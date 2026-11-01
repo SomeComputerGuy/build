@@ -1,0 +1,33 @@
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Subject: [PATCH] configs: orangepi_zero2: talk to the AXP305 over RSB
+
+The Zero2 device tree puts the AXP305 on r_rsb (pmic@745); TF-A and
+Linux use RSB and the PMIC stays in RSB mode across warm reboots, so the
+SPL's R_I2C access fails on every reboot ("Failed to set core voltage!
+Can't set CPU frequency", CPU left at 408 MHz until Linux cpufreq).
+Use the RSB controller in the SPL instead; drop the now unused legacy
+mvtwsi R_I2C setup. CONFIG_SPL_I2C stays, it pulls drivers/i2c (the RSB
+driver) into the SPL build.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/configs/orangepi_zero2_defconfig
++++ b/configs/orangepi_zero2_defconfig
+@@ -9,16 +9,12 @@ CONFIG_DRAM_SUNXI_TPR6=0x33808080
+ CONFIG_DRAM_SUNXI_TPR10=0xf83438
+ CONFIG_MACH_SUN50I_H616=y
+ CONFIG_SUNXI_DRAM_H616_DDR3_1333=y
+-CONFIG_R_I2C_ENABLE=y
+ CONFIG_SPL_SPI_SUNXI=y
+ CONFIG_SPL_SUNXI_LED_STATUS=y
+ CONFIG_SPL_SUNXI_LED_STATUS_GPIO=76
+ # CONFIG_SYS_MALLOC_CLEAR_ON_INIT is not set
+ CONFIG_SPL_I2C=y
+-CONFIG_SPL_SYS_I2C_LEGACY=y
+-CONFIG_SYS_I2C_MVTWSI=y
+-CONFIG_SYS_I2C_SLAVE=0x7f
+-CONFIG_SYS_I2C_SPEED=400000
++CONFIG_SYS_I2C_SUN8I_RSB=y
+ CONFIG_MTD=y
+ CONFIG_SPI_FLASH_MACRONIX=y
+ CONFIG_SUN8I_EMAC=y
