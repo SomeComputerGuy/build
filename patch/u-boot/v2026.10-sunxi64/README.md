@@ -18,3 +18,11 @@ is upstreamed; the legacy dir is kept for reference.
 Boards that already self-pin a newer `BOOTBRANCH_BOARD`/`BOOTPATCHDIR` (e.g.
 `v2025-sunxi`, `v2025.04`, `v2026.01`) are unaffected by the family default and keep
 their pins.
+
+## Orange Pi Zero2 (`board_orangepizero2/`)
+
+`u-boot-sunxi-with-spl.bin` doubles as the SPI NOR image (BROM order: SD, then SPI; the
+SPL header carries the size, U-Boot proper follows at the SPL size / `SYS_SPI_U_BOOT_OFFS`).
+`write_uboot_platform_mtd` in `sunxi64_common.inc` writes it with `flashcp` for
+`armbian-install`; by hand: `flashcp -v /usr/lib/linux-u-boot-*/u-boot-sunxi-with-spl.bin /dev/mtd0`,
+revert with `flash_erase /dev/mtd0 0 0` (blank flash = BROM skips SPI).
