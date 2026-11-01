@@ -1,0 +1,118 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 1 Nov 2026 22:45:46 +0000
+Subject: drm/sun4i: tcon_top: Select the TV encoder as TCON TV clock source
+
+TCON TOP can clock each TCON TV channel either from its CCU clock or
+from the TV encoder clock, which the hardware divides down to the pixel
+clock (by 16 on the H616, 8 when the TVE deflicker filter is used).
+Driving the TV encoder requires the latter so that encoder and TCON stay
+locked to the same clock.
+
+Add a helper to flip the source bit in TCON_TV_SETUP and call it from
+the R40-style TCON TV mux setup, selecting the TVE whenever the attached
+encoder is a TV DAC and the CCU clock otherwise.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_tcon.c     | 12 ++++++++
+ drivers/gpu/drm/sun4i/sun8i_tcon_top.c | 40 ++++++++++++++++++++++++++
+ drivers/gpu/drm/sun4i/sun8i_tcon_top.h |  3 ++
+ 3 files changed, 55 insertions(+)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_tcon.c b/drivers/gpu/drm/sun4i/sun4i_tcon.c
+index 111111111111..222222222222 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_tcon.c
++++ b/drivers/gpu/drm/sun4i/sun4i_tcon.c
+@@ -1648,6 +1648,18 @@ static int sun8i_r40_tcon_tv_set_mux(struct sun4i_tcon *tcon,
+ 			goto out_put_device;
+ 	}
+ 
++	/*
++	 * TCON TV channels get their clock from the TV encoder when they
++	 * drive it, and from the CCU otherwise.
++	 */
++	if (IS_ENABLED(CONFIG_DRM_SUN8I_TCON_TOP) && id >= 2) {
++		bool tve = encoder->encoder_type == DRM_MODE_ENCODER_TVDAC;
++
++		ret = sun8i_tcon_top_set_tv_clk_src(&pdev->dev, id, tve);
++		if (ret)
++			goto out_put_device;
++	}
++
+ 	if (IS_ENABLED(CONFIG_DRM_SUN8I_TCON_TOP)) {
+ 		ret = sun8i_tcon_top_de_config(&pdev->dev, tcon->id, id);
+ 		if (ret)
+diff --git a/drivers/gpu/drm/sun4i/sun8i_tcon_top.c b/drivers/gpu/drm/sun4i/sun8i_tcon_top.c
+index 111111111111..222222222222 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_tcon_top.c
++++ b/drivers/gpu/drm/sun4i/sun8i_tcon_top.c
+@@ -143,6 +143,46 @@ int sun8i_tcon_top_de_config(struct device *dev, int mixer, int tcon)
+ }
+ EXPORT_SYMBOL(sun8i_tcon_top_de_config);
+ 
++/*
++ * Each TCON TV channel clock can be sourced either from its CCU clock or
++ * from the TV encoder clock, which the hardware then divides down to the
++ * pixel clock. The TVE path needs the latter so that encoder and TCON stay
++ * locked to the same clock.
++ */
++int sun8i_tcon_top_set_tv_clk_src(struct device *dev, int tcon, bool from_tve)
++{
++	struct sun8i_tcon_top *tcon_top = dev_get_drvdata(dev);
++	unsigned long flags;
++	u32 val, bit;
++
++	if (!sun8i_tcon_top_node_is_tcon_top(dev->of_node)) {
++		dev_err(dev, "Device is not TCON TOP!\n");
++		return -EINVAL;
++	}
++
++	if (tcon < 2 || tcon > 3) {
++		dev_err(dev, "TCON index must be 2 or 3!\n");
++		return -EINVAL;
++	}
++
++	bit = tcon == 2 ? TCON_TOP_TCON_TV0_CLK_SRC_TVE :
++			  TCON_TOP_TCON_TV1_CLK_SRC_TVE;
++
++	spin_lock_irqsave(&tcon_top->reg_lock, flags);
++
++	val = readl(tcon_top->regs + TCON_TOP_TCON_TV_SETUP_REG);
++	if (from_tve)
++		val |= bit;
++	else
++		val &= ~bit;
++	writel(val, tcon_top->regs + TCON_TOP_TCON_TV_SETUP_REG);
++
++	spin_unlock_irqrestore(&tcon_top->reg_lock, flags);
++
++	return 0;
++}
++EXPORT_SYMBOL(sun8i_tcon_top_set_tv_clk_src);
++
+ 
+ static struct clk_hw *sun8i_tcon_top_register_gate(struct device *dev,
+ 						   const char *parent,
+diff --git a/drivers/gpu/drm/sun4i/sun8i_tcon_top.h b/drivers/gpu/drm/sun4i/sun8i_tcon_top.h
+index 111111111111..222222222222 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_tcon_top.h
++++ b/drivers/gpu/drm/sun4i/sun8i_tcon_top.h
+@@ -10,6 +10,8 @@
+ #include <linux/spinlock.h>
+ 
+ #define TCON_TOP_TCON_TV_SETUP_REG	0x00
++#define TCON_TOP_TCON_TV0_CLK_SRC_TVE		BIT(0)
++#define TCON_TOP_TCON_TV1_CLK_SRC_TVE		BIT(4)
+ 
+ #define TCON_TOP_PORT_SEL_REG		0x1C
+ #define TCON_TOP_PORT_DE0_MSK			GENMASK(1, 0)
+@@ -46,5 +48,6 @@ extern const struct of_device_id sun8i_tcon_top_of_table[];
+ 
+ int sun8i_tcon_top_set_hdmi_src(struct device *dev, int tcon);
+ int sun8i_tcon_top_de_config(struct device *dev, int mixer, int tcon);
++int sun8i_tcon_top_set_tv_clk_src(struct device *dev, int tcon, bool from_tve);
+ 
+ #endif /* _SUN8I_TCON_TOP_H_ */
+-- 
+Armbian

@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 1 Nov 2026 22:45:46 +0000
+Subject: clk: sunxi-ng: h616: Prepare the TVE clock for the TV encoder
+
+The TV encoder shares its clock parents (pll-video0/1 and their 4x
+outputs) with the TCON TV clocks, and pll-video0 is what HDMI runs from
+through tcon-tv0. Export CLK_PLL_VIDEO1 so that the device tree can
+parent the TVE clock to the other PLL, and mark tve0 with
+CLK_SET_RATE_NO_REPARENT so that a rate request stays on the parent DT
+selected instead of re-rating whichever PLL happens to give an exact
+match first, which would disturb a running HDMI output.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/clk/sunxi-ng/ccu-sun50i-h616.c      | 8 +++++++-
+ drivers/clk/sunxi-ng/ccu-sun50i-h616.h      | 1 -
+ include/dt-bindings/clock/sun50i-h616-ccu.h | 1 +
+ 3 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
+index 111111111111..222222222222 100644
+--- a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
++++ b/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
+@@ -683,13 +683,19 @@ static SUNXI_CCU_GATE(bus_tcon_tv0_clk, "bus-tcon-tv0", "ahb3",
+ static SUNXI_CCU_GATE(bus_tcon_tv1_clk, "bus-tcon-tv1", "ahb3",
+ 		      0xb9c, BIT(1), 0);
+ 
++/*
++ * The TV encoder clock shares its parents with the TCON TV clocks used by
++ * HDMI. Keep the parent chosen by DT so that a TVE rate request cannot
++ * re-rate the PLL that drives HDMI.
++ */
+ static SUNXI_CCU_MP_WITH_MUX_GATE(tve0_clk, "tve0",
+ 				  tcon_tv_parents, 0xbb0,
+ 				  0, 4,		/* M */
+ 				  8, 2,		/* P */
+ 				  24, 3,	/* mux */
+ 				  BIT(31),	/* gate */
+-				  CLK_SET_RATE_PARENT);
++				  CLK_SET_RATE_PARENT |
++				  CLK_SET_RATE_NO_REPARENT);
+ 
+ static SUNXI_CCU_GATE(bus_tve_top_clk, "bus-tve-top", "ahb3",
+ 		      0xbbc, BIT(0), 0);
+diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.h b/drivers/clk/sunxi-ng/ccu-sun50i-h616.h
+index 111111111111..222222222222 100644
+--- a/drivers/clk/sunxi-ng/ccu-sun50i-h616.h
++++ b/drivers/clk/sunxi-ng/ccu-sun50i-h616.h
+@@ -22,7 +22,6 @@
+ #define CLK_PLL_GPU		8
+ #define CLK_PLL_VIDEO0		9
+ #define CLK_PLL_VIDEO0_4X	10
+-#define CLK_PLL_VIDEO1		11
+ #define CLK_PLL_VIDEO1_4X	12
+ #define CLK_PLL_VIDEO2		13
+ #define CLK_PLL_VIDEO2_4X	14
+diff --git a/include/dt-bindings/clock/sun50i-h616-ccu.h b/include/dt-bindings/clock/sun50i-h616-ccu.h
+index 111111111111..222222222222 100644
+--- a/include/dt-bindings/clock/sun50i-h616-ccu.h
++++ b/include/dt-bindings/clock/sun50i-h616-ccu.h
+@@ -7,6 +7,7 @@
+ #define _DT_BINDINGS_CLK_SUN50I_H616_H_
+ 
+ #define CLK_PLL_PERIPH0		4
++#define CLK_PLL_VIDEO1		11
+ #define CLK_PLL_AUDIO_HS	17
+ #define CLK_PLL_AUDIO_4X	20
+ 
+-- 
+Armbian
