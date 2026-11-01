@@ -15,6 +15,18 @@ setenv bootlogo "false"
 
 setenv vendor "allwinner"
 
+# The distro boot code sets devtype/devnum/distro_bootpart/prefix before it sources this
+# script. Default them so the script also works when sourced by hand, e.g. from the U-Boot
+# prompt after a failed network boot attempt left devtype=dhcp:
+#   load mmc 0:1 ${scriptaddr} /boot/boot.scr && source ${scriptaddr}
+if test "${devtype}" != mmc && test "${devtype}" != usb && test "${devtype}" != scsi && test "${devtype}" != nvme && test "${devtype}" != sata; then
+	setenv devtype mmc
+	setenv devnum 0
+fi
+if test -z "${devnum}"; then setenv devnum 0; fi
+if test -z "${distro_bootpart}"; then setenv distro_bootpart 1; fi
+if test -z "${prefix}"; then setenv prefix /boot/; fi
+
 # Remember the default fdtfile provided by u-boot and delete the vendor name
 if setexpr subfdt sub ${vendor}/ "" ${fdtfile};then
 	setenv deffdt_file ${subfdt}
@@ -24,10 +36,29 @@ fi
 setenv deffdt_dir "${prefix}dtb"
 if test "$fdtdir" = ""; then setenv fdtdir "${deffdt_dir}/${vendor}";fi
 
-# Print boot source
-itest.b *0x10028 == 0x00 && echo "U-boot loaded from SD"
-itest.b *0x10028 == 0x02 && echo "U-boot loaded from eMMC or secondary SD"
-itest.b *0x10028 == 0x03 && echo "U-boot loaded from SPI"
+# Print boot source. U-Boot exports it as ${boot_source} (patch sunxi-export-boot-source-env);
+# with an older U-Boot read the boot_media byte of the SPL header instead. That header sits at
+# the SoC's SRAM A1 base + 0x28: 0x10000 on A64/H5, 0x20000 on H6/H616/H618/A100, 0x44000 on A523.
+if test -z "${boot_source}"; then
+	setenv splhdr 0x10028
+	setexpr socchk sub "sun50i-h6" "" "${fdtfile}"
+	if test "${socchk}" != "${fdtfile}"; then setenv splhdr 0x20028; fi
+	setexpr socchk sub "sun50i-a1" "" "${fdtfile}"
+	if test "${socchk}" != "${fdtfile}"; then setenv splhdr 0x20028; fi
+	setexpr socchk sub "sun55i-" "" "${fdtfile}"
+	if test "${socchk}" != "${fdtfile}"; then setenv splhdr 0x44028; fi
+	itest.b *${splhdr} == 0x00 && setenv boot_source mmc0
+	itest.b *${splhdr} == 0x10 && setenv boot_source mmc0
+	itest.b *${splhdr} == 0x02 && setenv boot_source mmc2
+	itest.b *${splhdr} == 0x12 && setenv boot_source mmc2
+	itest.b *${splhdr} == 0x03 && setenv boot_source spi
+	setenv splhdr
+	setenv socchk
+fi
+if test "${boot_source}" = mmc0; then echo "U-boot loaded from SD"; fi
+if test "${boot_source}" = mmc2; then echo "U-boot loaded from eMMC or secondary SD"; fi
+if test "${boot_source}" = spi; then echo "U-boot loaded from SPI"; fi
+if test "${boot_source}" = fel; then echo "U-boot loaded via FEL"; fi
 
 echo "Boot script loaded from ${devtype}"
 
