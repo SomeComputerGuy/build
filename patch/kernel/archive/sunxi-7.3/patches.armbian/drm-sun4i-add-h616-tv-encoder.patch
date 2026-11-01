@@ -1,0 +1,779 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 1 Nov 2026 22:45:46 +0000
+Subject: drm/sun4i: Add support for the H616 TV encoder
+
+The H616 TV encoder core shares its register layout with the A10 TVE
+handled by sun4i_tv.c, but the analog side is different enough to
+warrant its own driver: the DAC bias, efuse calibration and cable
+detection controls moved into a separate TVE TOP block, the DAC is
+clocked from the TVE module clock (216 MHz, 16 times the 13.5 MHz pixel
+clock, which TCON TOP divides down for the TCON TV channel), and the
+per-standard register values differ from the A10 ones.
+
+Add a driver exposing a Composite connector with NTSC and PAL
+(720x480i and 720x576i). The DAC bias calibration is read from the SID
+efuse, falling back to the BSP default when it is blank. The encoder
+asks the display engine for YCbCr output. Cable detection (the TVE
+has a DAC load detector) is left for later, the connector always
+reports connected.
+
+Register semantics follow the H616 User Manual V1.0 chapter 7.3 (TV
+Encoder); the configuration values were cross-checked against the
+Allwinner BSP TVE code (de_tve_sun8iw11.c, used for sun50iw9).
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/sun4i/Kconfig     |   9 +
+ drivers/gpu/drm/sun4i/Makefile    |   1 +
+ drivers/gpu/drm/sun4i/sun8i_tve.c | 712 ++++++++++++++++++++++++++++++
+ 3 files changed, 722 insertions(+)
+ create mode 100644 drivers/gpu/drm/sun4i/sun8i_tve.c
+
+diff --git a/drivers/gpu/drm/sun4i/Kconfig b/drivers/gpu/drm/sun4i/Kconfig
+index 111111111111..222222222222 100644
+--- a/drivers/gpu/drm/sun4i/Kconfig
++++ b/drivers/gpu/drm/sun4i/Kconfig
+@@ -96,4 +96,13 @@ config DRM_SUN8I_TCON_TOP
+ 	  TCON TOP is responsible for configuring display pipeline for
+ 	  HDMI, TVE and LCD.
+ 
++config DRM_SUN8I_TVE
++	tristate "Support for Allwinner H616 TV Encoder"
++	depends on DRM_SUN8I_MIXER
++	default DRM_SUN4I
++	help
++	  Choose this option if you have an Allwinner H616 SoC and want
++	  to use its composite (CVBS) TV output. If M is selected the
++	  module will be called sun8i_tve.
++
+ endif
+diff --git a/drivers/gpu/drm/sun4i/Makefile b/drivers/gpu/drm/sun4i/Makefile
+index 111111111111..222222222222 100644
+--- a/drivers/gpu/drm/sun4i/Makefile
++++ b/drivers/gpu/drm/sun4i/Makefile
+@@ -43,3 +43,4 @@ obj-$(CONFIG_DRM_SUN6I_DSI)	+= sun6i_mipi_dsi.o
+ obj-$(CONFIG_DRM_SUN8I_DW_HDMI)	+= sun8i-drm-hdmi.o
+ obj-$(CONFIG_DRM_SUN8I_MIXER)	+= sun8i-mixer.o
+ obj-$(CONFIG_DRM_SUN8I_TCON_TOP) += sun8i_tcon_top.o
++obj-$(CONFIG_DRM_SUN8I_TVE)	+= sun8i_tve.o
+diff --git a/drivers/gpu/drm/sun4i/sun8i_tve.c b/drivers/gpu/drm/sun4i/sun8i_tve.c
+new file mode 100644
+index 000000000000..222222222222
+--- /dev/null
++++ b/drivers/gpu/drm/sun4i/sun8i_tve.c
+@@ -0,0 +1,712 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Allwinner H616 TV encoder (composite video output)
++ *
++ * Copyright (C) 2026 Arun Iyengar <aiyengar1990@gmail.com>
++ *
++ * The encoder core is the same block that sun4i_tv.c programs on the A10,
++ * but this generation moved the analog DAC controls (bias, calibration,
++ * cable detection) into a separate "TVE TOP" block and clocks the encoder
++ * from its own module clock: TCON TOP divides that clock by 16 to obtain
++ * the TCON TV pixel clock, so the two stay locked. Register layout follows
++ * the Allwinner H616 User Manual V1.0, chapter 7.3 (TV Encoder).
++ */
++
++#include <linux/clk.h>
++#include <linux/component.h>
++#include <linux/module.h>
++#include <linux/nvmem-consumer.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/reset.h>
++
++#include <drm/drm_atomic.h>
++#include <drm/drm_atomic_helper.h>
++#include <drm/drm_encoder.h>
++#include <drm/drm_of.h>
++#include <drm/drm_print.h>
++#include <drm/drm_probe_helper.h>
++#include <drm/drm_simple_kms_helper.h>
++
++#include "sun4i_crtc.h"
++#include "sun4i_drv.h"
++#include "sunxi_engine.h"
++
++/* TVE TOP: one 0x20 register group per DAC */
++#define SUN8I_TVE_TOP_DAC_MAP_REG(dac)		(0x020 + 0x20 * (dac))
++#define SUN8I_TVE_TOP_DAC_MAP_OUT(x)			(((x) & 0x7) << 4)
++#define SUN8I_TVE_TOP_DAC_MAP_SEL_TVE0			0x1
++
++#define SUN8I_TVE_TOP_DAC_STATUS_REG(dac)	(0x024 + 0x20 * (dac))
++
++#define SUN8I_TVE_TOP_DAC_CFG0_REG(dac)		(0x028 + 0x20 * (dac))
++#define SUN8I_TVE_TOP_DAC_CFG0_CLOCK_INVERT		BIT(31)
++#define SUN8I_TVE_TOP_DAC_CFG0_CALI_IN(x)		(((x) & 0x3ff) << 16)
++#define SUN8I_TVE_TOP_DAC_CFG0_LOW_BIAS(x)		(((x) & 0xf) << 12)
++#define SUN8I_TVE_TOP_DAC_CFG0_BIAS_EXT_SEL		BIT(9)
++#define SUN8I_TVE_TOP_DAC_CFG0_BIAS_INT_SEL		BIT(8)
++#define SUN8I_TVE_TOP_DAC_CFG0_BIAS_REF_INT_EN		BIT(4)
++#define SUN8I_TVE_TOP_DAC_CFG0_DAC_EN			BIT(0)
++
++#define SUN8I_TVE_TOP_DAC_CFG1_REG(dac)		(0x02c + 0x20 * (dac))
++#define SUN8I_TVE_TOP_DAC_CFG1_REF_EXT_SEL		BIT(9)
++#define SUN8I_TVE_TOP_DAC_CFG1_REF_INT_SEL		BIT(8)
++#define SUN8I_TVE_TOP_DAC_CFG1_REF2_SEL(x)		(((x) & 0x3) << 4)
++#define SUN8I_TVE_TOP_DAC_CFG1_REF2_SEL_0_40V		SUN8I_TVE_TOP_DAC_CFG1_REF2_SEL(3)
++#define SUN8I_TVE_TOP_DAC_CFG1_REF1_SEL(x)		((x) & 0xf)
++#define SUN8I_TVE_TOP_DAC_CFG1_REF1_SEL_1_00V		SUN8I_TVE_TOP_DAC_CFG1_REF1_SEL(0xa)
++
++#define SUN8I_TVE_TOP_DAC_CFG2_REG(dac)		(0x030 + 0x20 * (dac))
++#define SUN8I_TVE_TOP_DAC_CFG2_AB(x)			(((x) & 0x1f) << 8)
++#define SUN8I_TVE_TOP_DAC_CFG2_S2S1(x)			(((x) & 0x3) << 6)
++#define SUN8I_TVE_TOP_DAC_CFG2_R_SET(x)			((x) & 0x3f)
++
++/* TV encoder */
++#define SUN8I_TVE_GCTL_REG			0x000
++/*
++ * The manual documents bit 31 as a clock gate disable, but the vendor driver
++ * sets it whenever the encoder (or its cable detection) runs.
++ */
++#define SUN8I_TVE_GCTL_CLOCK_EN				BIT(31)
++#define SUN8I_TVE_GCTL_CVBS_UPSAMPLE(x)			(((x) & 0x3) << 20)
++#define SUN8I_TVE_GCTL_CVBS_UPSAMPLE_216M		SUN8I_TVE_GCTL_CVBS_UPSAMPLE(3)
++#define SUN8I_TVE_GCTL_ENABLE				BIT(0)
++
++#define SUN8I_TVE_CFG_REG			0x004
++#define SUN8I_TVE_CFG_DAC_CONTROL_54M			BIT(26)
++#define SUN8I_TVE_CFG_CORE_DATAPATH_54M			BIT(25)
++#define SUN8I_TVE_CFG_CORE_CONTROL_54M			BIT(24)
++/* Documented as reserved, but always set by the vendor driver */
++#define SUN8I_TVE_CFG_YUV_RGB_OUTPUT_EN			BIT(18)
++#define SUN8I_TVE_CFG_YC_EN				BIT(17)
++#define SUN8I_TVE_CFG_CVBS_EN				BIT(16)
++#define SUN8I_TVE_CFG_MODE(x)				((x) & 0xf)
++#define SUN8I_TVE_CFG_MODE_NTSC				SUN8I_TVE_CFG_MODE(0)
++#define SUN8I_TVE_CFG_MODE_PAL				SUN8I_TVE_CFG_MODE(1)
++
++#define SUN8I_TVE_DAC_SRC_REG			0x008
++#define SUN8I_TVE_DAC_SRC_SEL(dac, x)			(((x) & 0x7) << (4 + 3 * (dac)))
++#define SUN8I_TVE_DAC_SRC_COMPOSITE			0
++#define SUN8I_TVE_DAC_SRC_NONE				7
++
++#define SUN8I_TVE_NOTCH_REG			0x00c
++#define SUN8I_TVE_NOTCH_Y_DELAY(x)			(((x) & 0x7) << 25)
++#define SUN8I_TVE_NOTCH_EN				BIT(16)
++#define SUN8I_TVE_NOTCH_C_DELAY(x)			(((x) & 0xf) << 12)
++
++#define SUN8I_TVE_CHROMA_FREQ_REG		0x010
++
++#define SUN8I_TVE_PORCH_REG			0x014
++#define SUN8I_TVE_PORCH_BACK(x)				(((x) & 0x1ff) << 16)
++#define SUN8I_TVE_PORCH_FRONT(x)			((x) & 0xfff)
++
++#define SUN8I_TVE_HD_VSYNC_REG			0x018
++#define SUN8I_TVE_HD_VSYNC_FRONT_PORCH(x)		((x) & 0xfff)
++
++#define SUN8I_TVE_LINE_REG			0x01c
++#define SUN8I_TVE_LINE_FIRST(x)				(((x) & 0xff) << 16)
++#define SUN8I_TVE_LINE_NUMBER(x)			((x) & 0x7ff)
++
++#define SUN8I_TVE_LEVEL_REG			0x020
++#define SUN8I_TVE_LEVEL_BLANK(x)			(((x) & 0x3ff) << 16)
++#define SUN8I_TVE_LEVEL_BLACK(x)			((x) & 0x3ff)
++
++#define SUN8I_TVE_AUTO_DETECT_EN_REG		0x030
++#define SUN8I_TVE_AUTO_DETECT_STATUS_REG	0x038
++#define SUN8I_TVE_AUTO_DETECT_DEBOUNCE_REG	0x03c
++
++#define SUN8I_TVE_AUTO_DETECT_CFG0_REG		0x0f8
++#define SUN8I_TVE_AUTO_DETECT_CFG0_PULSE_VALUE(x)	((x) & 0x3ff)
++
++#define SUN8I_TVE_AUTO_DETECT_CFG1_REG		0x0fc
++
++#define SUN8I_TVE_COLOR_PHASE_RESET_REG		0x100
++#define SUN8I_TVE_COLOR_PHASE_RESET_8_FIELDS		0
++#define SUN8I_TVE_COLOR_PHASE_RESET_4_FIELDS		1
++
++#define SUN8I_TVE_VSYNC_NUM_REG			0x104
++#define SUN8I_TVE_VSYNC_NUM_6_PULSES			BIT(0)
++
++#define SUN8I_TVE_NOTCH_FREQ_REG		0x108
++
++#define SUN8I_TVE_CB_CR_LVL_REG			0x10c
++#define SUN8I_TVE_CB_CR_LVL_CR_BURST(x)			(((x) & 0xff) << 8)
++#define SUN8I_TVE_CB_CR_LVL_CB_BURST(x)			((x) & 0xff)
++
++#define SUN8I_TVE_TINT_BURST_PHASE_REG		0x110
++
++#define SUN8I_TVE_BURST_WIDTH_REG		0x114
++#define SUN8I_TVE_BURST_WIDTH_BREEZEWAY(x)		(((x) & 0x7f) << 16)
++#define SUN8I_TVE_BURST_WIDTH_BURST(x)			(((x) & 0x7f) << 8)
++#define SUN8I_TVE_BURST_WIDTH_HSYNC(x)			((x) & 0xff)
++
++#define SUN8I_TVE_CB_CR_GAIN_REG		0x118
++#define SUN8I_TVE_CB_CR_GAIN_CR(x)			(((x) & 0xff) << 8)
++#define SUN8I_TVE_CB_CR_GAIN_CB(x)			((x) & 0xff)
++
++#define SUN8I_TVE_SYNC_VBI_REG			0x11c
++#define SUN8I_TVE_SYNC_VBI_SYNC(x)			(((x) & 0x3ff) << 16)
++#define SUN8I_TVE_SYNC_VBI_VBLANK(x)			((x) & 0x3ff)
++
++#define SUN8I_TVE_WHITE_LEVEL_REG		0x120
++#define SUN8I_TVE_WHITE_LEVEL_BREEZEWAY(x)		(((x) & 0x3ff) << 16)
++#define SUN8I_TVE_WHITE_LEVEL_WHITE(x)			((x) & 0x3ff)
++
++#define SUN8I_TVE_ACTIVE_LINE_REG		0x124
++
++#define SUN8I_TVE_CHROMA_BW_REG			0x128
++#define SUN8I_TVE_CHROMA_BW(x)				(((x) & 0x3) << 16)
++#define SUN8I_TVE_CHROMA_BW_0_6M			SUN8I_TVE_CHROMA_BW(0)
++#define SUN8I_TVE_CHROMA_BW_1_2M			SUN8I_TVE_CHROMA_BW(1)
++
++#define SUN8I_TVE_12C_REG			0x12c
++#define SUN8I_TVE_12C_NOTCH_WIDTH_WIDE			BIT(8)
++#define SUN8I_TVE_12C_COMP_YUV_EN			BIT(0)
++
++#define SUN8I_TVE_RESYNC_REG			0x130
++#define SUN8I_TVE_RESYNC_FIELD				BIT(31)
++#define SUN8I_TVE_RESYNC_DISABLE			BIT(30)
++/* Reserved in the manual, always set by the vendor driver */
++#define SUN8I_TVE_RESYNC_UNKNOWN			BIT(29)
++#define SUN8I_TVE_RESYNC_LINE(x)			(((x) & 0x7ff) << 16)
++#define SUN8I_TVE_RESYNC_PIXEL(x)			((x) & 0x7ff)
++
++#define SUN8I_TVE_SLAVE_REG			0x134
++#define SUN8I_TVE_ENC_CFG0_REG			0x138
++
++#define SUN8I_TVE_ENC_CFG1_REG			0x13c
++#define SUN8I_TVE_ENC_CFG1_BYPASS_YCLAMP		BIT(0)
++
++#define SUN8I_TVE_LP_CTL_REG			0x380
++
++#define SUN8I_TVE_NR_REG			0x3a0
++#define SUN8I_TVE_NR_T_VALUE(x)				(((x) & 0xff) << 16)
++#define SUN8I_TVE_NR_EN					BIT(0)
++
++/* TCON TOP derives the TCON TV pixel clock from the encoder clock */
++#define SUN8I_TVE_CLK_PER_PIXEL_CLK		16
++
++/* Used when the efuse does not hold a DAC calibration value */
++#define SUN8I_TVE_DAC_CALIBRATION_DEFAULT	625
++
++struct sun8i_tve_mode {
++	unsigned int	tv_mode;
++
++	u32		mode;
++	u32		chroma_freq;
++	u16		back_porch;
++	u16		front_porch;
++	u16		line_number;
++	u16		black_level;
++	u16		blank_level;
++	u16		vblank_level;
++	u8		cb_burst;
++	u8		cr_burst;
++	u8		cb_gain;
++	u8		cr_gain;
++	u8		notch_freq;
++	u8		color_phase_reset;
++	u32		chroma_bw;
++	bool		vsync_6_pulses;
++	bool		bypass_yclamp;
++	bool		noise_reduction;
++};
++
++struct sun8i_tve {
++	struct drm_connector	connector;
++	struct drm_encoder	encoder;
++
++	struct regmap		*regs;
++	struct regmap		*top_regs;
++	struct clk		*mod_clk;
++
++	u32			calibration;
++};
++
++static const struct sun8i_tve_mode sun8i_tve_modes[] = {
++	{
++		.tv_mode		= DRM_MODE_TV_MODE_NTSC,
++		.mode			= SUN8I_TVE_CFG_MODE_NTSC,
++		.chroma_freq		= 0x21f07c1f,
++		.back_porch		= 118,
++		.front_porch		= 32,
++		.line_number		= 525,
++		.black_level		= 240,
++		.blank_level		= 240,
++		.vblank_level		= 240,
++		.cb_burst		= 0x4f,
++		.cr_burst		= 0,
++		.cb_gain		= 0xa0,
++		.cr_gain		= 0xa0,
++		.notch_freq		= 2,
++		.color_phase_reset	= SUN8I_TVE_COLOR_PHASE_RESET_4_FIELDS,
++		.chroma_bw		= SUN8I_TVE_CHROMA_BW_0_6M,
++		.bypass_yclamp		= true,
++	},
++	{
++		.tv_mode		= DRM_MODE_TV_MODE_PAL,
++		.mode			= SUN8I_TVE_CFG_MODE_PAL,
++		.chroma_freq		= 0x2a098acb,
++		.back_porch		= 138,
++		.front_porch		= 24,
++		.line_number		= 625,
++		.black_level		= 252,
++		.blank_level		= 252,
++		.vblank_level		= 252,
++		.cb_burst		= 0x29,
++		.cr_burst		= 0x29,
++		.cb_gain		= 0xa8,
++		.cr_gain		= 0xa8,
++		.notch_freq		= 5,
++		.color_phase_reset	= SUN8I_TVE_COLOR_PHASE_RESET_8_FIELDS,
++		.chroma_bw		= SUN8I_TVE_CHROMA_BW_1_2M,
++		.vsync_6_pulses		= true,
++		.noise_reduction	= true,
++	},
++};
++
++static inline struct sun8i_tve *
++drm_encoder_to_sun8i_tve(struct drm_encoder *encoder)
++{
++	return container_of(encoder, struct sun8i_tve, encoder);
++}
++
++static const struct sun8i_tve_mode *sun8i_tve_find_mode(unsigned int tv_mode)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(sun8i_tve_modes); i++)
++		if (sun8i_tve_modes[i].tv_mode == tv_mode)
++			return &sun8i_tve_modes[i];
++
++	return NULL;
++}
++
++static void sun8i_tve_dac_init(struct sun8i_tve *tve)
++{
++	/* Route the (only) DAC to the encoder output */
++	regmap_write(tve->top_regs, SUN8I_TVE_TOP_DAC_MAP_REG(0),
++		     SUN8I_TVE_TOP_DAC_MAP_OUT(0) |
++		     SUN8I_TVE_TOP_DAC_MAP_SEL_TVE0);
++
++	/* Bias and reference settings as used by the vendor driver */
++	regmap_write(tve->top_regs, SUN8I_TVE_TOP_DAC_CFG1_REG(0),
++		     SUN8I_TVE_TOP_DAC_CFG1_REF_EXT_SEL |
++		     SUN8I_TVE_TOP_DAC_CFG1_REF2_SEL_0_40V |
++		     SUN8I_TVE_TOP_DAC_CFG1_REF1_SEL_1_00V);
++	regmap_write(tve->top_regs, SUN8I_TVE_TOP_DAC_CFG2_REG(0),
++		     SUN8I_TVE_TOP_DAC_CFG2_R_SET(0x10));
++
++	/* Calibrated bias current, DAC still off */
++	regmap_write(tve->top_regs, SUN8I_TVE_TOP_DAC_CFG0_REG(0),
++		     SUN8I_TVE_TOP_DAC_CFG0_CLOCK_INVERT |
++		     SUN8I_TVE_TOP_DAC_CFG0_CALI_IN(tve->calibration) |
++		     SUN8I_TVE_TOP_DAC_CFG0_LOW_BIAS(4) |
++		     SUN8I_TVE_TOP_DAC_CFG0_BIAS_EXT_SEL);
++}
++
++static void sun8i_tve_dac_set_enabled(struct sun8i_tve *tve, bool enable)
++{
++	regmap_update_bits(tve->top_regs, SUN8I_TVE_TOP_DAC_CFG0_REG(0),
++			   SUN8I_TVE_TOP_DAC_CFG0_DAC_EN,
++			   enable ? SUN8I_TVE_TOP_DAC_CFG0_DAC_EN : 0);
++}
++
++static void sun8i_tve_mode_set(struct sun8i_tve *tve,
++			       const struct sun8i_tve_mode *tv_mode,
++			       const struct drm_display_mode *mode)
++{
++	/* 216 MHz DAC clock, encoder disabled while reprogramming */
++	regmap_write(tve->regs, SUN8I_TVE_GCTL_REG,
++		     SUN8I_TVE_GCTL_CVBS_UPSAMPLE_216M);
++
++	regmap_write(tve->regs, SUN8I_TVE_CFG_REG,
++		     SUN8I_TVE_CFG_DAC_CONTROL_54M |
++		     SUN8I_TVE_CFG_CORE_DATAPATH_54M |
++		     SUN8I_TVE_CFG_CORE_CONTROL_54M |
++		     SUN8I_TVE_CFG_YUV_RGB_OUTPUT_EN |
++		     SUN8I_TVE_CFG_YC_EN |
++		     SUN8I_TVE_CFG_CVBS_EN |
++		     tv_mode->mode);
++
++	regmap_write(tve->regs, SUN8I_TVE_DAC_SRC_REG,
++		     SUN8I_TVE_DAC_SRC_SEL(0, SUN8I_TVE_DAC_SRC_COMPOSITE));
++
++	regmap_write(tve->regs, SUN8I_TVE_NOTCH_REG,
++		     SUN8I_TVE_NOTCH_Y_DELAY(1) |
++		     SUN8I_TVE_NOTCH_C_DELAY(4));
++
++	regmap_write(tve->regs, SUN8I_TVE_CHROMA_FREQ_REG,
++		     tv_mode->chroma_freq);
++
++	regmap_write(tve->regs, SUN8I_TVE_PORCH_REG,
++		     SUN8I_TVE_PORCH_BACK(tv_mode->back_porch) |
++		     SUN8I_TVE_PORCH_FRONT(tv_mode->front_porch));
++
++	regmap_write(tve->regs, SUN8I_TVE_HD_VSYNC_REG,
++		     SUN8I_TVE_HD_VSYNC_FRONT_PORCH(0x16));
++
++	regmap_write(tve->regs, SUN8I_TVE_LINE_REG,
++		     SUN8I_TVE_LINE_FIRST(22) |
++		     SUN8I_TVE_LINE_NUMBER(tv_mode->line_number));
++
++	regmap_write(tve->regs, SUN8I_TVE_LEVEL_REG,
++		     SUN8I_TVE_LEVEL_BLANK(tv_mode->blank_level) |
++		     SUN8I_TVE_LEVEL_BLACK(tv_mode->black_level));
++
++	regmap_write(tve->regs, SUN8I_TVE_AUTO_DETECT_CFG0_REG,
++		     SUN8I_TVE_AUTO_DETECT_CFG0_PULSE_VALUE(0x200));
++
++	regmap_write(tve->regs, SUN8I_TVE_COLOR_PHASE_RESET_REG,
++		     tv_mode->color_phase_reset);
++	regmap_write(tve->regs, SUN8I_TVE_VSYNC_NUM_REG,
++		     tv_mode->vsync_6_pulses ? SUN8I_TVE_VSYNC_NUM_6_PULSES : 0);
++	regmap_write(tve->regs, SUN8I_TVE_NOTCH_FREQ_REG, tv_mode->notch_freq);
++
++	regmap_write(tve->regs, SUN8I_TVE_CB_CR_LVL_REG,
++		     SUN8I_TVE_CB_CR_LVL_CB_BURST(tv_mode->cb_burst) |
++		     SUN8I_TVE_CB_CR_LVL_CR_BURST(tv_mode->cr_burst));
++
++	regmap_write(tve->regs, SUN8I_TVE_TINT_BURST_PHASE_REG, 0);
++
++	regmap_write(tve->regs, SUN8I_TVE_BURST_WIDTH_REG,
++		     SUN8I_TVE_BURST_WIDTH_BREEZEWAY(22) |
++		     SUN8I_TVE_BURST_WIDTH_BURST(68) |
++		     SUN8I_TVE_BURST_WIDTH_HSYNC(126));
++
++	regmap_write(tve->regs, SUN8I_TVE_CB_CR_GAIN_REG,
++		     SUN8I_TVE_CB_CR_GAIN_CB(tv_mode->cb_gain) |
++		     SUN8I_TVE_CB_CR_GAIN_CR(tv_mode->cr_gain));
++
++	regmap_write(tve->regs, SUN8I_TVE_SYNC_VBI_REG,
++		     SUN8I_TVE_SYNC_VBI_SYNC(0x10) |
++		     SUN8I_TVE_SYNC_VBI_VBLANK(tv_mode->vblank_level));
++
++	regmap_write(tve->regs, SUN8I_TVE_WHITE_LEVEL_REG,
++		     SUN8I_TVE_WHITE_LEVEL_BREEZEWAY(0x1e8) |
++		     SUN8I_TVE_WHITE_LEVEL_WHITE(0x320));
++
++	/* Width of the active line in 27 MHz cycles: 720 pixels at 13.5 MHz */
++	regmap_write(tve->regs, SUN8I_TVE_ACTIVE_LINE_REG,
++		     mode->hdisplay * 2);
++
++	regmap_write(tve->regs, SUN8I_TVE_CHROMA_BW_REG, tv_mode->chroma_bw);
++
++	regmap_write(tve->regs, SUN8I_TVE_12C_REG,
++		     SUN8I_TVE_12C_NOTCH_WIDTH_WIDE |
++		     SUN8I_TVE_12C_COMP_YUV_EN);
++
++	regmap_write(tve->regs, SUN8I_TVE_RESYNC_REG,
++		     SUN8I_TVE_RESYNC_UNKNOWN |
++		     SUN8I_TVE_RESYNC_LINE(15) |
++		     SUN8I_TVE_RESYNC_PIXEL(12));
++
++	regmap_write(tve->regs, SUN8I_TVE_SLAVE_REG, 0);
++	regmap_write(tve->regs, SUN8I_TVE_ENC_CFG0_REG, 0);
++	regmap_write(tve->regs, SUN8I_TVE_ENC_CFG1_REG,
++		     tv_mode->bypass_yclamp ? SUN8I_TVE_ENC_CFG1_BYPASS_YCLAMP : 0);
++
++	/* Interlaced input, so no deflicker filter */
++	regmap_write(tve->regs, SUN8I_TVE_LP_CTL_REG, 0);
++	regmap_write(tve->regs, SUN8I_TVE_NR_REG,
++		     tv_mode->noise_reduction ?
++		     SUN8I_TVE_NR_T_VALUE(3) | SUN8I_TVE_NR_EN : 0);
++}
++
++static void sun8i_tve_atomic_mode_set(struct drm_encoder *encoder,
++				      struct drm_crtc_state *crtc_state,
++				      struct drm_connector_state *conn_state)
++{
++	struct sun8i_tve *tve = drm_encoder_to_sun8i_tve(encoder);
++	const struct drm_display_mode *mode = &crtc_state->adjusted_mode;
++	unsigned long rate;
++	int ret;
++
++	/*
++	 * TCON TOP feeds the TCON TV channel with this clock divided by 16,
++	 * so it has to be set before the TCON starts.
++	 */
++	rate = (unsigned long)mode->crtc_clock * 1000 *
++	       SUN8I_TVE_CLK_PER_PIXEL_CLK;
++	ret = clk_set_rate(tve->mod_clk, rate);
++	if (ret)
++		DRM_DEV_ERROR(encoder->dev->dev,
++			      "Couldn't set TV encoder clock to %lu Hz: %d\n",
++			      rate, ret);
++}
++
++static void sun8i_tve_atomic_disable(struct drm_encoder *encoder,
++				     struct drm_atomic_commit *state)
++{
++	struct sun8i_tve *tve = drm_encoder_to_sun8i_tve(encoder);
++	struct sun4i_crtc *crtc = drm_crtc_to_sun4i_crtc(encoder->crtc);
++
++	DRM_DEBUG_DRIVER("Disabling the TV Output\n");
++
++	regmap_update_bits(tve->regs, SUN8I_TVE_GCTL_REG,
++			   SUN8I_TVE_GCTL_CLOCK_EN | SUN8I_TVE_GCTL_ENABLE, 0);
++	sun8i_tve_dac_set_enabled(tve, false);
++
++	sunxi_engine_disable_color_correction(crtc->engine);
++}
++
++static void sun8i_tve_atomic_enable(struct drm_encoder *encoder,
++				    struct drm_atomic_commit *state)
++{
++	struct sun8i_tve *tve = drm_encoder_to_sun8i_tve(encoder);
++	struct sun4i_crtc *crtc = drm_crtc_to_sun4i_crtc(encoder->crtc);
++	struct drm_crtc_state *crtc_state =
++		drm_atomic_get_new_crtc_state(state, encoder->crtc);
++	struct drm_connector_state *conn_state =
++		drm_atomic_get_new_connector_state(state, &tve->connector);
++	const struct sun8i_tve_mode *tv_mode;
++
++	DRM_DEBUG_DRIVER("Enabling the TV Output\n");
++
++	tv_mode = sun8i_tve_find_mode(conn_state->tv.mode);
++	if (!tv_mode)
++		return;
++
++	sun8i_tve_mode_set(tve, tv_mode, &crtc_state->adjusted_mode);
++
++	/* The encoder expects YCbCr, have the display engine produce it */
++	sunxi_engine_apply_color_correction(crtc->engine);
++
++	sun8i_tve_dac_set_enabled(tve, true);
++
++	regmap_update_bits(tve->regs, SUN8I_TVE_GCTL_REG,
++			   SUN8I_TVE_GCTL_CLOCK_EN | SUN8I_TVE_GCTL_ENABLE,
++			   SUN8I_TVE_GCTL_CLOCK_EN | SUN8I_TVE_GCTL_ENABLE);
++}
++
++static const struct drm_encoder_helper_funcs sun8i_tve_helper_funcs = {
++	.atomic_mode_set	= sun8i_tve_atomic_mode_set,
++	.atomic_disable		= sun8i_tve_atomic_disable,
++	.atomic_enable		= sun8i_tve_atomic_enable,
++};
++
++static const struct drm_connector_helper_funcs sun8i_tve_connector_helper_funcs = {
++	.atomic_check	= drm_atomic_helper_connector_tv_check,
++	.get_modes	= drm_connector_helper_tv_get_modes,
++};
++
++static void sun8i_tve_connector_reset(struct drm_connector *connector)
++{
++	drm_atomic_helper_connector_reset(connector);
++	drm_atomic_helper_connector_tv_reset(connector);
++}
++
++static const struct drm_connector_funcs sun8i_tve_connector_funcs = {
++	.fill_modes		= drm_helper_probe_single_connector_modes,
++	.destroy		= drm_connector_cleanup,
++	.reset			= sun8i_tve_connector_reset,
++	.atomic_duplicate_state	= drm_atomic_helper_connector_duplicate_state,
++	.atomic_destroy_state	= drm_atomic_helper_connector_destroy_state,
++};
++
++static const struct regmap_config sun8i_tve_regmap_config = {
++	.reg_bits	= 32,
++	.val_bits	= 32,
++	.reg_stride	= 4,
++	.max_register	= SUN8I_TVE_NR_REG,
++	.name		= "tve",
++};
++
++static const struct regmap_config sun8i_tve_top_regmap_config = {
++	.reg_bits	= 32,
++	.val_bits	= 32,
++	.reg_stride	= 4,
++	.max_register	= SUN8I_TVE_TOP_DAC_CFG2_REG(0),
++	.name		= "tve-top",
++};
++
++static int sun8i_tve_get_calibration(struct device *dev, u32 *calibration)
++{
++	u32 val;
++	int ret;
++
++	ret = nvmem_cell_read_u32(dev, "calibration", &val);
++	if (ret == -EPROBE_DEFER)
++		return ret;
++	if (ret) {
++		dev_warn(dev, "Couldn't read DAC calibration (%d), using default\n",
++			 ret);
++		val = 0;
++	}
++
++	/* The 10-bit bias calibration sits in the upper half of the word */
++	val = (val >> 16) & 0x3ff;
++	*calibration = val ? val : SUN8I_TVE_DAC_CALIBRATION_DEFAULT;
++
++	return 0;
++}
++
++static int sun8i_tve_bind(struct device *dev, struct device *master,
++			  void *data)
++{
++	struct platform_device *pdev = to_platform_device(dev);
++	struct sun8i_tve *tve = dev_get_drvdata(dev);
++	struct drm_device *drm = data;
++	struct reset_control *reset;
++	void __iomem *regs;
++	struct clk *clk;
++	int ret;
++
++	regs = devm_platform_ioremap_resource_byname(pdev, "tve");
++	if (IS_ERR(regs))
++		return dev_err_probe(dev, PTR_ERR(regs),
++				     "Couldn't map the TV encoder registers\n");
++
++	tve->regs = devm_regmap_init_mmio(dev, regs, &sun8i_tve_regmap_config);
++	if (IS_ERR(tve->regs))
++		return dev_err_probe(dev, PTR_ERR(tve->regs),
++				     "Couldn't create the TV encoder regmap\n");
++
++	regs = devm_platform_ioremap_resource_byname(pdev, "top");
++	if (IS_ERR(regs))
++		return dev_err_probe(dev, PTR_ERR(regs),
++				     "Couldn't map the TVE TOP registers\n");
++
++	tve->top_regs = devm_regmap_init_mmio(dev, regs,
++					      &sun8i_tve_top_regmap_config);
++	if (IS_ERR(tve->top_regs))
++		return dev_err_probe(dev, PTR_ERR(tve->top_regs),
++				     "Couldn't create the TVE TOP regmap\n");
++
++	/* TVE TOP first, it holds the DAC the encoder drives */
++	reset = devm_reset_control_get_exclusive_deasserted(dev, "top");
++	if (IS_ERR(reset))
++		return dev_err_probe(dev, PTR_ERR(reset),
++				     "Couldn't get the TVE TOP reset\n");
++
++	clk = devm_clk_get_enabled(dev, "top");
++	if (IS_ERR(clk))
++		return dev_err_probe(dev, PTR_ERR(clk),
++				     "Couldn't get the TVE TOP bus clock\n");
++
++	reset = devm_reset_control_get_exclusive_deasserted(dev, "tve");
++	if (IS_ERR(reset))
++		return dev_err_probe(dev, PTR_ERR(reset),
++				     "Couldn't get the TV encoder reset\n");
++
++	clk = devm_clk_get_enabled(dev, "bus");
++	if (IS_ERR(clk))
++		return dev_err_probe(dev, PTR_ERR(clk),
++				     "Couldn't get the TV encoder bus clock\n");
++
++	/*
++	 * The module clock also feeds the TCON TV channel through TCON TOP,
++	 * so keep it running while bound; its rate is set per mode.
++	 */
++	tve->mod_clk = devm_clk_get_enabled(dev, "mod");
++	if (IS_ERR(tve->mod_clk))
++		return dev_err_probe(dev, PTR_ERR(tve->mod_clk),
++				     "Couldn't get the TV encoder module clock\n");
++
++	sun8i_tve_dac_init(tve);
++
++	drm_encoder_helper_add(&tve->encoder, &sun8i_tve_helper_funcs);
++	ret = drm_simple_encoder_init(drm, &tve->encoder,
++				      DRM_MODE_ENCODER_TVDAC);
++	if (ret) {
++		dev_err(dev, "Couldn't initialise the TV encoder\n");
++		return ret;
++	}
++
++	tve->encoder.possible_crtcs = drm_of_find_possible_crtcs(drm,
++								 dev->of_node);
++	if (!tve->encoder.possible_crtcs) {
++		ret = -EPROBE_DEFER;
++		goto err_cleanup_encoder;
++	}
++
++	drm_connector_helper_add(&tve->connector,
++				 &sun8i_tve_connector_helper_funcs);
++	ret = drm_connector_init(drm, &tve->connector,
++				 &sun8i_tve_connector_funcs,
++				 DRM_MODE_CONNECTOR_Composite);
++	if (ret) {
++		dev_err(dev, "Couldn't initialise the Composite connector\n");
++		goto err_cleanup_encoder;
++	}
++	tve->connector.interlace_allowed = true;
++
++	drm_connector_attach_encoder(&tve->connector, &tve->encoder);
++
++	ret = drm_mode_create_tv_properties(drm,
++					    BIT(DRM_MODE_TV_MODE_NTSC) |
++					    BIT(DRM_MODE_TV_MODE_PAL));
++	if (ret)
++		goto err_cleanup_connector;
++
++	drm_object_attach_property(&tve->connector.base,
++				   drm->mode_config.tv_mode_property,
++				   DRM_MODE_TV_MODE_PAL);
++
++	return 0;
++
++err_cleanup_connector:
++	drm_connector_cleanup(&tve->connector);
++err_cleanup_encoder:
++	drm_encoder_cleanup(&tve->encoder);
++	return ret;
++}
++
++static void sun8i_tve_unbind(struct device *dev, struct device *master,
++			     void *data)
++{
++	struct sun8i_tve *tve = dev_get_drvdata(dev);
++
++	sun8i_tve_dac_set_enabled(tve, false);
++}
++
++static const struct component_ops sun8i_tve_ops = {
++	.bind	= sun8i_tve_bind,
++	.unbind	= sun8i_tve_unbind,
++};
++
++static int sun8i_tve_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct sun8i_tve *tve;
++	int ret;
++
++	tve = devm_kzalloc(dev, sizeof(*tve), GFP_KERNEL);
++	if (!tve)
++		return -ENOMEM;
++
++	/* Done here rather than at bind time so that the efuse can defer us */
++	ret = sun8i_tve_get_calibration(dev, &tve->calibration);
++	if (ret)
++		return ret;
++
++	dev_set_drvdata(dev, tve);
++
++	return component_add(dev, &sun8i_tve_ops);
++}
++
++static void sun8i_tve_remove(struct platform_device *pdev)
++{
++	component_del(&pdev->dev, &sun8i_tve_ops);
++}
++
++static const struct of_device_id sun8i_tve_of_table[] = {
++	{ .compatible = "allwinner,sun50i-h616-tv-encoder" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, sun8i_tve_of_table);
++
++static struct platform_driver sun8i_tve_platform_driver = {
++	.probe		= sun8i_tve_probe,
++	.remove		= sun8i_tve_remove,
++	.driver		= {
++		.name		= "sun8i-tve",
++		.of_match_table	= sun8i_tve_of_table,
++	},
++};
++module_platform_driver(sun8i_tve_platform_driver);
++
++MODULE_AUTHOR("Arun Iyengar <aiyengar1990@gmail.com>");
++MODULE_DESCRIPTION("Allwinner H616 TV Encoder Driver");
++MODULE_LICENSE("GPL");
+-- 
+Armbian
