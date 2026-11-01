@@ -49,6 +49,19 @@ write_uboot_platform() {
 	dd if=$1/u-boot-sunxi-with-spl.bin of=$2 conv=fsync bs=1024 seek=8
 }
 
+# SPI NOR (boards with CONFIG_SPL_SPI_SUNXI, e.g. Orange Pi Zero2): the BROM loads the SPL
+# from offset 0 of the flash, so the SD/eMMC image (SPL + U-Boot FIT) is written as is.
+# $2 is the /dev/mtdblockN armbian-install selected; flashcp (mtd-utils) erases, writes and
+# verifies through the matching character device, dd on the block device is the fallback.
+write_uboot_platform_mtd() {
+	local img="$1/u-boot-sunxi-with-spl.bin" mtd="${2/mtdblock/mtd}"
+	if command -v flashcp > /dev/null && [[ -c $mtd ]]; then
+		flashcp -v "$img" "$mtd"
+	else
+		dd if="$img" of="$2" conv=fsync,notrunc status=none
+	fi
+}
+
 setup_write_uboot_platform() {
 	local tmp part dev
 	if grep -q "ubootpart" /proc/cmdline; then
