@@ -65,6 +65,9 @@ function do_main_configuration() {
 	# Armbian config is central tool used in all builds. As its build externally, we have moved it to extension. Enable it here.
 	enable_extension "armbian-config"
 
+	# Kernel security fixes that stable does not carry yet, from armbian/cve. KERNEL_CVE_PATCHES=no disables them.
+	enable_extension "kernel-cve-patches"
+
 	# Fix binman pkg_resources removal in setuptools >= 82. Can be removed when all U-Boot versions are >= v2025.10.
 	enable_extension "uboot-binman-fix-pkg-resources"
 
