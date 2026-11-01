@@ -1,0 +1,53 @@
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Subject: [PATCH] usb: hub: yield while waiting for the port connect debounce
+
+usb_init() creates one uthread per USB controller for the bus scan
+(CONFIG_UTHREAD), but the scan threads never actually overlap: the port
+scan loop in usb_device_list_scan() only waits for time to pass
+(query_delay, then CONFIG_USB_HUB_DEBOUNCE_TIMEOUT = 1 s for a port with
+nothing connected), and for a root hub every port status request is
+answered synchronously by the host controller driver, so the loop spins
+without ever reaching udelay()/schedule(). The first controller's thread
+therefore holds the CPU for the full ~1.1 s debounce, then the next one
+does the same, and "usb start" costs ~1.1 s per controller: 7 s on an
+H616 board with three EHCI + three OHCI root hubs.
+
+Yield once per pass over usb_scan_list. The other controllers' threads
+then configure their root hubs and add their ports to the (shared) list
+while the first one is debouncing, and the running loop scans all of
+them; the debounce periods overlap and "usb start" takes about one
+debounce per phase (primary controllers, then companions). Without
+CONFIG_UTHREAD schedule() only runs the cyclic framework, as the EHCI
+transfer wait loop already does.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff -ruN a/common/usb_hub.c b/common/usb_hub.c
+--- a/common/usb_hub.c
++++ b/common/usb_hub.c
+@@ -41,6 +41,7 @@
+ #include <asm/unaligned.h>
+ 
+ #include <usb.h>
++#include <u-boot/schedule.h>
+ 
+ #define USB_BUFSIZ	512
+ 
+@@ -592,6 +593,17 @@
+ 			if (ret)
+ 				goto out;
+ 		}
++
++		/*
++		 * Root hub port status requests complete synchronously, so this
++		 * loop never sleeps while it waits for the connect debounce
++		 * (query_delay + CONFIG_USB_HUB_DEBOUNCE_TIMEOUT) to expire.
++		 * Yield so that the uthreads usb_init() created for the other
++		 * controllers can configure their root hubs and add their ports
++		 * to usb_scan_list meanwhile; the debounce periods then overlap
++		 * instead of adding up per controller.
++		 */
++		schedule();
+ 	}
+ 
+ out:
