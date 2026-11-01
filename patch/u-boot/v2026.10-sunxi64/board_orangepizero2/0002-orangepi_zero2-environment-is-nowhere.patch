@@ -1,0 +1,30 @@
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Subject: [PATCH] configs: orangepi_zero2: do not store the environment
+
+Armbian configures the boot through /boot/armbianEnv.txt, read by
+boot.scr; a saved U-Boot environment is never written and, if one ever
+appeared (stale uboot.env on a FAT partition, a saved env in the SPI
+flash), it would silently override the boot flow. Our images are a
+single ext4 partition anyway, so the upstream default (FAT on mmc 0:1)
+only produces
+
+  Loading Environment from FAT... Unable to use mmc 0:1...
+
+on every boot, and ENV_IS_IN_SPI_FLASH would put a 64 KiB env at 0xf0000
+of the 2 MiB SPI NOR we now boot from. Use ENV_IS_NOWHERE: the built-in
+default environment is used, saveenv is unavailable, no probing noise.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/configs/orangepi_zero2_defconfig
++++ b/configs/orangepi_zero2_defconfig
+@@ -24,6 +24,9 @@
+ CONFIG_SUN8I_EMAC=y
+ CONFIG_PHY_REALTEK=y
+ CONFIG_AXP305_POWER=y
++# CONFIG_ENV_IS_IN_FAT is not set
++# CONFIG_ENV_IS_IN_SPI_FLASH is not set
++CONFIG_ENV_IS_NOWHERE=y
+ CONFIG_SPI=y
+ CONFIG_USB_EHCI_HCD=y
+ CONFIG_USB_OHCI_HCD=y
