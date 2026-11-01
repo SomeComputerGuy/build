@@ -1,0 +1,32 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Orange Pi Zero2 13-pin "expansion board": IR receiver and composite
+ * video (CVBS) output. Line-out is already enabled in the board DT.
+ *
+ * The expansion board's MIC jack is not usable on the Zero2: the H616
+ * audio codec has no ADC (H616 User Manual 8.4.1 lists DAC/LINEOUT only)
+ * and the official Zero2 user guide states "The Orange Pi Zero2 does not
+ * support MIC Input on the expansion board".
+ *
+ * Enable with: overlays=orangepi-zero2-expansion
+ */
+
+/ {
+	compatible = "xunlong,orangepi-zero2", "allwinner,sun50i-h616";
+
+	fragment@0 {
+		target = <&ir>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+
+	fragment@1 {
+		target = <&tve>;
+		__overlay__ {
+			status = "okay";
+		};
+	};
+};
