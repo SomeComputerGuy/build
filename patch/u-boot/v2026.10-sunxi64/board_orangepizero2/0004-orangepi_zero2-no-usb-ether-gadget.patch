@@ -1,0 +1,25 @@
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Subject: [PATCH] configs: orangepi_zero2: drop the RNDIS Ethernet gadget
+
+CONFIG_USB_ETHER defaults to y on sunxi with the MUSB gadget. It
+registers a fake "usb_ether" network device at boot which only ever prints
+
+  Allwinner mUSB OTG (Peripheral)
+  Net:   eth0: ethernet@5020000using musb-hdrc, OUT ep1out IN ep1in STATUS ep2in
+  MAC de:ad:be:ef:00:01
+  HOST MAC de:ad:be:ef:00:00
+  RNDIS ready
+  , eth1: usb_ether
+
+on the Zero2, whose USB-C port is power/peripheral only and never used
+for RNDIS networking. The MUSB gadget itself (fastboot, ums) is kept.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/configs/orangepi_zero2_defconfig
++++ b/configs/orangepi_zero2_defconfig
+@@ -28,3 +28,4 @@
+ CONFIG_USB_EHCI_HCD=y
+ CONFIG_USB_OHCI_HCD=y
+ CONFIG_USB_MUSB_GADGET=y
++# CONFIG_USB_ETHER is not set
