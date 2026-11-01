@@ -96,6 +96,7 @@ dtb-$(CONFIG_ARCH_SUNXI) += \
 	sun50i-h616-spidev1_1.dtbo \
 	sun50i-h616-spidev1_2.dtbo \
 	sun50i-h616-ir.dtbo \
+	sun50i-h616-orangepi-zero2-expansion.dtbo \
 	sun50i-h616-tft35_spi.dtbo \
 	sun50i-h616-mcp2515.dtbo \
 	sun50i-h616-walnutpi-box-oled.dtbo \
