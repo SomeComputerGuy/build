@@ -1,0 +1,46 @@
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Subject: [PATCH] sunxi: export the boot source in the environment
+
+Boot scripts want to know which medium the BROM loaded the SPL from (to
+print it, to pick the root device, to decide whether the SD card is the
+boot device at all). Armbian's sunxi boot script reads the boot_media
+byte of the SPL header at a hard-coded 0x10028, which is only right for
+SoCs whose SRAM A1 is at 0x10000 (A64/H5): on H6/H616/H618 the SPL sits
+at 0x20000, on A523 at 0x44000, so there it reports "loaded from SD"
+while U-Boot actually came from the SPI flash. U-Boot already knows the
+answer (sunxi_get_boot_device(), used for fel_booted/mmc_bootdev), so
+publish it as ${boot_source} = fel | mmc0 | mmc2 | spi | nand next to
+those two variables. Scripts can then fall back to the SPL header only
+on U-Boots that do not export it.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff -ruN a/board/sunxi/board.c b/board/sunxi/board.c
+--- a/board/sunxi/board.c
++++ b/board/sunxi/board.c
+@@ -835,17 +835,25 @@
+ 	env_set("fel_booted", NULL);
+ 	env_set("fel_scriptaddr", NULL);
+ 	env_set("mmc_bootdev", NULL);
++	env_set("boot_source", NULL);
+ 
+ 	boot = sunxi_get_boot_device();
+ 	/* determine if we are running in FEL mode */
+ 	if (boot == BOOT_DEVICE_BOARD) {
+ 		env_set("fel_booted", "1");
++		env_set("boot_source", "fel");
+ 		parse_spl_header(SPL_ADDR);
+ 	/* or if we booted from MMC, and which one */
+ 	} else if (boot == BOOT_DEVICE_MMC1) {
+ 		env_set("mmc_bootdev", "0");
++		env_set("boot_source", "mmc0");
+ 	} else if (boot == BOOT_DEVICE_MMC2) {
+ 		env_set("mmc_bootdev", "1");
++		env_set("boot_source", "mmc2");
++	} else if (boot == BOOT_DEVICE_SPI) {
++		env_set("boot_source", "spi");
++	} else if (boot == BOOT_DEVICE_NAND) {
++		env_set("boot_source", "nand");
+ 	}
+ 
+ 	/* Set fdtfile to match the FIT configuration chosen in SPL. */
