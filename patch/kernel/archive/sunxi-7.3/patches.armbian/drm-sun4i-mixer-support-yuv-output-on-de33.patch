@@ -311,15 +311,15 @@ diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.h b/drivers/gpu/drm/sun4i/sun8i_m
 index 111111111111..222222222222 100644
 --- a/drivers/gpu/drm/sun4i/sun8i_mixer.h
 +++ b/drivers/gpu/drm/sun4i/sun8i_mixer.h
-@@ -89,6 +89,8 @@
+@@ -93,6 +93,8 @@
  
  /* colors are always in AARRGGBB format */
  #define SUN8I_MIXER_BLEND_COLOR_BLACK		0xff000000
 +/* Black in limited range YCbCr, used when the blender works in YUV */
 +#define SUN50I_MIXER_BLEND_COLOR_BLACK_YUV	0xff108080
- /* The following numbers are some still unknown magic numbers */
- #define SUN8I_MIXER_BLEND_MODE_DEF		0x03010301
- 
+ /*
+  * Blend coefficients: pixel fs = 1, fd = 1 - As; alpha fs = 1, fd = 1 - As,
+  * i.e. the "source over" operator on pre-multiplied data. Pipes flagged as
 @@ -96,6 +98,8 @@
  #define SUN8I_MIXER_BLEND_ROUTE_PIPE_SHIFT(n)	((n) << 2)
  
