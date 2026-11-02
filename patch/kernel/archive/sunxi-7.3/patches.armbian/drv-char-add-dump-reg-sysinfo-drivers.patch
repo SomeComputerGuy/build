@@ -1406,7 +1406,7 @@ index 000000000000..111111111111
 +	.platform_name  = "sun50i-h616",
 +};
 +
-+struct sunxi_info_quirks *quirks;
++static const struct sunxi_info_quirks *quirks;
 +
 +static int soc_info_open(struct inode *inode, struct file *file)
 +{
