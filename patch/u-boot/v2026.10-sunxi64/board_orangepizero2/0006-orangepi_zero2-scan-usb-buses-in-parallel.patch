@@ -1,0 +1,21 @@
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Subject: [PATCH] configs: orangepi_zero2: scan the six USB host controllers in parallel
+
+With the on-board USB-A port and the two expansion-board ports enabled
+the Zero2 has three EHCI and three OHCI root hubs, and the sequential
+bus scan in "usb start" (preboot) costs the 1 s connect debounce per
+controller: 7 s with nothing plugged in, up from 2.5 s with one port.
+Enable CONFIG_UTHREAD so usb_init() initialises and scans the
+controllers in parallel (together with the usb_hub yield fix) which
+brings the scan back to roughly the two-port figure while keeping every
+port bootable.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/configs/orangepi_zero2_defconfig
++++ b/configs/orangepi_zero2_defconfig
+@@ -29,3 +29,4 @@
+ CONFIG_USB_OHCI_HCD=y
+ CONFIG_USB_MUSB_GADGET=y
+ # CONFIG_USB_ETHER is not set
++CONFIG_UTHREAD=y
