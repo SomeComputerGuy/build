@@ -1,0 +1,598 @@
+From 0b820e1fdb6661373c71f49a12880562d9783544 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Mon, 2 Nov 2026 04:58:17 +0000
+Subject: [PATCH 3/3] debug(allwinner): PM event trace page and runtime
+ experiment knob
+
+Bring-up aid only, not for upstream. The Allwinner BL31 console has no
+runtime scope and printing from PSCI handlers after the OS has gated the
+UART clock would hang BL31, so record PM events in the last page of the
+BL31 DRAM reservation instead (SUNXI_PM_TRACE_BASE = 0x4003f000, mapped
+non-cacheable, a system ring plus one lock-free ring per core, survives
+warm resets; the per-core rings freeze after a warm reset until the OS
+re-arms them) where the OS (/dev/mem) or U-Boot (md.l) can read them.
+The same page carries a knob, reset to 0 at every boot, that selects
+cpu-sleep experiments at runtime (WFI only / the regular sequence with
+or without the GIC CPU interface / either with core 0 never gated) and
+lets the system suspend path skip the DRAM self-refresh, the CPU clock
+change or the SRAM relocation. Modes whose WFI may return restart the
+core through the warm boot entry point instead of letting the generic
+code panic.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ plat/allwinner/common/allwinner-common.mk     |  9 ++
+ plat/allwinner/common/include/platform_def.h  |  5 +-
+ .../allwinner/common/include/sunxi_pm_trace.h | 65 +++++++++++++
+ plat/allwinner/common/sunxi_bl31_setup.c      |  2 +
+ plat/allwinner/common/sunxi_common.c          |  4 +
+ plat/allwinner/common/sunxi_native_pm.c       | 90 +++++++++++++++++
+ plat/allwinner/common/sunxi_native_suspend.c  | 46 ++++++---
+ plat/allwinner/common/sunxi_pm_trace.c        | 97 +++++++++++++++++++
+ plat/allwinner/common/sunxi_standby_sram.S    | 20 ++++
+ plat/allwinner/sun50i_h616/platform.mk        |  1 +
+ 10 files changed, 326 insertions(+), 13 deletions(-)
+ create mode 100644 plat/allwinner/common/include/sunxi_pm_trace.h
+ create mode 100644 plat/allwinner/common/sunxi_pm_trace.c
+
+diff --git a/plat/allwinner/common/allwinner-common.mk b/plat/allwinner/common/allwinner-common.mk
+index 88541a0..f1ec32d 100644
+--- a/plat/allwinner/common/allwinner-common.mk
++++ b/plat/allwinner/common/allwinner-common.mk
+@@ -82,6 +82,15 @@ BL31_SOURCES		+=	${AW_PLAT}/common/sunxi_native_suspend.c \
+ 				${AW_PLAT}/common/sunxi_standby_sram.S
+ endif
+ 
++# Bring-up only: event trace + experiment knob in the last page of the BL31
++# DRAM reservation, readable from the OS via /dev/mem and from U-Boot via md.
++SUNXI_PM_DEBUG_TRACE	?=	0
++$(eval $(call assert_boolean,SUNXI_PM_DEBUG_TRACE))
++$(eval $(call add_define,SUNXI_PM_DEBUG_TRACE))
++ifeq (${SUNXI_PM_DEBUG_TRACE},1)
++BL31_SOURCES		+=	${AW_PLAT}/common/sunxi_pm_trace.c
++endif
++
+ ifeq (${SUNXI_PSCI_USE_SCPI},1)
+ BL31_SOURCES		+=	drivers/allwinner/sunxi_msgbox.c	\
+ 				drivers/arm/css/scpi/css_scpi.c		\
+diff --git a/plat/allwinner/common/include/platform_def.h b/plat/allwinner/common/include/platform_def.h
+index c9d075a..65f8192 100644
+--- a/plat/allwinner/common/include/platform_def.h
++++ b/plat/allwinner/common/include/platform_def.h
+@@ -48,10 +48,13 @@
+ /* How much DRAM to map (to map BL33, for fetching the DTB from U-Boot) */
+ #define SUNXI_DRAM_MAP_SIZE		(64U << 20)
+ 
++/* Bring-up PM trace page: last page of the BL31 DRAM reservation. */
++#define SUNXI_PM_TRACE_BASE		(BL31_LIMIT - PAGE_SIZE)
++
+ #define CACHE_WRITEBACK_SHIFT		6
+ #define CACHE_WRITEBACK_GRANULE		(1 << CACHE_WRITEBACK_SHIFT)
+ 
+-#define MAX_STATIC_MMAP_REGIONS		3
++#define MAX_STATIC_MMAP_REGIONS		4
+ #define MAX_MMAP_REGIONS		(5 + MAX_STATIC_MMAP_REGIONS)
+ 
+ #define PLAT_CSS_SCP_COM_SHARED_MEM_BASE \
+diff --git a/plat/allwinner/common/include/sunxi_pm_trace.h b/plat/allwinner/common/include/sunxi_pm_trace.h
+new file mode 100644
+index 0000000..b91e9c0
+--- /dev/null
++++ b/plat/allwinner/common/include/sunxi_pm_trace.h
+@@ -0,0 +1,65 @@
++/*
++ * Copyright (c) 2026, Arun Iyengar <aiyengar1990@gmail.com>
++ *
++ * SPDX-License-Identifier: BSD-3-Clause
++ *
++ * Bring-up aid: PM event trace and experiment knob in a non-cacheable page
++ * (SUNXI_PM_TRACE_BASE). Layout:
++ *   0x00 magic "SXPM" (0x4d505853)   0x04 boot generation
++ *   0x08 knob (reset to 0 at every boot)
++ *   0x0c freeze: set by BL31 after a warm reset, per-core rings stop
++ *        recording until the OS clears it (the pre-reset events survive)
++ *   0x40 system ring (BOOT, SYS_*, SYSTEM_*): u32 count, 3 x u32 reserved,
++ *        then 58 records
++ *   0x400 + core * 0x300: per-core ring (CPU_ON/OFF, SLEEP_*, STANDBY):
++ *        u32 count, 3 x u32 reserved, then 46 records
++ *   record: {u32 cntpct_lo, u32 event | core << 24, u32 d0, u32 d1}
++ */
++
++#ifndef SUNXI_PM_TRACE_H
++#define SUNXI_PM_TRACE_H
++
++#include <stdint.h>
++
++#define SUNXI_PM_TRACE_MAGIC		0x4d505853U
++
++enum sunxi_pm_event {
++	SUNXI_PM_EV_BOOT = 1,		/* d0: generation */
++	SUNXI_PM_EV_CPU_ON,		/* d0: mpidr */
++	SUNXI_PM_EV_CPU_OFF,		/* d0: CPUIDLE_STAT, d1: CPUIDLE_PEND */
++	SUNXI_PM_EV_SLEEP_ENTER,	/* d0: mode | CPUIDLE_STAT << 8, d1: CPUIDLE_PEND */
++	SUNXI_PM_EV_SLEEP_WAKE,		/* d0: CPUIDLE_STAT, d1: CPUIDLE_PEND */
++	SUNXI_PM_EV_SLEEP_WFI_RET,	/* WFI returned, core was not gated */
++	SUNXI_PM_EV_STANDBY,		/* cpu_standby (retention) */
++	SUNXI_PM_EV_SYS_SUSPEND,	/* d0: CPUX_AXI_CFG, d1: PLL_CPUX */
++	SUNXI_PM_EV_SYS_JUMP,		/* d0: knob, d1: entry address */
++	SUNXI_PM_EV_SYS_RESUME,		/* d0: standby result, d1: PLL locked */
++	SUNXI_PM_EV_SYSTEM_RESET,
++	SUNXI_PM_EV_SYSTEM_OFF,
++};
++
++/* knob bits */
++#define SUNXI_PM_KNOB_SLEEP_MODE_MASK	0x7U	/* see sunxi_native_pm.c */
++#define SUNXI_PM_KNOB_SKIP_SELFREF	(1U << 4)
++#define SUNXI_PM_KNOB_SKIP_CPU_CLK	(1U << 5)
++#define SUNXI_PM_KNOB_STANDBY_IN_DRAM	(1U << 6)
++
++#if SUNXI_PM_DEBUG_TRACE
++void sunxi_pm_trace_init(void);
++void sunxi_pm_trace(unsigned int event, uint32_t d0, uint32_t d1);
++uint32_t sunxi_pm_knob(void);
++void __dead2 sunxi_warm_restart(void);
++#else
++static inline void sunxi_pm_trace_init(void)
++{
++}
++static inline void sunxi_pm_trace(unsigned int event, uint32_t d0, uint32_t d1)
++{
++}
++static inline uint32_t sunxi_pm_knob(void)
++{
++	return 0;
++}
++#endif
++
++#endif /* SUNXI_PM_TRACE_H */
+diff --git a/plat/allwinner/common/sunxi_bl31_setup.c b/plat/allwinner/common/sunxi_bl31_setup.c
+index 263083b..b3243f8 100644
+--- a/plat/allwinner/common/sunxi_bl31_setup.c
++++ b/plat/allwinner/common/sunxi_bl31_setup.c
+@@ -23,6 +23,7 @@
+ 
+ #include <sunxi_def.h>
+ #include <sunxi_mmap.h>
++#include <sunxi_pm_trace.h>
+ #include <sunxi_private.h>
+ 
+ 
+@@ -185,6 +186,7 @@ void bl31_plat_runtime_setup(void)
+ {
+ 	/* Change the DTB if the configuration requires so. */
+ 	sunxi_prepare_dtb(fdt);
++	sunxi_pm_trace_init();
+ }
+ 
+ entry_point_info_t *bl31_plat_get_next_image_ep_info(uint32_t type)
+diff --git a/plat/allwinner/common/sunxi_common.c b/plat/allwinner/common/sunxi_common.c
+index 62f4fcb..471e2b8 100644
+--- a/plat/allwinner/common/sunxi_common.c
++++ b/plat/allwinner/common/sunxi_common.c
+@@ -23,6 +23,10 @@ static const mmap_region_t sunxi_mmap[MAX_STATIC_MMAP_REGIONS + 1] = {
+ 			MT_DEVICE | MT_RW | MT_SECURE | MT_EXECUTE_NEVER),
+ 	MAP_REGION(PRELOADED_BL33_BASE, SUNXI_BL33_VIRT_BASE,
+ 		   SUNXI_DRAM_MAP_SIZE, MT_RW_DATA | MT_NS),
++#if SUNXI_PM_DEBUG_TRACE
++	MAP_REGION_FLAT(SUNXI_PM_TRACE_BASE, PAGE_SIZE,
++			MT_NON_CACHEABLE | MT_RW | MT_SECURE | MT_EXECUTE_NEVER),
++#endif
+ 	{},
+ };
+ 
+diff --git a/plat/allwinner/common/sunxi_native_pm.c b/plat/allwinner/common/sunxi_native_pm.c
+index 2f66ea5..64c74bf 100644
+--- a/plat/allwinner/common/sunxi_native_pm.c
++++ b/plat/allwinner/common/sunxi_native_pm.c
+@@ -16,6 +16,7 @@
+ 
+ #include <sunxi_cpucfg.h>
+ #include <sunxi_mmap.h>
++#include <sunxi_pm_trace.h>
+ #include <sunxi_private.h>
+ 
+ #define SUNXI_WDOG0_CTRL_REG		(SUNXI_R_WDOG_BASE + 0x0010)
+@@ -40,6 +41,7 @@
+ 
+ static int sunxi_pwr_domain_on(u_register_t mpidr)
+ {
++	sunxi_pm_trace(SUNXI_PM_EV_CPU_ON, (uint32_t)mpidr, 0);
+ 	sunxi_cpu_on(mpidr);
+ 
+ 	return PSCI_E_SUCCESS;
+@@ -50,6 +52,8 @@ static void sunxi_pwr_domain_off(const psci_power_state_t *target_state)
+ #if SUNXI_NATIVE_CPU_SUSPEND
+ 	/* An offline core must stay off whatever interrupts target it. */
+ 	mmio_clrbits_32(SUNXI_CPUIDLE_WAKE_REG, BIT_32(plat_my_core_pos()));
++	sunxi_pm_trace(SUNXI_PM_EV_CPU_OFF, mmio_read_32(SUNXI_CPUIDLE_STAT_REG),
++		       mmio_read_32(SUNXI_CPUIDLE_PEND_REG));
+ #endif
+ 
+ 	gicv2_cpuif_disable();
+@@ -70,11 +74,45 @@ static void sunxi_cpu_standby(plat_local_state_t cpu_state)
+ 
+ 	assert(is_local_state_retn(cpu_state));
+ 
++	sunxi_pm_trace(SUNXI_PM_EV_STANDBY, cpu_state, 0);
+ 	write_scr_el3(scr | SCR_IRQ_BIT);
+ 	wfi();
+ 	write_scr_el3(scr);
+ }
+ 
++#if SUNXI_PM_DEBUG_TRACE
++/*
++ * Bring-up experiments, selected at runtime through the knob (bits 2:0):
++ *  0: no power-down at all: WFI in EL3, then restart through the warm boot
++ *     entry point (always safe, exercises the resume path)
++ *  1: the regular sequence: CPUIDLE_WAKE armed, CORE_CLOSE + WFI with the
++ *     GIC CPU interface disabled
++ *  2: like 1 but with the GIC CPU interface left enabled
++ *  3: like 1, but core 0 is never gated (behaves as in mode 0)
++ *  4: like 2, but core 0 is never gated
++ */
++static unsigned int sleep_mode[PLATFORM_CORE_COUNT];
++
++/* Sampled once per entry so that a knob change cannot split one cycle in two modes. */
++static unsigned int sunxi_sleep_mode(bool sample)
++{
++	unsigned int core = plat_my_core_pos();
++
++	if (sample) {
++		unsigned int mode = sunxi_pm_knob() & SUNXI_PM_KNOB_SLEEP_MODE_MASK;
++
++		if (mode > 4U) {
++			mode = 0U;
++		}
++		if (mode >= 3U) {
++			mode = (core == 0U) ? 0U : mode - 2U;
++		}
++		sleep_mode[core] = mode;
++	}
++	return sleep_mode[core];
++}
++#endif
++
+ /*
+  * Power this core down. The CPUIDLE hardware block takes over once the core
+  * executes WFI with its CORE_CLOSE flag set: it isolates the core and removes
+@@ -97,6 +135,25 @@ static void sunxi_pwr_domain_suspend(const psci_power_state_t *target_state)
+ 		return;
+ 	}
+ 
++#if SUNXI_PM_DEBUG_TRACE
++	{
++		unsigned int mode = sunxi_sleep_mode(true);
++
++		sunxi_pm_trace(SUNXI_PM_EV_SLEEP_ENTER,
++			       mode | (mmio_read_32(SUNXI_CPUIDLE_STAT_REG) << 8),
++			       mmio_read_32(SUNXI_CPUIDLE_PEND_REG));
++		if (mode == 0U) {
++			return;
++		}
++		mmio_setbits_32(SUNXI_CPUIDLE_WAKE_REG, BIT_32(plat_my_core_pos()));
++		if (mode == 1U) {
++			gicv2_cpuif_disable();
++		}
++		sunxi_cpu_power_off_self();
++		return;
++	}
++#endif
++
+ 	mmio_setbits_32(SUNXI_CPUIDLE_WAKE_REG, BIT_32(plat_my_core_pos()));
+ 
+ 	gicv2_cpuif_disable();
+@@ -113,6 +170,9 @@ static void sunxi_pwr_domain_suspend_finish(const psci_power_state_t *target_sta
+ #endif
+ 	{
+ 		mmio_clrbits_32(SUNXI_CPUIDLE_WAKE_REG, BIT_32(plat_my_core_pos()));
++		sunxi_pm_trace(SUNXI_PM_EV_SLEEP_WAKE,
++			       mmio_read_32(SUNXI_CPUIDLE_STAT_REG),
++			       mmio_read_32(SUNXI_CPUIDLE_PEND_REG));
+ 	}
+ 
+ 	/* The GIC distributor never loses power, only the CPU interface needs setup. */
+@@ -126,6 +186,34 @@ static void sunxi_pwr_domain_pwr_down(const psci_power_state_t *target_state)
+ 	if (is_local_state_off(SYSTEM_PWR_STATE(target_state))) {
+ 		sunxi_native_system_suspend_pwr_down();
+ 	}
++
++#if SUNXI_PM_DEBUG_TRACE
++	{
++		unsigned int mode = sunxi_sleep_mode(false);
++
++		/*
++		 * In the modes where the WFI can return (no power-down, or the
++		 * GIC CPU interface left on), do it here and restart the core
++		 * through the warm boot path, as if it had been powered off;
++		 * the generic code would panic on a returning WFI.
++		 */
++		if (mode == 0U || mode == 2U) {
++			write_scr_el3(read_scr_el3() | SCR_IRQ_BIT);
++			isb();
++			dsbsy();
++			wfi();
++			if (mode != 0U) {
++				mmio_write_32(SUNXI_CORE_CLOSE_REG, 0);
++				mmio_clrbits_32(SUNXI_CPUIDLE_WAKE_REG,
++						BIT_32(plat_my_core_pos()));
++			}
++			sunxi_pm_trace(SUNXI_PM_EV_SLEEP_WFI_RET,
++				       mmio_read_32(SUNXI_CPUIDLE_STAT_REG),
++				       mmio_read_32(SUNXI_CPUIDLE_PEND_REG));
++			sunxi_warm_restart();
++		}
++	}
++#endif
+ }
+ 
+ static void sunxi_get_sys_suspend_power_state(psci_power_state_t *req_state)
+@@ -178,6 +266,7 @@ static int sunxi_validate_power_state(unsigned int power_state,
+ 
+ static void sunxi_system_off(void)
+ {
++	sunxi_pm_trace(SUNXI_PM_EV_SYSTEM_OFF, 0, 0);
+ 	gicv2_cpuif_disable();
+ 
+ 	/* Attempt to power down the board (may not return) */
+@@ -190,6 +279,7 @@ static void sunxi_system_off(void)
+ 
+ static void __dead2 sunxi_system_reset(void)
+ {
++	sunxi_pm_trace(SUNXI_PM_EV_SYSTEM_RESET, 0, 0);
+ 	gicv2_cpuif_disable();
+ 
+ 	/* Reset the whole system when the watchdog times out */
+diff --git a/plat/allwinner/common/sunxi_native_suspend.c b/plat/allwinner/common/sunxi_native_suspend.c
+index 94a6bad..f00f728 100644
+--- a/plat/allwinner/common/sunxi_native_suspend.c
++++ b/plat/allwinner/common/sunxi_native_suspend.c
+@@ -15,6 +15,7 @@
+ 
+ #include <sunxi_ccu.h>
+ #include <sunxi_mmap.h>
++#include <sunxi_pm_trace.h>
+ #include <sunxi_private.h>
+ 
+ /* PLL_CPUX control register */
+@@ -58,31 +59,49 @@ void __dead2 sunxi_native_system_suspend_pwr_down(void)
+ {
+ 	const uint32_t *src = sunxi_standby_sram_start;
+ 	uintptr_t dst = SUNXI_SRAM_A1_BASE;
++	uintptr_t entry = SUNXI_SRAM_A1_BASE;
++	uint32_t knob = sunxi_pm_knob();
++	uint32_t poll_limit = STANDBY_POLL_LIMIT;
+ 
+-	/* Run the CPU from the 24 MHz oscillator and stop its PLL. */
+ 	saved_cpux_axi_cfg = mmio_read_32(SUNXI_CCU_CPUX_AXI_CFG_REG);
+-	mmio_write_32(SUNXI_CCU_CPUX_AXI_CFG_REG,
+-		      (saved_cpux_axi_cfg & ~CPUX_CLK_SRC_MASK) |
+-		      CPUX_CLK_SRC_OSC24M);
+-	udelay(1);
+ 	saved_pll_cpux = mmio_read_32(SUNXI_CCU_PLL_CPUX_REG);
+-	mmio_write_32(SUNXI_CCU_PLL_CPUX_REG, saved_pll_cpux & ~PLL_CPUX_ENABLE);
++	sunxi_pm_trace(SUNXI_PM_EV_SYS_SUSPEND, saved_cpux_axi_cfg, saved_pll_cpux);
++
++	/* Run the CPU from the 24 MHz oscillator and stop its PLL. */
++	if ((knob & SUNXI_PM_KNOB_SKIP_CPU_CLK) == 0U) {
++		mmio_write_32(SUNXI_CCU_CPUX_AXI_CFG_REG,
++			      (saved_cpux_axi_cfg & ~CPUX_CLK_SRC_MASK) |
++			      CPUX_CLK_SRC_OSC24M);
++		udelay(1);
++		mmio_write_32(SUNXI_CCU_PLL_CPUX_REG,
++			      saved_pll_cpux & ~PLL_CPUX_ENABLE);
++	}
+ 
+-	/* SRAM is mapped as device memory, so copy it word by word. */
+-	while (src < sunxi_standby_sram_end) {
+-		mmio_write_32(dst, *src++);
+-		dst += sizeof(uint32_t);
++	if ((knob & SUNXI_PM_KNOB_STANDBY_IN_DRAM) != 0U) {
++		/* Experiment: run the routine in place, DRAM must stay active. */
++		entry = (uintptr_t)sunxi_standby_sram_start;
++		poll_limit = 0;
++	} else {
++		/* SRAM is mapped as device memory, so copy it word by word. */
++		while (src < sunxi_standby_sram_end) {
++			mmio_write_32(dst, *src++);
++			dst += sizeof(uint32_t);
++		}
++	}
++	if ((knob & SUNXI_PM_KNOB_SKIP_SELFREF) != 0U) {
++		poll_limit = 0;
+ 	}
+ 	dsbsy();
++	sunxi_pm_trace(SUNXI_PM_EV_SYS_JUMP, knob, (uint32_t)entry);
+ 
+ 	/* A pending Non-secure interrupt must terminate the WFI in SRAM. */
+ 	write_scr_el3(read_scr_el3() | SCR_IRQ_BIT);
+ 	isb();
+ 
+ 	standby_result = 0;
+-	sunxi_standby_jump(SUNXI_SRAM_A1_BASE, SUNXI_DRAM_CTL_BASE,
++	sunxi_standby_jump(entry, SUNXI_DRAM_CTL_BASE,
+ 			   SUNXI_DRAM_COM_BASE, (uintptr_t)bl31_warm_entrypoint,
+-			   STANDBY_POLL_LIMIT, (uintptr_t)&standby_result);
++			   poll_limit, (uintptr_t)&standby_result);
+ }
+ 
+ /* Called from the warm boot path on the CPU that resumes the system. */
+@@ -90,6 +109,7 @@ void sunxi_native_system_suspend_finish(void)
+ {
+ 	uint32_t result = standby_result;
+ 	unsigned int timeout = 1000;
++	uint32_t locked = 1;
+ 
+ 	/* Restart the PLL and wait for it to lock before switching back. */
+ 	if ((saved_pll_cpux & PLL_CPUX_ENABLE) != 0U) {
+@@ -98,6 +118,7 @@ void sunxi_native_system_suspend_finish(void)
+ 		while ((mmio_read_32(SUNXI_CCU_PLL_CPUX_REG) & PLL_CPUX_LOCK) == 0U) {
+ 			if (--timeout == 0U) {
+ 				WARN("PSCI: PLL_CPUX failed to lock\n");
++				locked = 0;
+ 				break;
+ 			}
+ 			udelay(1);
+@@ -105,6 +126,7 @@ void sunxi_native_system_suspend_finish(void)
+ 		mmio_write_32(SUNXI_CCU_PLL_CPUX_REG, saved_pll_cpux);
+ 	}
+ 	mmio_write_32(SUNXI_CCU_CPUX_AXI_CFG_REG, saved_cpux_axi_cfg);
++	sunxi_pm_trace(SUNXI_PM_EV_SYS_RESUME, result, locked);
+ 
+ 	if ((result & STANDBY_RESULT_VALID) == 0U) {
+ 		WARN("PSCI: resumed without passing through the SRAM standby code\n");
+diff --git a/plat/allwinner/common/sunxi_pm_trace.c b/plat/allwinner/common/sunxi_pm_trace.c
+new file mode 100644
+index 0000000..8efe7a2
+--- /dev/null
++++ b/plat/allwinner/common/sunxi_pm_trace.c
+@@ -0,0 +1,97 @@
++/*
++ * Copyright (c) 2026, Arun Iyengar <aiyengar1990@gmail.com>
++ *
++ * SPDX-License-Identifier: BSD-3-Clause
++ */
++
++#include <arch_helpers.h>
++#include <common/debug.h>
++#include <lib/mmio.h>
++#include <plat/common/platform.h>
++#include <platform_def.h>
++
++#include <sunxi_pm_trace.h>
++
++#define TRACE_HDR_MAGIC		(SUNXI_PM_TRACE_BASE + 0x00)
++#define TRACE_HDR_GEN		(SUNXI_PM_TRACE_BASE + 0x04)
++#define TRACE_HDR_KNOB		(SUNXI_PM_TRACE_BASE + 0x08)
++#define TRACE_HDR_FREEZE	(SUNXI_PM_TRACE_BASE + 0x0c)
++#define TRACE_SYS_RING		(SUNXI_PM_TRACE_BASE + 0x40)
++#define TRACE_SYS_RECORDS	58U
++#define TRACE_CORE_RING(c)	(SUNXI_PM_TRACE_BASE + 0x400 + (c) * 0x300)
++#define TRACE_CORE_RECORDS	46U
++
++static bool is_system_event(unsigned int event)
++{
++	return event == SUNXI_PM_EV_BOOT || event >= SUNXI_PM_EV_SYS_SUSPEND;
++}
++
++/*
++ * Lock-free: system events are only ever recorded by the single running CPU
++ * (boot, SYSTEM_SUSPEND/RESET/OFF), every other event goes to the ring of the
++ * recording core. Callers may run with caches off.
++ */
++void sunxi_pm_trace(unsigned int event, uint32_t d0, uint32_t d1)
++{
++	unsigned int core = plat_my_core_pos();
++	uintptr_t ring;
++	uint32_t count, records;
++
++	if (is_system_event(event)) {
++		ring = TRACE_SYS_RING;
++		records = TRACE_SYS_RECORDS;
++	} else {
++		if (mmio_read_32(TRACE_HDR_FREEZE) != 0U) {
++			return;
++		}
++		ring = TRACE_CORE_RING(core);
++		records = TRACE_CORE_RECORDS;
++	}
++	count = mmio_read_32(ring);
++	ring += 0x10 + (count % records) * 0x10;
++
++	mmio_write_32(ring + 0x0, (uint32_t)read_cntpct_el0());
++	mmio_write_32(ring + 0x4, (event & 0xffU) | (core << 24));
++	mmio_write_32(ring + 0x8, d0);
++	mmio_write_32(ring + 0xc, d1);
++	mmio_write_32(ring - 0x10 - (count % records) * 0x10, count + 1U);
++	dsbsy();
++}
++
++uint32_t sunxi_pm_knob(void)
++{
++	return mmio_read_32(TRACE_HDR_KNOB);
++}
++
++void sunxi_pm_trace_init(void)
++{
++	uint32_t gen = 0;
++	unsigned int c;
++
++	if (mmio_read_32(TRACE_HDR_MAGIC) == SUNXI_PM_TRACE_MAGIC) {
++		/* Warm reset: keep the records, they may explain the reset. */
++		gen = mmio_read_32(TRACE_HDR_GEN) + 1U;
++		if (mmio_read_32(TRACE_SYS_RING) > 0x10000U) {
++			mmio_write_32(TRACE_SYS_RING, 0);
++		}
++		for (c = 0; c < PLATFORM_CORE_COUNT; c++) {
++			if (mmio_read_32(TRACE_CORE_RING(c)) > 0x10000U) {
++				mmio_write_32(TRACE_CORE_RING(c), 0);
++			}
++		}
++		mmio_write_32(TRACE_HDR_FREEZE, 1);
++	} else {
++		for (uintptr_t p = SUNXI_PM_TRACE_BASE;
++		     p < SUNXI_PM_TRACE_BASE + PAGE_SIZE; p += 4) {
++			mmio_write_32(p, 0);
++		}
++		mmio_write_32(TRACE_HDR_MAGIC, SUNXI_PM_TRACE_MAGIC);
++	}
++	mmio_write_32(TRACE_HDR_GEN, gen);
++	/* Experiments never survive a reset. */
++	mmio_write_32(TRACE_HDR_KNOB, 0);
++	sunxi_pm_trace(SUNXI_PM_EV_BOOT, gen, 0);
++	INFO("PM trace page at 0x%lx, boot generation %u%s\n",
++	     (unsigned long)SUNXI_PM_TRACE_BASE, gen,
++	     gen != 0U ? " (per-core rings frozen)" : "");
++}
+diff --git a/plat/allwinner/common/sunxi_standby_sram.S b/plat/allwinner/common/sunxi_standby_sram.S
+index e1f55b3..8f93c20 100644
+--- a/plat/allwinner/common/sunxi_standby_sram.S
++++ b/plat/allwinner/common/sunxi_standby_sram.S
+@@ -10,6 +10,7 @@
+ 	.globl	sunxi_standby_jump
+ 	.globl	sunxi_standby_sram_start
+ 	.globl	sunxi_standby_sram_end
++	.globl	sunxi_warm_restart
+ 
+ /* DesignWare uMCTL2 DDR controller registers */
+ #define MCTL_STATR			0x004
+@@ -53,6 +54,25 @@ func sunxi_standby_jump
+ 	br	x6
+ endfunc sunxi_standby_jump
+ 
++/*
++ * void sunxi_warm_restart(void): turn MMU and caches off and re-enter BL31
++ * through the warm boot entry point, as a core that was powered off would.
++ */
++func sunxi_warm_restart
++	mrs	x7, sctlr_el3
++	bic	x7, x7, #SCTLR_M_BIT
++	bic	x7, x7, #SCTLR_C_BIT
++	bic	x7, x7, #SCTLR_I_BIT
++	msr	sctlr_el3, x7
++	isb
++	ic	iallu
++	dsb	sy
++	isb
++	adrp	x0, bl31_warm_entrypoint
++	add	x0, x0, :lo12:bl31_warm_entrypoint
++	br	x0
++endfunc sunxi_warm_restart
++
+ /*
+  * The standby routine. Position independent, uses neither stack nor memory
+  * other than the given MMIO registers, runs with MMU and caches off.
+diff --git a/plat/allwinner/sun50i_h616/platform.mk b/plat/allwinner/sun50i_h616/platform.mk
+index 331b9ec..c63b7b2 100644
+--- a/plat/allwinner/sun50i_h616/platform.mk
++++ b/plat/allwinner/sun50i_h616/platform.mk
+@@ -13,6 +13,7 @@ SUNXI_PSCI_USE_NATIVE	:=	1
+ SUNXI_NATIVE_CPU_SUSPEND :=	1
+ # CPU0 can park itself in SRAM A1 with the DRAM in self-refresh.
+ SUNXI_NATIVE_SYSTEM_SUSPEND :=	1
++SUNXI_PM_DEBUG_TRACE :=	1
+ 
+ # The differences between the platforms are covered by the include files.
+ include plat/allwinner/common/allwinner-common.mk
+-- 
+2.55.0
+
