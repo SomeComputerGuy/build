@@ -1,0 +1,364 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 1 Nov 2026 22:45:46 +0000
+Subject: drm/sun4i: mixer: Support YUV output on DE33 for the TV encoder
+
+The TV encoders take YCbCr. DE2 provides it with the post-blend DCSC
+unit, programmed through the apply_color_correction engine callback.
+DE33 has no such stage: the blender can instead work in YUV space and
+every channel CSC converts its layer into the output colour space.
+
+Implement the color correction callbacks for DE33 accordingly: switch
+the blender format space and background colour, and remember the output
+format so that the layer CSC setup picks RGB to YUV (or YUV to YUV when
+the plane encoding/range differ) conversion into limited range BT.601,
+the only colour space the TV encoder accepts. UI channels have a CSC on
+DE33 as well, so configure it from the UI layer update path.
+
+Because the conversion is done per layer, the output colour space has
+to be known before the planes of a commit are programmed. Request it
+from the CRTC mode_set_nofb hook based on the encoder type; the TV
+encoders keep calling the callbacks at enable/disable time, which is
+harmless and keeps the DE2 path unchanged.
+
+Coefficients are taken from the Allwinner BSP CSC tables
+(de_csc_table.c, r2y and y2y*2l) in the DE3 register layout.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/sun4i/sun4i_crtc.c     |  10 +++
+ drivers/gpu/drm/sun4i/sun8i_csc.c      | 111 +++++++++++++++++++++++--
+ drivers/gpu/drm/sun4i/sun8i_mixer.c    |  53 +++++++++++-
+ drivers/gpu/drm/sun4i/sun8i_mixer.h    |   6 ++
+ drivers/gpu/drm/sun4i/sun8i_ui_layer.c |   4 +
+ 5 files changed, 175 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_crtc.c b/drivers/gpu/drm/sun4i/sun4i_crtc.c
+index 111111111111..222222222222 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_crtc.c
++++ b/drivers/gpu/drm/sun4i/sun4i_crtc.c
+@@ -161,6 +161,16 @@ static void sun4i_crtc_mode_set_nofb(struct drm_crtc *crtc)
+ 
+ 	sun4i_tcon_mode_set(scrtc->tcon, encoder, mode);
+ 	sunxi_engine_mode_set(scrtc->engine, mode);
++
++	/*
++	 * TV encoders take YCbCr. Ask for it here, before the planes of
++	 * this commit are programmed, since on some engines the conversion
++	 * is done per layer.
++	 */
++	if (encoder && encoder->encoder_type == DRM_MODE_ENCODER_TVDAC)
++		sunxi_engine_apply_color_correction(scrtc->engine);
++	else
++		sunxi_engine_disable_color_correction(scrtc->engine);
+ }
+ 
+ static const struct drm_crtc_helper_funcs sun4i_crtc_helper_funcs = {
+diff --git a/drivers/gpu/drm/sun4i/sun8i_csc.c b/drivers/gpu/drm/sun4i/sun8i_csc.c
+index 111111111111..222222222222 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_csc.c
++++ b/drivers/gpu/drm/sun4i/sun8i_csc.c
+@@ -3,11 +3,13 @@
+  * Copyright (C) Jernej Skrabec <jernej.skrabec@siol.net>
+  */
+ 
++#include <drm/drm_crtc.h>
+ #include <drm/drm_fourcc.h>
+ #include <drm/drm_framebuffer.h>
+ #include <drm/drm_plane.h>
+ #include <drm/drm_print.h>
+ 
++#include "sun4i_crtc.h"
+ #include "sun8i_csc.h"
+ #include "sun8i_mixer.h"
+ 
+@@ -15,6 +17,9 @@ enum sun8i_csc_mode {
+ 	SUN8I_CSC_MODE_OFF,
+ 	SUN8I_CSC_MODE_YUV2RGB,
+ 	SUN8I_CSC_MODE_YVU2RGB,
++	SUN8I_CSC_MODE_RGB2YUV,
++	SUN8I_CSC_MODE_YUV2YUV,
++	SUN8I_CSC_MODE_YVU2YUV,
+ };
+ 
+ static const u32 ccsc_base[][2] = {
+@@ -116,6 +121,54 @@ static const u32 yuv2rgb_de3[2][3][12] = {
+ 	},
+ };
+ 
++/*
++ * Conversions into limited range BT.601 YCbCr, the only output colour space
++ * the TV encoder accepts. Same layout as the yuv2rgb_de3 tables above.
++ */
++static const u32 rgb2yuv_de3[12] = {
++	0x0000837A, 0x0001021D, 0x00003221, 0x00000040,
++	0xFFFFB41C, 0xFFFF6B03, 0x0000E0E1, 0x00000200,
++	0x0000E0E1, 0xFFFF43B1, 0xFFFFDB6E, 0x00000200,
++};
++
++static const u32 yuv2yuv_de3[2][3][12] = {
++	[DRM_COLOR_YCBCR_LIMITED_RANGE] = {
++		/* Identity, only used to swap the chroma planes of YVU formats */
++		[DRM_COLOR_YCBCR_BT601] = {
++			0x00020000, 0x00000000, 0x00000000, 0x00000000,
++			0x00000000, 0x00020000, 0x00000000, 0x00000000,
++			0x00000000, 0x00000000, 0x00020000, 0x00000000,
++		},
++		[DRM_COLOR_YCBCR_BT709] = {
++			0x00020000, 0x000032D9, 0x00006226, 0xFFC00040,
++			0x00000000, 0x0001FACE, 0xFFFFC759, 0xFE000200,
++			0x00000000, 0xFFFFDAE7, 0x0001F780, 0xFE000200,
++		},
++		[DRM_COLOR_YCBCR_BT2020] = {
++			0x00020000, 0x00003B03, 0x000034D2, 0xFFC00040,
++			0x00000000, 0x0001FD8C, 0xFFFFE183, 0xFE000200,
++			0x00000000, 0xFFFFD4F3, 0x0001F3FA, 0xFE000200,
++		},
++	},
++	[DRM_COLOR_YCBCR_FULL_RANGE] = {
++		[DRM_COLOR_YCBCR_BT601] = {
++			0x0001B7B8, 0x00000000, 0x00000000, 0x00000040,
++			0x00000000, 0x0001C1C2, 0x00000000, 0xFE000200,
++			0x00000000, 0x00000000, 0x0001C1C2, 0xFE000200,
++		},
++		[DRM_COLOR_YCBCR_BT709] = {
++			0x0001B7B8, 0x00002CAB, 0x00005638, 0x00000040,
++			0x00000000, 0x0001BD32, 0xFFFFCE3C, 0xFE000200,
++			0x00000000, 0xFFFFDF6A, 0x0001BA4A, 0xFE000200,
++		},
++		[DRM_COLOR_YCBCR_BT2020] = {
++			0x0001B7B8, 0x000033D6, 0x00002E66, 0x00000040,
++			0x00000000, 0x0001BF9A, 0xFFFFE538, 0xFE000200,
++			0x00000000, 0xFFFFDA2F, 0x0001B732, 0xFE000200,
++		},
++	},
++};
++
+ static void sun8i_csc_setup(struct regmap *map, u32 base,
+ 			    enum sun8i_csc_mode mode,
+ 			    enum drm_color_encoding encoding,
+@@ -236,7 +289,18 @@ static void sun8i_de33_ccsc_setup(struct regmap *map, int layer,
+ 	const u32 *table;
+ 	int i;
+ 
+-	table = yuv2rgb_de3[range][encoding];
++	switch (mode) {
++	case SUN8I_CSC_MODE_RGB2YUV:
++		table = rgb2yuv_de3;
++		break;
++	case SUN8I_CSC_MODE_YUV2YUV:
++	case SUN8I_CSC_MODE_YVU2YUV:
++		table = yuv2yuv_de3[range][encoding];
++		break;
++	default:
++		table = yuv2rgb_de3[range][encoding];
++		break;
++	}
+ 	base = DE33_CCSC_BASE + layer * DE33_CH_SIZE;
+ 
+ 	switch (mode) {
+@@ -244,11 +308,14 @@ static void sun8i_de33_ccsc_setup(struct regmap *map, int layer,
+ 		val = 0;
+ 		break;
+ 	case SUN8I_CSC_MODE_YUV2RGB:
++	case SUN8I_CSC_MODE_RGB2YUV:
++	case SUN8I_CSC_MODE_YUV2YUV:
+ 		val = SUN8I_CSC_CTRL_EN;
+ 		sun8i_de33_convert_table(table, csc);
+ 		regmap_bulk_write(map, SUN50I_CSC_COEFF(base, 0), csc, 15);
+ 		break;
+ 	case SUN8I_CSC_MODE_YVU2RGB:
++	case SUN8I_CSC_MODE_YVU2YUV:
+ 		val = SUN8I_CSC_CTRL_EN;
+ 		sun8i_de33_convert_table(table, csc);
+ 		for (i = 0; i < 15; i++) {
+@@ -271,32 +338,64 @@ static void sun8i_de33_ccsc_setup(struct regmap *map, int layer,
+ 	regmap_write(map, SUN8I_CSC_CTRL(base), val);
+ }
+ 
+-static u32 sun8i_csc_get_mode(struct drm_plane_state *state)
++static bool sun8i_csc_output_is_yuv(struct sun8i_layer *layer,
++				    struct drm_plane_state *state)
++{
++	struct sun4i_crtc *scrtc;
++	struct sun8i_mixer *mixer;
++
++	/* Only DE33 can blend in YUV, see sun50i_mixer_set_output_yuv() */
++	if (layer->cfg->de_type != SUN8I_MIXER_DE33 || !state->crtc)
++		return false;
++
++	scrtc = drm_crtc_to_sun4i_crtc(state->crtc);
++	mixer = engine_to_sun8i_mixer(scrtc->engine);
++
++	return mixer->output_yuv;
++}
++
++static u32 sun8i_csc_get_mode(struct sun8i_layer *layer,
++			      struct drm_plane_state *state)
+ {
+ 	const struct drm_format_info *format;
++	bool yvu, output_yuv;
+ 
+ 	if (!state->crtc || !state->visible)
+ 		return SUN8I_CSC_MODE_OFF;
+ 
++	output_yuv = sun8i_csc_output_is_yuv(layer, state);
++
+ 	format = state->fb->format;
+ 	if (!format->is_yuv)
+-		return SUN8I_CSC_MODE_OFF;
++		return output_yuv ? SUN8I_CSC_MODE_RGB2YUV : SUN8I_CSC_MODE_OFF;
+ 
+ 	switch (format->format) {
+ 	case DRM_FORMAT_YVU411:
+ 	case DRM_FORMAT_YVU420:
+ 	case DRM_FORMAT_YVU422:
+ 	case DRM_FORMAT_YVU444:
+-		return SUN8I_CSC_MODE_YVU2RGB;
++		yvu = true;
++		break;
+ 	default:
+-		return SUN8I_CSC_MODE_YUV2RGB;
++		yvu = false;
++		break;
+ 	}
++
++	if (!output_yuv)
++		return yvu ? SUN8I_CSC_MODE_YVU2RGB : SUN8I_CSC_MODE_YUV2RGB;
++
++	/* The output is limited range BT.601, pass matching planes through */
++	if (!yvu && state->color_encoding == DRM_COLOR_YCBCR_BT601 &&
++	    state->color_range == DRM_COLOR_YCBCR_LIMITED_RANGE)
++		return SUN8I_CSC_MODE_OFF;
++
++	return yvu ? SUN8I_CSC_MODE_YVU2YUV : SUN8I_CSC_MODE_YUV2YUV;
+ }
+ 
+ void sun8i_csc_config(struct sun8i_layer *layer,
+ 		      struct drm_plane_state *state)
+ {
+-	u32 mode = sun8i_csc_get_mode(state);
++	u32 mode = sun8i_csc_get_mode(layer, state);
+ 	u32 base;
+ 
+ 	if (layer->cfg->de_type == SUN8I_MIXER_DE3) {
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+index 111111111111..222222222222 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -514,10 +514,57 @@ static const struct sunxi_engine_ops sun8i_engine_ops = {
+ 	.vblank_quirk		= sun8i_mixer_vblank_quirk,
+ };
+ 
++/*
++ * DE33 has no CSC stage after the blender. YUV output is obtained by
++ * blending in YUV space and having every layer CSC convert into it, so
++ * record the request here and let the layers pick it up on their next
++ * update (see sun8i_csc_config()).
++ */
++static void sun50i_mixer_set_output_yuv(struct sunxi_engine *engine, bool yuv)
++{
++	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
++	u32 bld_base = sun8i_blender_base(mixer);
++	u32 black;
++
++	if (mixer->cfg->de_type != SUN8I_MIXER_DE33 || mixer->cfg->uses_rcq) {
++		if (yuv)
++			DRM_DEBUG_DRIVER("YUV output is not supported on this DE\n");
++		return;
++	}
++
++	if (mixer->output_yuv == yuv)
++		return;
++
++	DRM_DEBUG_DRIVER("Switching mixer output to %s\n", yuv ? "YUV" : "RGB");
++
++	mixer->output_yuv = yuv;
++	black = yuv ? SUN50I_MIXER_BLEND_COLOR_BLACK_YUV :
++		      SUN8I_MIXER_BLEND_COLOR_BLACK;
++
++	regmap_update_bits(engine->regs, SUN8I_MIXER_BLEND_OUTCTL(bld_base),
++			   SUN50I_MIXER_BLEND_OUTCTL_FMT_SPACE_MASK,
++			   yuv ? SUN50I_MIXER_BLEND_OUTCTL_FMT_SPACE_YUV : 0);
++	regmap_write(engine->regs, SUN8I_MIXER_BLEND_BKCOLOR(bld_base), black);
++	regmap_write(engine->regs, SUN8I_MIXER_BLEND_ATTR_FCOLOR(bld_base, 0),
++		     black);
++}
++
++static void sun50i_mixer_apply_color_correction(struct sunxi_engine *engine)
++{
++	sun50i_mixer_set_output_yuv(engine, true);
++}
++
++static void sun50i_mixer_disable_color_correction(struct sunxi_engine *engine)
++{
++	sun50i_mixer_set_output_yuv(engine, false);
++}
++
+ static const struct sunxi_engine_ops sun50i_engine_ops = {
+-	.commit		= sun8i_mixer_commit,
+-	.layers_init	= sun50i_layers_init,
+-	.mode_set	= sun8i_mixer_mode_set,
++	.commit			= sun8i_mixer_commit,
++	.layers_init		= sun50i_layers_init,
++	.mode_set		= sun8i_mixer_mode_set,
++	.apply_color_correction	= sun50i_mixer_apply_color_correction,
++	.disable_color_correction = sun50i_mixer_disable_color_correction,
+ };
+ 
+ static const struct regmap_config sun8i_mixer_regmap_config = {
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.h b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+index 111111111111..222222222222 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+@@ -93,6 +93,8 @@
+ 
+ /* colors are always in AARRGGBB format */
+ #define SUN8I_MIXER_BLEND_COLOR_BLACK		0xff000000
++/* Black in limited range YCbCr, used when the blender works in YUV */
++#define SUN50I_MIXER_BLEND_COLOR_BLACK_YUV	0xff108080
+ /*
+  * Blend coefficients: pixel fs = 1, fd = 1 - As; alpha fs = 1, fd = 1 - As,
+  * i.e. the "source over" operator on pre-multiplied data. Pipes flagged as
+@@ -96,6 +98,8 @@
+ #define SUN8I_MIXER_BLEND_ROUTE_PIPE_SHIFT(n)	((n) << 2)
+ 
+ #define SUN8I_MIXER_BLEND_OUTCTL_INTERLACED	BIT(1)
++#define SUN50I_MIXER_BLEND_OUTCTL_FMT_SPACE_MASK	GENMASK(9, 8)
++#define SUN50I_MIXER_BLEND_OUTCTL_FMT_SPACE_YUV	BIT(8)
+ 
+ #define SUN50I_MIXER_BLEND_CSC_CTL_EN(ch)	BIT(ch)
+ #define SUN50I_MIXER_BLEND_CSC_CONST_VAL(d, c)	(((d) << 16) | ((c) & 0xffff))
+@@ -247,6 +251,8 @@ struct sun8i_mixer {
+ 
+ 	struct regmap			*top_regs;
+ 	struct device			*planes_dev;
++	/* DE33 only: blender and layer CSCs produce BT.601 YCbCr */
++	bool				output_yuv;
+ 	struct sun4i_drv		*drv;
+ 	bool				hw_preconfigured;
+ 
+diff --git a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
+index 111111111111..222222222222 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
+@@ -21,6 +21,7 @@
+ #include <drm/drm_print.h>
+ #include <drm/drm_probe_helper.h>
+ 
++#include "sun8i_csc.h"
+ #include "sun8i_mixer.h"
+ #include "sun8i_ui_layer.h"
+ #include "sun8i_ui_scaler.h"
+@@ -200,6 +201,9 @@ static void sun8i_ui_layer_atomic_update(struct drm_plane *plane,
+ 
+ 	sun8i_ui_layer_update_attributes(layer, plane);
+ 	sun8i_ui_layer_update_coord(layer, plane);
++	/* DE33 UI channels have a CSC too, needed for YUV output */
++	if (layer->cfg->de_type == SUN8I_MIXER_DE33)
++		sun8i_csc_config(layer, new_state);
+ 	sun8i_ui_layer_update_buffer(layer, plane);
+ }
+ 
+-- 
+Armbian

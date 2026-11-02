@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 1 Nov 2026 22:45:46 +0000
+Subject: arm64: dts: allwinner: h616: Add the TV encoder
+
+TVE0 at 0x06524000, with its TVE TOP block at 0x06520000, is fed by
+TCON TV1 (TCON TV0 is the one used for HDMI). Add the encoder node and
+the TCON TV1 output endpoint for it, together with the SID efuse cell
+holding the DAC bias calibration. The TVE clock is parented to
+pll-video1 so that selecting its 216 MHz rate leaves the HDMI PLL
+alone.
+
+The node stays disabled: composite output only exists on boards that
+route TV-OUT to a connector or header.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../arm64/boot/dts/allwinner/sun50i-h616.dtsi | 33 +++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+index 111111111111..222222222222 100644
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+@@ -346,6 +346,10 @@
+ 				reg = <0x14 0x8>;
+ 			};
+ 
++			tve_calibration: tve-calibration@2c {
++				reg = <0x2c 0x4>;
++			};
++
+ 			cpu_speed_grade: cpu-speed-grade@0 {
+ 				reg = <0x0 2>;
+ 			};
+@@ -1699,6 +1703,12 @@
+ 					#size-cells = <0>;
+ 					reg = <1>;
+ 
++					tcon_tv1_out_tve: endpoint@0 {
++						reg = <0>;
++						remote-endpoint = <&tve_in_tcon_tv1>;
++						allwinner,tcon-channel = <1>;
++					};
++
+ 					tcon_tv1_out_tcon_top: endpoint@1 {
+ 						reg = <1>;
+ 						remote-endpoint = <&tcon_top_hdmi_in_tcon_tv1>;
+@@ -1707,6 +1717,29 @@
+ 			};
+ 		};
+ 
++		tve: tv-encoder@6524000 {
++			compatible = "allwinner,sun50i-h616-tv-encoder";
++			reg = <0x06524000 0x4000>, <0x06520000 0x4000>;
++			reg-names = "tve", "top";
++			clocks = <&ccu CLK_BUS_TVE0>, <&ccu CLK_TVE0>,
++				 <&ccu CLK_BUS_TVE_TOP>;
++			clock-names = "bus", "mod", "top";
++			resets = <&ccu RST_BUS_TVE0>, <&ccu RST_BUS_TVE_TOP>;
++			reset-names = "tve", "top";
++			/* keep the HDMI PLL (pll-video0) undisturbed */
++			assigned-clocks = <&ccu CLK_TVE0>;
++			assigned-clock-parents = <&ccu CLK_PLL_VIDEO1>;
++			nvmem-cells = <&tve_calibration>;
++			nvmem-cell-names = "calibration";
++			status = "disabled";
++
++			port {
++				tve_in_tcon_tv1: endpoint {
++					remote-endpoint = <&tcon_tv1_out_tve>;
++				};
++			};
++		};
++
+ 		rtc: rtc@7000000 {
+ 			compatible = "allwinner,sun50i-h616-rtc";
+ 			reg = <0x07000000 0x400>;
+-- 
+Armbian
