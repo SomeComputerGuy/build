@@ -1,4 +1,4 @@
-From 6e711aa9c4e67e4d04e68fee7d7d7abb81845e39 Mon Sep 17 00:00:00 2001
+From 87decaa0ef07d04a518012267eafe2602cc4264d Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Mon, 2 Nov 2026 02:57:02 +0000
 Subject: [PATCH 2/3] feat(allwinner): implement SYSTEM_SUSPEND natively on the
@@ -17,12 +17,14 @@ the native PSCI ops by keeping the last CPU alive in SRAM:
    there, so that no DRAM access happens while the DRAM controller is put
    into self-refresh: with the MBUS masters disabled (as crust does on
    the H6), PWRCTL.selfref_sw is set and STAT.operating_mode polled for
-   self-refresh. On this controller selfref_sw is quasi-dynamic, so it is
-   changed inside a SWCTL.sw_done/SWSTAT.sw_done_ack handshake, as
-   U-Boot's DRAM init does when it leaves self-refresh (with a plain
-   write, STAT was seen to stay at 0xaa, power-down, and self-refresh
-   was never reached). All waits are bounded by the generic counter (20 ms
-   each); the routine reports timeouts and the STAT/PWRCTL values seen.
+   self-refresh. selfref_sw is changed inside a SWCTL.sw_done/
+   SWSTAT.sw_done_ack handshake, as U-Boot's H616 DRAM init does when it
+   leaves self-refresh, and the operating mode is compared on its low
+   two bits like U-Boot does. All waits are bounded by the generic
+   counter (20 ms each); the routine reports timeouts and the
+   STAT/PWRCTL values seen. The H616 DRAM controller blocks are at
+   0x047fa000 (MC_COM) and 0x047fb000 (controller), not at the A133
+   addresses.
  - The routine waits in WFI. The GIC CPU interface stays enabled and IRQs
    are routed to EL3 but masked, so every interrupt the OS left enabled
    in the GIC (RTC alarm, GPIO, ...) is a wakeup source without any
@@ -321,7 +323,7 @@ index 0000000..32941fb
 +}
 diff --git a/plat/allwinner/common/sunxi_standby_sram.S b/plat/allwinner/common/sunxi_standby_sram.S
 new file mode 100644
-index 0000000..353fb1d
+index 0000000..aa033d6
 --- /dev/null
 +++ b/plat/allwinner/common/sunxi_standby_sram.S
 @@ -0,0 +1,172 @@
@@ -398,12 +400,12 @@ index 0000000..353fb1d
 + *     entry poll gave up), STATR when it was left (or the exit poll gave
 + *     up), and PWRCTL as read back after the self-refresh request.
 + *
-+ * PWRCTL.selfref_sw is quasi-dynamic on this controller: like U-Boot's DRAM
-+ * init, which leaves self-refresh this way, change it only with SWCTL.sw_done
-+ * cleared and wait for SWSTAT.sw_done_ack after setting sw_done again (with
-+ * a plain write, STATR kept reading 0xaa, i.e. operating mode 2 = power-down,
-+ * and never reported self-refresh). The operating mode is compared on its
-+ * low two bits, as U-Boot does.
++ * PWRCTL.selfref_sw is changed the way U-Boot's H616 DRAM init changes it
++ * when it leaves self-refresh: with SWCTL.sw_done cleared, then setting
++ * sw_done again and waiting for SWSTAT.sw_done_ack. The operating mode is
++ * compared on its low two bits, as U-Boot does. Only the controller (and the
++ * MBUS master enables in MC_COM) are involved: the PHY keeps its clocks, so
++ * nothing there needs restoring on the way out.
 + *
 + * Only the IRQ/FIQ signals from the GIC CPU interface can end the WFI,
 + * which is what makes any interrupt the OS left enabled a wakeup source.
@@ -511,15 +513,15 @@ index 85fbb90..ea4d9b0 100644
  
  #define SUNXI_R_PRCM_SEC_SWITCH_REG	(SUNXI_R_PRCM_BASE + 0x0290)
 diff --git a/plat/allwinner/sun50i_h616/include/sunxi_mmap.h b/plat/allwinner/sun50i_h616/include/sunxi_mmap.h
-index 24a4ba8..c804b79 100644
+index 24a4ba8..763dc49 100644
 --- a/plat/allwinner/sun50i_h616/include/sunxi_mmap.h
 +++ b/plat/allwinner/sun50i_h616/include/sunxi_mmap.h
 @@ -29,6 +29,8 @@
  #define SUNXI_SPC_BASE			0x03008000
  #define SUNXI_WDOG_BASE			0x030090a0
  #define SUNXI_PIO_BASE			0x0300b000
-+#define SUNXI_DRAM_COM_BASE		0x04810000
-+#define SUNXI_DRAM_CTL_BASE		0x04820000
++#define SUNXI_DRAM_COM_BASE		0x047fa000
++#define SUNXI_DRAM_CTL_BASE		0x047fb000
  #define SUNXI_GICD_BASE			0x03021000
  #define SUNXI_GICC_BASE			0x03022000
  #define SUNXI_UART0_BASE		0x05000000
