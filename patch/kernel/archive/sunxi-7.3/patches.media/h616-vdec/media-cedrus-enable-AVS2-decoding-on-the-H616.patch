@@ -1,0 +1,32 @@
+From 6492a08138a6fb22791308177110d1d96bb70b50 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Mon, 2 Nov 2026 22:26:59 +0000
+Subject: media: cedrus: enable AVS2 decoding on the H616
+
+The H616 product specification lists AVS2 JiZhun (Main) 10-bit decoding
+up to 4K@60, and the vendor libawavs2.so drives it with the registers
+the driver programs. Enable it.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/staging/media/sunxi/cedrus/cedrus.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+index b4a321d90..fdc5be30d 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -1035,7 +1035,8 @@ static const struct cedrus_variant sun50i_h616_cedrus_variant = {
+ 			  CEDRUS_CAPABILITY_VP8_DEC |
+ 			  CEDRUS_CAPABILITY_VP9_DEC |
+ 			  CEDRUS_CAPABILITY_VC1_DEC |
+-			  CEDRUS_CAPABILITY_MPEG4_DEC,
++			  CEDRUS_CAPABILITY_MPEG4_DEC |
++			  CEDRUS_CAPABILITY_AVS2_DEC,
+ 	.mod_rate	= 600000000,
+ 	/*
+ 	 * With the 128-bit DDR mode, H.264 and VP8 read corrupted reference
+-- 
+Armbian
+
