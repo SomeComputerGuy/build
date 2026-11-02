@@ -1,4 +1,4 @@
-From 4b91179205133fc69592ea87b3b1ba1d19e7297e Mon Sep 17 00:00:00 2001
+From da069c275af12474678e4379761f768b2b36ca2c Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Mon, 2 Nov 2026 04:58:17 +0000
 Subject: [PATCH 3/3] debug(allwinner): PM event trace page and runtime
@@ -612,7 +612,7 @@ index 0000000..6028d70
 +	     gen != 0U ? " (per-core rings frozen)" : "");
 +}
 diff --git a/plat/allwinner/common/sunxi_standby_sram.S b/plat/allwinner/common/sunxi_standby_sram.S
-index 353fb1d..4cfd590 100644
+index aa033d6..df7ed17 100644
 --- a/plat/allwinner/common/sunxi_standby_sram.S
 +++ b/plat/allwinner/common/sunxi_standby_sram.S
 @@ -10,6 +10,7 @@
