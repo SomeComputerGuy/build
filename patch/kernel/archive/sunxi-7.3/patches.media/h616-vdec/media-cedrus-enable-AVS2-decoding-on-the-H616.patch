@@ -1,4 +1,4 @@
-From dc1d2bbaa63714b2bce7004424e9d4fc4a345f8f Mon Sep 17 00:00:00 2001
+From 6492a08138a6fb22791308177110d1d96bb70b50 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Mon, 2 Nov 2026 22:26:59 +0000
 Subject: media: cedrus: enable AVS2 decoding on the H616

@@ -1,4 +1,4 @@
-From f0daaea498965292e3b66d295090180c803f464e Mon Sep 17 00:00:00 2001
+From 3bedd3a438113c74a7dc891a4319cef251d7db62 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Mon, 2 Nov 2026 22:26:59 +0000
 Subject: media: cedrus: add AVS2 decoding
@@ -23,9 +23,16 @@ The register sequence and the layout of the table buffer were recovered,
 for interoperability, from the debug information and the disassembly of
 the vendor libawavs2.so (libcedarc); no vendor code is used.
 
-10-bit pictures use the low-2-bit plane and P010 output of the H.265 and
-VP9 decoders. The VE is reset when it is switched to or from AVS2, as
-for VP9. Field coded sequences are rejected for now.
+10-bit pictures reuse the output paths of the H.265 and VP9 decoders.
+For P010 capture the engine reconstructs into the hidden AFBC surface
+behind the P010 picture and writes P010 through the secondary output;
+the vendor library enables AFBC for AVS2 on this decoder version too,
+and programs the single AFBC plane address in both address words of
+the current picture, which the driver also does for the references.
+The NV12 formats at 10 bits get the appended low-2-bit plane, with the
+HIGH10 bit the vendor library sets. The VE is reset when it is
+switched to or from AVS2, as for VP9. Field coded sequences are
+rejected for now.
 
 The decoder is not enabled on any variant yet.
 
@@ -35,12 +42,12 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  drivers/staging/media/sunxi/cedrus/Makefile   |   2 +-
  drivers/staging/media/sunxi/cedrus/cedrus.c   |  63 ++
  drivers/staging/media/sunxi/cedrus/cedrus.h   |  21 +
- .../staging/media/sunxi/cedrus/cedrus_avs2.c  | 614 ++++++++++++++++++
+ .../staging/media/sunxi/cedrus/cedrus_avs2.c  | 621 ++++++++++++++++++
  .../staging/media/sunxi/cedrus/cedrus_dec.c   |  19 +-
  .../staging/media/sunxi/cedrus/cedrus_hw.c    |   2 +
  .../staging/media/sunxi/cedrus/cedrus_regs.h  |  80 +++
  .../staging/media/sunxi/cedrus/cedrus_video.c |  13 +-
- 8 files changed, 810 insertions(+), 4 deletions(-)
+ 8 files changed, 817 insertions(+), 4 deletions(-)
  create mode 100644 drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
 
 diff --git a/drivers/staging/media/sunxi/cedrus/Makefile b/drivers/staging/media/sunxi/cedrus/Makefile
@@ -135,7 +142,7 @@ index 848711adc..b4a321d90 100644
  
  #define CEDRUS_CONTROLS_COUNT	ARRAY_SIZE(cedrus_controls)
 diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
-index 5a8de2299..351343f0e 100644
+index 3e10b0470..0a823942f 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus.h
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
 @@ -37,6 +37,7 @@
@@ -203,10 +210,10 @@ index 5a8de2299..351343f0e 100644
  {
 diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c b/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
 new file mode 100644
-index 000000000..7e531010d
+index 000000000..37db91e43
 --- /dev/null
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
-@@ -0,0 +1,614 @@
+@@ -0,0 +1,621 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * Cedrus VPU driver: AVS2 (GB/T 33475.2, IEEE 1857.4) decoding
@@ -407,6 +414,11 @@ index 000000000..7e531010d
 +					       V4L2_BUF_TYPE_VIDEO_CAPTURE);
 +	s32 cur_ref_poc[V4L2_AVS2_MAX_REF_PICS] = {};
 +	bool is_top = pic->flags & V4L2_AVS2_PICTURE_FLAG_IS_TOP_FIELD;
++	/*
++	 * An AFBC surface has a single plane. The vendor library programs
++	 * its address in both address words of the current picture.
++	 */
++	bool afbc = cedrus_recon_is_afbc(ctx);
 +	dma_addr_t cur_luma, cur_chroma;
 +	u32 bottom = 0;
 +	unsigned int num_refs, i;
@@ -441,7 +453,7 @@ index 000000000..7e531010d
 +
 +		cbuf = vb2_to_cedrus_buffer(buf);
 +		luma = cedrus_dst_frame_addr(ctx, buf, 0);
-+		chroma = cedrus_dst_frame_addr(ctx, buf, 1);
++		chroma = afbc ? luma : cedrus_dst_frame_addr(ctx, buf, 1);
 +
 +		/*
 +		 * The background reference, last in the list of a P or F
@@ -482,7 +494,8 @@ index 000000000..7e531010d
 +	/* Current picture. */
 +	i = CEDRUS_AVS2_CUR_PIC;
 +	cur_luma = cedrus_dst_frame_addr(ctx, &run->dst->vb2_buf, 0);
-+	cur_chroma = cedrus_dst_frame_addr(ctx, &run->dst->vb2_buf, 1);
++	cur_chroma = afbc ? cur_luma :
++		     cedrus_dst_frame_addr(ctx, &run->dst->vb2_buf, 1);
 +	tbl->pic[i][0] = cpu_to_le32(VE_DEC_AVS2_PIC_ADDR(cur_luma));
 +	tbl->pic[i][1] = cpu_to_le32((pic->poc & 0x1ff) | bottom);
 +	tbl->pic[i][2] = cpu_to_le32(VE_DEC_AVS2_PIC_ADDR(cur_chroma));
@@ -678,9 +691,9 @@ index 000000000..7e531010d
 +	cedrus_write(dev, VE_DEC_H265_BITS_ADDR, reg);
 +
 +	/*
-+	 * P010 capture: the primary output writes the hidden 8-bit
++	 * P010 capture: the primary output writes the hidden AFBC
 +	 * reconstruction surface that the reference list points to, the
-+	 * secondary output converts it into the visible P010 surface.
++	 * secondary output the visible P010 surface.
 +	 */
 +	if (p010) {
 +		struct v4l2_pix_format recon = cedrus_dst_frame_fmt(ctx);
@@ -703,7 +716,8 @@ index 000000000..7e531010d
 +
 +		/*
 +		 * Offset of the appended low-2-bit plane from the
-+		 * reconstruction luma base, as for H.265.
++		 * reconstruction luma base, as for H.265 (zero for an AFBC
++		 * reconstruction, which carries the full 10-bit samples).
 +		 */
 +		cedrus_write(dev, VE_DEC_AVS2_FIRST_2BIT_OFFSET,
 +			     recon.bytesperline * recon.height * 3 / 2);
@@ -863,7 +877,7 @@ index 266d98702..5346c6f48 100644
  	dev->last_src_pixelformat = ctx->src_fmt.pixelformat;
  
 diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
-index 0cb1b6815..a8d2d5700 100644
+index 1fdc223f4..683440f3e 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
 @@ -60,7 +60,9 @@ int cedrus_engine_enable(struct cedrus_ctx *ctx)
@@ -966,7 +980,7 @@ index 0e3e38dae..c569a94d5 100644
 +
  #endif
 diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
-index 77add2525..83ac0ba5a 100644
+index c41248333..9743f0b8e 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
 @@ -55,6 +55,11 @@ static struct cedrus_format cedrus_formats[] = {
@@ -1000,7 +1014,7 @@ index 77add2525..83ac0ba5a 100644
  		/* Zero bytes per line for encoded source. */
  		bytesperline = 0;
  		/* Choose some minimum size since this can't be 0 */
-@@ -526,6 +534,9 @@ static int cedrus_s_fmt_vid_out_p(struct cedrus_ctx *ctx,
+@@ -524,6 +532,9 @@ static int cedrus_s_fmt_vid_out_p(struct cedrus_ctx *ctx,
  	case V4L2_PIX_FMT_VP9_FRAME:
  		ctx->current_codec = &cedrus_dec_ops_vp9;
  		break;

@@ -1,4 +1,4 @@
-From 2624b77005aa78d33852af434b4a9b7d51e4d789 Mon Sep 17 00:00:00 2001
+From af199b447b1102ca08e158e6aaf73d2337c0afe3 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Mon, 2 Nov 2026 22:26:42 +0000
 Subject: media: uapi: add AVS2 stateless decoder pixel format and
