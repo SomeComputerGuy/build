@@ -1,0 +1,32 @@
+From bca6f83b104f62866d13f252d4c9e3250cbd267a Mon Sep 17 00:00:00 2001
+From: Jernej Skrabec <jernej.skrabec@gmail.com>
+Date: Wed, 31 Jul 2024 18:44:14 +0200
+Subject: [PATCH 4/5] media: cedrus: Don't require requests for all codecs
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+JPEG decoding doesn’t need it currently.
+
+Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
+Link: https://lore.kernel.org/r/20240731164422.206503-5-linkmauve@linkmauve.fr
+---
+ drivers/staging/media/sunxi/cedrus/cedrus_video.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+index 9ad29e5ac..9e0ad5d39 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -810,7 +810,7 @@ int cedrus_queue_init(void *priv, struct vb2_queue *src_vq,
+ 	src_vq->lock = &ctx->dev->dev_mutex;
+ 	src_vq->dev = ctx->dev->dev;
+ 	src_vq->supports_requests = true;
+-	src_vq->requires_requests = true;
++	src_vq->requires_requests = false;
+ 
+ 	ret = vb2_queue_init(src_vq);
+ 	if (ret)
+-- 
+2.55.0
+
