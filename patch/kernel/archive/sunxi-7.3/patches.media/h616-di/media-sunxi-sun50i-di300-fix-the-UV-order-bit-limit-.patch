@@ -21,7 +21,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 17 insertions(+), 11 deletions(-)
 
 diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
-index 9da82c68a..a452d97a2 100644
+index 10fc5edd3..5ed86fea2 100644
 --- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
 +++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
 @@ -99,11 +99,12 @@ static bool deinterlace_fmt_is_uv_combined(u32 pixelformat)

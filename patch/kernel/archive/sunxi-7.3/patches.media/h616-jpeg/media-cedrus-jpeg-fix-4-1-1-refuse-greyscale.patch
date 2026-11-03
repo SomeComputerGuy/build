@@ -1,0 +1,413 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 3 Nov 2026 08:13:55 +0000
+Subject: [PATCH] media: cedrus: jpeg: fix 4:1:1, refuse greyscale
+
+Board probe on the H616 (register dump after each job, capture
+pre-filled with a marker byte):
+
+- 4:1:1: we set FORCE_420 for it; the vendor library sets FORCE_420
+  only for 4:2:2 and 4:4:4. With FORCE_420 a 1080p 4:1:1 picture hung
+  the engine and a small one had wrong chroma. Without it the engine
+  decodes correctly but writes the 4:1:1 chroma as is: one interleaved
+  CbCr line of width/2 bytes per picture line at the luma stride, twice
+  the size of the 4:2:0 chroma plane (at 1080p it ran past the capture
+  buffer: IOMMU fault 8 KiB after its end). Decode 4:1:1 chroma into a
+  per-context bounce buffer and resample it to the capture format
+  (NV12, NV21, YUV420, YVU420) after the job, through a new
+  post_process decoder op. The tiled format is refused for 4:1:1.
+- Greyscale (chroma format 400) is a no-op for this engine: the job
+  ends at once with success, the VLD bit offset unchanged, no MCU
+  decoded and nothing written, for every CTRL, output path, FORCE_420,
+  trigger-write and MCU-size variant tried. Refuse it, so userspace can
+  fall back to software.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/staging/media/sunxi/cedrus/cedrus.h   |   8 +
+ .../staging/media/sunxi/cedrus/cedrus_hw.c    |   3 +
+ .../staging/media/sunxi/cedrus/cedrus_jpeg.c  | 248 +++++++++++++-----
+ 3 files changed, 192 insertions(+), 67 deletions(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+index 5c927a0c7..b555c5769 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -279,6 +279,13 @@ struct cedrus_ctx {
+ 		} avs2;
+ 		struct {
+ 			unsigned int	subsampling;
++			/* 4:1:1: chroma bounce buffer, see cedrus_jpeg.c */
++			bool		chroma_411;
++			unsigned int	width;
++			unsigned int	height;
++			void		*chroma_buf;
++			dma_addr_t	chroma_buf_dma;
++			size_t		chroma_buf_size;
+ 		} jpeg;
+ 		struct {
+ 			void		*mb_info_buf;
+@@ -308,6 +315,7 @@ struct cedrus_dec_ops {
+ 			     enum cedrus_irq_status *status);
+ 	unsigned int (*extra_cap_size)(struct cedrus_ctx *ctx,
+ 				       struct v4l2_pix_format *pix_fmt);
++	void (*post_process)(struct cedrus_ctx *ctx);
+ };
+ 
+ #define CEDRUS_WATCHDOG_TIMEOUT_MS	2000
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+index 08edea898..90401bdae 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -296,6 +296,9 @@ static irqreturn_t cedrus_irq(int irq, void *data)
+ 	else
+ 		state = VB2_BUF_STATE_DONE;
+ 
++	if (state == VB2_BUF_STATE_DONE && ctx->current_codec->post_process)
++		ctx->current_codec->post_process(ctx);
++
+ 	v4l2_m2m_buf_done_and_job_finish(ctx->dev->m2m_dev, ctx->fh.m2m_ctx,
+ 					 state);
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c b/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c
+index 91929716f..d0e9a4053 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c
+@@ -5,6 +5,7 @@
+  * Copyright (C) 2022 Emmanuel Gil Peyrot <linkmauve@linkmauve.fr>
+  */
+ 
++#include <linux/dma-mapping.h>
+ #include <linux/string.h>
+ 
+ #include <media/videobuf2-dma-contig.h>
+@@ -228,6 +229,18 @@ static int cedrus_jpeg_fail(struct cedrus_ctx *ctx, const char *what)
+ 	return -EINVAL;
+ }
+ 
++static void cedrus_jpeg_free_chroma(struct cedrus_ctx *ctx)
++{
++	if (!ctx->codec.jpeg.chroma_buf)
++		return;
++
++	dma_free_noncoherent(ctx->dev->dev, ctx->codec.jpeg.chroma_buf_size,
++			     ctx->codec.jpeg.chroma_buf,
++			     ctx->codec.jpeg.chroma_buf_dma, DMA_FROM_DEVICE);
++	ctx->codec.jpeg.chroma_buf = NULL;
++	ctx->codec.jpeg.chroma_buf_size = 0;
++}
++
+ static int cedrus_jpeg_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ {
+ 	struct cedrus_dev *dev = ctx->dev;
+@@ -248,7 +261,9 @@ static int cedrus_jpeg_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	const u8 *quant_y, *quant_c;
+ 	unsigned int mcu_w, mcu_h, i;
+ 	u32 reg, subsampling;
+-	bool grey, force_420;
++	struct v4l2_pix_format out_fmt;
++	bool force_420, s411;
++	u8 h, v;
+ 	unsigned long size;
+ 	void *src_vaddr;
+ 	u16 width, height;
+@@ -274,9 +289,13 @@ static int cedrus_jpeg_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	if (header.frame.precision != 8)
+ 		return cedrus_jpeg_fail(ctx, "sample precision is not 8 bits");
+ 
+-	if (header.frame.num_components != 1 &&
+-	    header.frame.num_components != 3)
+-		return cedrus_jpeg_fail(ctx, "component count is not 1 or 3");
++	/*
++	 * Greyscale (chroma format 400) is a no-op for the H616 engine: the
++	 * job ends at once with success, the VLD offset unchanged and no
++	 * output written, whatever the output/IRQ/FORCE_420 settings.
++	 */
++	if (header.frame.num_components != 3)
++		return cedrus_jpeg_fail(ctx, "component count is not 3");
+ 
+ 	/* One interleaved scan carrying every component. */
+ 	if (scan_header.num_components != header.frame.num_components)
+@@ -290,50 +309,51 @@ static int cedrus_jpeg_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	if (header.ecs_offset >= size)
+ 		return cedrus_jpeg_fail(ctx, "no entropy coded data");
+ 
+-	grey = header.frame.num_components == 1;
+-	force_420 = false;
+-
+-	if (grey) {
+-		/* A single-component scan codes one 8x8 block per MCU. */
+-		subsampling = VE_DEC_MPEG_TRIGGER_CHROMA_FMT_400;
+-		mcu_w = 8;
+-		mcu_h = 8;
+-	} else {
+-		u8 h = comp[0].horizontal_sampling_factor;
+-		u8 v = comp[0].vertical_sampling_factor;
+-
+-		if (comp[1].horizontal_sampling_factor != 1 ||
+-		    comp[1].vertical_sampling_factor != 1 ||
+-		    comp[2].horizontal_sampling_factor != 1 ||
+-		    comp[2].vertical_sampling_factor != 1)
+-			return cedrus_jpeg_fail(ctx, "chroma sampling factors");
+-
+-		switch (h << 4 | v) {
+-		case 0x22:
+-			subsampling = VE_DEC_MPEG_TRIGGER_CHROMA_FMT_420;
+-			break;
+-		case 0x21:
+-			subsampling = VE_DEC_MPEG_TRIGGER_CHROMA_FMT_422;
+-			break;
+-		case 0x11:
+-			subsampling = VE_DEC_MPEG_TRIGGER_CHROMA_FMT_444;
+-			break;
+-		case 0x12:
+-			subsampling = VE_DEC_MPEG_TRIGGER_CHROMA_FMT_422T;
+-			break;
+-		case 0x41:
+-			subsampling = VE_DEC_MPEG_TRIGGER_CHROMA_FMT_411;
+-			break;
+-		default:
+-			return cedrus_jpeg_fail(ctx, "luma sampling factors");
+-		}
+-
+-		/* All capture formats are 4:2:0. */
+-		force_420 = subsampling != VE_DEC_MPEG_TRIGGER_CHROMA_FMT_420;
+-		mcu_w = 8 * h;
+-		mcu_h = 8 * v;
++	if (comp[1].horizontal_sampling_factor != 1 ||
++	    comp[1].vertical_sampling_factor != 1 ||
++	    comp[2].horizontal_sampling_factor != 1 ||
++	    comp[2].vertical_sampling_factor != 1)
++		return cedrus_jpeg_fail(ctx, "chroma sampling factors");
++
++	h = comp[0].horizontal_sampling_factor;
++	v = comp[0].vertical_sampling_factor;
++	switch (h << 4 | v) {
++	case 0x22:
++		subsampling = VE_DEC_MPEG_TRIGGER_CHROMA_FMT_420;
++		break;
++	case 0x21:
++		subsampling = VE_DEC_MPEG_TRIGGER_CHROMA_FMT_422;
++		break;
++	case 0x11:
++		subsampling = VE_DEC_MPEG_TRIGGER_CHROMA_FMT_444;
++		break;
++	case 0x12:
++		subsampling = VE_DEC_MPEG_TRIGGER_CHROMA_FMT_422T;
++		break;
++	case 0x41:
++		subsampling = VE_DEC_MPEG_TRIGGER_CHROMA_FMT_411;
++		break;
++	default:
++		return cedrus_jpeg_fail(ctx, "luma sampling factors");
+ 	}
+ 
++	/*
++	 * All capture formats are 4:2:0. As the vendor library, set
++	 * FORCE_420 only for 4:2:2 and 4:4:4: with it, 4:1:1 hung the H616
++	 * engine. Without it the engine writes 4:1:1 chroma as is (one
++	 * interleaved CbCr row of width/2 bytes per picture line), twice
++	 * the 4:2:0 chroma size, so 4:1:1 chroma goes to a bounce buffer
++	 * and is resampled to 4:2:0 by the CPU after the job.
++	 */
++	force_420 = subsampling == VE_DEC_MPEG_TRIGGER_CHROMA_FMT_422 ||
++		    subsampling == VE_DEC_MPEG_TRIGGER_CHROMA_FMT_444;
++	s411 = subsampling == VE_DEC_MPEG_TRIGGER_CHROMA_FMT_411;
++	mcu_w = 8 * h;
++	mcu_h = 8 * v;
++
++	if (s411 && dst_fmt->pixelformat == V4L2_PIX_FMT_NV12_32L32)
++		return cedrus_jpeg_fail(ctx, "4:1:1 needs a linear capture format");
++
+ 	/*
+ 	 * The engine writes whole MCUs: the picture must fit the capture
+ 	 * buffer, and its MCU-padded width the line stride.
+@@ -352,13 +372,12 @@ static int cedrus_jpeg_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	/* Quantisation: Y and one table shared by Cb and Cr. */
+ 	quant_y = cedrus_jpeg_get_quant(quantization_tables,
+ 					comp[0].quantization_table_selector);
+-	quant_c = grey ? quant_y :
+-		cedrus_jpeg_get_quant(quantization_tables,
+-				      comp[1].quantization_table_selector);
++	quant_c = cedrus_jpeg_get_quant(quantization_tables,
++					comp[1].quantization_table_selector);
+ 	if (!quant_y || !quant_c)
+ 		return cedrus_jpeg_fail(ctx, "missing or 16-bit DQT table");
+ 
+-	if (!grey && comp[2].quantization_table_selector !=
++	if (comp[2].quantization_table_selector !=
+ 		     comp[1].quantization_table_selector) {
+ 		const u8 *quant_cr = cedrus_jpeg_get_quant(quantization_tables,
+ 				comp[2].quantization_table_selector);
+@@ -370,7 +389,7 @@ static int cedrus_jpeg_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	/* Huffman: Y-DC, Y-AC, C-DC, C-AC. */
+ 	for (i = 0; i < 2; i++) {
+ 		struct v4l2_jpeg_scan_component_spec *sc =
+-			&scan_header.component[grey ? 0 : i];
++			&scan_header.component[i];
+ 
+ 		ret = cedrus_jpeg_get_huff(huffman_tables, false,
+ 					   sc->dc_entropy_coding_table_selector,
+@@ -383,8 +402,7 @@ static int cedrus_jpeg_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 			return cedrus_jpeg_fail(ctx, "invalid DHT table");
+ 	}
+ 
+-	if (!grey &&
+-	    (scan_header.component[2].dc_entropy_coding_table_selector !=
++	if ((scan_header.component[2].dc_entropy_coding_table_selector !=
+ 	     scan_header.component[1].dc_entropy_coding_table_selector ||
+ 	     scan_header.component[2].ac_entropy_coding_table_selector !=
+ 	     scan_header.component[1].ac_entropy_coding_table_selector)) {
+@@ -411,18 +429,25 @@ static int cedrus_jpeg_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	dst_luma_addr = cedrus_dst_buf_addr(ctx, dst_buf, 0);
+ 	dst_chroma_addr = cedrus_dst_buf_addr(ctx, dst_buf, 1);
+ 
+-	/*
+-	 * Grey pictures leave the chroma plane alone (to be confirmed on
+-	 * hardware); fill it with neutral chroma so the output is valid.
+-	 */
+-	if (grey) {
+-		u8 *vaddr = vb2_plane_vaddr(dst_buf, 0);
+-		size_t offset = dst_chroma_addr - dst_luma_addr;
+-
+-		if (!vaddr || offset >= dst_fmt->sizeimage)
+-			return -EFAULT;
+-
+-		memset(vaddr + offset, 0x80, dst_fmt->sizeimage - offset);
++	ctx->codec.jpeg.chroma_411 = s411;
++	ctx->codec.jpeg.width = width;
++	ctx->codec.jpeg.height = height;
++	if (s411) {
++		/* 4:1:1 chroma: height rows at the luma stride */
++		size_t need = (size_t)dst_fmt->bytesperline *
++			      (ALIGN(height, 16) + 16);
++
++		if (ctx->codec.jpeg.chroma_buf_size < need) {
++			cedrus_jpeg_free_chroma(ctx);
++			ctx->codec.jpeg.chroma_buf =
++				dma_alloc_noncoherent(dev->dev, need,
++						      &ctx->codec.jpeg.chroma_buf_dma,
++						      DMA_FROM_DEVICE, GFP_KERNEL);
++			if (!ctx->codec.jpeg.chroma_buf)
++				return -ENOMEM;
++			ctx->codec.jpeg.chroma_buf_size = need;
++		}
++		dst_chroma_addr = ctx->codec.jpeg.chroma_buf_dma;
+ 	}
+ 
+ 	ctx->codec.jpeg.subsampling = subsampling;
+@@ -465,8 +490,14 @@ static int cedrus_jpeg_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	reg = src_buf_addr + vb2_plane_size(src_buf, 0) - 1;
+ 	cedrus_write(dev, VE_DEC_MPEG_VLD_END_ADDR, reg);
+ 
+-	/* The linear output formats come out of the secondary output. */
+-	cedrus_dst_secondary_format_set(dev, dst_fmt);
++	/*
++	 * The linear output formats come out of the secondary output. The
++	 * 4:1:1 chroma bounce buffer is written as NV12 (same luma layout).
++	 */
++	out_fmt = *dst_fmt;
++	if (s411)
++		out_fmt.pixelformat = V4L2_PIX_FMT_NV12;
++	cedrus_dst_secondary_format_set(dev, &out_fmt);
+ 
+ 	/* Enable appropriate interrupts and components. */
+ 	reg = VE_DEC_MPEG_CTRL_IRQ_MASK;
+@@ -504,10 +535,93 @@ static void cedrus_jpeg_trigger(struct cedrus_ctx *ctx)
+ 	cedrus_write(dev, VE_DEC_MPEG_TRIGGER, reg);
+ }
+ 
++static int cedrus_jpeg_start(struct cedrus_ctx *ctx)
++{
++	ctx->codec.jpeg.chroma_buf = NULL;
++	ctx->codec.jpeg.chroma_buf_size = 0;
++	ctx->codec.jpeg.chroma_411 = false;
++
++	return 0;
++}
++
++static void cedrus_jpeg_stop(struct cedrus_ctx *ctx)
++{
++	cedrus_jpeg_free_chroma(ctx);
++}
++
++/*
++ * 4:1:1 to 4:2:0: each 4:2:0 chroma sample takes the 4:1:1 sample of its
++ * column pair, averaged over its two lines.
++ */
++static void cedrus_jpeg_post_process(struct cedrus_ctx *ctx)
++{
++	struct v4l2_pix_format *fmt = &ctx->dst_fmt;
++	unsigned int bpl = fmt->bytesperline;
++	unsigned int w = ctx->codec.jpeg.width, h = ctx->codec.jpeg.height;
++	unsigned int cw = DIV_ROUND_UP(w, 2), ch = DIV_ROUND_UP(h, 2);
++	struct vb2_v4l2_buffer *dst;
++	u8 *out, *cb, *cr;
++	const u8 *in;
++	unsigned int x, y, step;
++
++	if (!ctx->codec.jpeg.chroma_411)
++		return;
++
++	dst = v4l2_m2m_next_dst_buf(ctx->fh.m2m_ctx);
++	out = dst ? vb2_plane_vaddr(&dst->vb2_buf, 0) : NULL;
++	if (!out)
++		return;
++	out += (size_t)bpl * fmt->height;
++
++	dma_sync_single_for_cpu(ctx->dev->dev, ctx->codec.jpeg.chroma_buf_dma,
++				ctx->codec.jpeg.chroma_buf_size,
++				DMA_FROM_DEVICE);
++	in = ctx->codec.jpeg.chroma_buf;
++
++	switch (fmt->pixelformat) {
++	case V4L2_PIX_FMT_NV21:
++		cr = out;
++		cb = out + 1;
++		step = 2;
++		break;
++	case V4L2_PIX_FMT_YUV420:
++		cb = out;
++		cr = out + (size_t)(bpl / 2) * (fmt->height / 2);
++		step = 1;
++		break;
++	case V4L2_PIX_FMT_YVU420:
++		cr = out;
++		cb = out + (size_t)(bpl / 2) * (fmt->height / 2);
++		step = 1;
++		break;
++	default:
++		cb = out;
++		cr = out + 1;
++		step = 2;
++		break;
++	}
++
++	for (y = 0; y < ch; y++) {
++		const u8 *r0 = in + (size_t)bpl * 2 * y;
++		const u8 *r1 = 2 * y + 1 < h ? r0 + bpl : r0;
++		size_t o = (size_t)y * (step == 2 ? bpl : bpl / 2);
++
++		for (x = 0; x < cw; x++) {
++			unsigned int k = (x / 2) * 2;
++
++			cb[o + x * step] = (r0[k] + r1[k] + 1) >> 1;
++			cr[o + x * step] = (r0[k + 1] + r1[k + 1] + 1) >> 1;
++		}
++	}
++}
++
+ struct cedrus_dec_ops cedrus_dec_ops_jpeg = {
+ 	.irq_clear   = cedrus_jpeg_irq_clear,
+ 	.irq_disable = cedrus_jpeg_irq_disable,
+ 	.irq_status  = cedrus_jpeg_irq_status,
+ 	.setup       = cedrus_jpeg_setup,
+ 	.trigger     = cedrus_jpeg_trigger,
++	.start       = cedrus_jpeg_start,
++	.stop        = cedrus_jpeg_stop,
++	.post_process = cedrus_jpeg_post_process,
+ };
+-- 
+2.55.0
+

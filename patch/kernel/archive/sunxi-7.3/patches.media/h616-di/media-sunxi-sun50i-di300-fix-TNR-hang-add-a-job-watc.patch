@@ -14,19 +14,20 @@ Found on the H616 board:
   v4l2_m2m_cancel_job() in uninterruptible sleep, so the device was
   unusable until reboot. Add a 1 s watchdog that reports the engine
   state, resets the block and fails the job's buffers.
-- At 2048x1280 with 4:2:2 input the engine reads past the end of each
-  source frame (IOMMU read faults exactly at the buffer end, output
-  still correct). Allocate MMAP source buffers with a page of slack.
+- At 2048x1280 with 4:2:2 input the engine reads one page past the
+  end of each capture frame (IOMMU read faults exactly at the buffer
+  end, output still correct). Allocate MMAP buffers with a page of
+  slack.
 
 Assisted-by: Claude:claude-opus-5-5
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- .../sunxi/sun50i-di300/sun50i-di300.c         | 81 ++++++++++++++++---
+ .../sunxi/sun50i-di300/sun50i-di300.c         | 80 ++++++++++++++++---
  .../sunxi/sun50i-di300/sun50i-di300.h         |  5 ++
- 2 files changed, 76 insertions(+), 10 deletions(-)
+ 2 files changed, 75 insertions(+), 10 deletions(-)
 
 diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
-index 54a2364fb..9da82c68a 100644
+index 54a2364fb..10fc5edd3 100644
 --- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
 +++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
 @@ -508,8 +508,13 @@ static void deinterlace_device_run(void *priv)
@@ -145,22 +146,21 @@ index 54a2364fb..9da82c68a 100644
  }
  
  static void deinterlace_init(struct deinterlace_dev *dev)
-@@ -1112,6 +1161,14 @@ static int deinterlace_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
+@@ -1112,6 +1161,13 @@ static int deinterlace_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
  			return -EINVAL;
  	} else {
  		sizes[0] = pix_fmt->sizeimage;
 +		/*
-+		 * At 2048x1280 4:2:2 the engine reads past the end of each
-+		 * source frame (IOMMU read faults exactly at the buffer
-+		 * end; the output is still correct). Give MMAP source
++		 * At 2048x1280 4:2:2 the engine reads one page past the end
++		 * of each capture frame (IOMMU read faults exactly at the
++		 * buffer end; the output is still correct). Give MMAP
 +		 * buffers a page of slack.
 +		 */
-+		if (V4L2_TYPE_IS_OUTPUT(vq->type))
-+			sizes[0] += PAGE_SIZE;
++		sizes[0] += PAGE_SIZE;
  		*nplanes = 1;
  	}
  
-@@ -1766,6 +1823,8 @@ static int deinterlace_probe(struct platform_device *pdev)
+@@ -1766,6 +1822,8 @@ static int deinterlace_probe(struct platform_device *pdev)
  	if (irq <= 0)
  		return irq;
  
@@ -169,7 +169,7 @@ index 54a2364fb..9da82c68a 100644
  	ret = devm_request_irq(dev->dev, irq, deinterlace_irq,
  			       0, dev_name(dev->dev), dev);
  	if (ret) {
-@@ -1898,6 +1957,8 @@ static void deinterlace_remove(struct platform_device *pdev)
+@@ -1898,6 +1956,8 @@ static void deinterlace_remove(struct platform_device *pdev)
  {
  	struct deinterlace_dev *dev = platform_get_drvdata(pdev);
  
