@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jernej Skrabec <jernej.skrabec@gmail.com>
+Date: Sat, 18 Jul 2026 13:37:04 +0200
+Subject: [PATCH] drm/sun4i: Share the DE33 DMA address space
+
+All DE33 memory clients share one IOMMU master and must therefore allocate
+and map buffers through the same device and domain.
+
+Use the shared planes device as the DRM DMA device, allocate mixer RCQ
+memory through it and defer writeback RCQ allocation until bind can
+select that same DMA device.
+
+Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
+[aiyengar: only the mixer and planes parts are carried: this tree has
+ neither RCQ nor writeback, so the sun50i_wb.c hunks and the RCQ
+ allocation are dropped. The planes device gets a 32-bit DMA mask
+ instead of 40 bits, because the VI/UI fetch units here are programmed
+ with the low 32 address bits only (no HADDR writes outside AFBC) and
+ the IOMMU hands out 32-bit IOVAs anyway (LE's 40-bit mask goes with
+ its 0239 IOMMU >4 GiB patch, not carried)]
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/sun4i/sun50i_planes.c | 10 ++++++++++
+ drivers/gpu/drm/sun4i/sun8i_mixer.c   |  7 +++++++
+ 2 files changed, 17 insertions(+)
+
+diff --git a/drivers/gpu/drm/sun4i/sun50i_planes.c b/drivers/gpu/drm/sun4i/sun50i_planes.c
+index 2e0e7d36c..5a639669a 100644
+--- a/drivers/gpu/drm/sun4i/sun50i_planes.c
++++ b/drivers/gpu/drm/sun4i/sun50i_planes.c
+@@ -4,6 +4,7 @@
+ #include <drm/drm_device.h>
+ 
+ #include <linux/device.h>
++#include <linux/dma-mapping.h>
+ #include <linux/io.h>
+ #include <linux/mfd/syscon.h>
+ #include <linux/module.h>
+@@ -163,6 +164,15 @@ static int sun50i_planes_probe(struct platform_device *pdev)
+ 	struct device *dev = &pdev->dev;
+ 	struct sun50i_planes *planes;
+ 	void __iomem *regs;
++	int ret;
++
++	/*
++	 * The VI and UI fetch units are programmed with the low 32 address
++	 * bits only. Behind the IOMMU all addresses are 32-bit IOVAs.
++	 */
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
++	if (ret)
++		return dev_err_probe(dev, ret, "Cannot set DMA mask\n");
+ 
+ 	planes = devm_kzalloc(dev, sizeof(*planes), GFP_KERNEL);
+ 	if (!planes)
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+index 8783dabc5..6abada374 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -702,6 +702,13 @@ static int sun8i_mixer_bind(struct device *dev, struct device *master,
+ 		}
+ 
+ 		mixer->planes_dev = &pdev->dev;
++
++		/*
++		 * All DE33 memory clients share one IOMMU master. Use the
++		 * planes device for framebuffer allocations so they are
++		 * mapped in its domain.
++		 */
++		drm_dev_set_dma_dev(drm, mixer->planes_dev);
+ 	}
+ 
+ 	list_add_tail(&mixer->engine.list, &drv->engine_list);

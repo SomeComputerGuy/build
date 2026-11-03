@@ -2636,7 +2636,7 @@ index 111111111111..222222222222 100644
  		put_device(mixer->planes_dev);
  
  	clk_disable_unprepare(mixer->mod_clk);
-@@ -987,6 +1085,23 @@ static const struct sun8i_mixer_cfg sun50i_h616_mixer0_cfg = {
+@@ -987,6 +1085,29 @@ static const struct sun8i_mixer_cfg sun50i_h616_mixer0_cfg = {
  	.mod_rate	= 600000000,
  };
  
@@ -2647,8 +2647,14 @@ index 111111111111..222222222222 100644
 +static const struct sun8i_mixer_cfg sun55i_a523_mixer0_cfg = {
 +	.lay_cfg = {
 +		.de_type	= SUN8I_MIXER_DE33,
-+		.scaler_mask	= 0xf,
-+		.scanline_yuv	= 4096,
++		.scaler_type	= {
++			SUN8I_SCALER_VI_10,
++			SUN8I_SCALER_UI,
++			SUN8I_SCALER_UI,
++			SUN8I_SCALER_UI,
++		},
++		.scanline_yuv	= {4096},
++		.scanline_rgb	= {2048, 2048, 2048, 2048},
 +	},
 +	.de_type	= SUN8I_MIXER_DE33,
 +	.mod_rate	= 600000000,
@@ -2660,7 +2666,7 @@ index 111111111111..222222222222 100644
  static const struct of_device_id sun8i_mixer_of_table[] = {
  	{
  		.compatible = "allwinner,sun8i-a83t-de2-mixer-0",
-@@ -1040,6 +1155,10 @@ static const struct of_device_id sun8i_mixer_of_table[] = {
+@@ -1040,6 +1161,10 @@ static const struct of_device_id sun8i_mixer_of_table[] = {
  		.compatible = "allwinner,sun50i-h616-de33-mixer-0",
  		.data = &sun50i_h616_mixer0_cfg,
  	},
