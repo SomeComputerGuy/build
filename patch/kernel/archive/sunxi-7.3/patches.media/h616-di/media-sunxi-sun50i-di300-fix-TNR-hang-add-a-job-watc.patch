@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 3 Nov 2026 05:44:07 +0000
+Subject: [PATCH] media: sunxi: sun50i-di300: fix TNR hang, add a job watchdog
+
+Found on the H616 board:
+
+- With TNR enabled the first job of a stream ran with the motion
+  detector off (no history yet). The engine then stays busy forever
+  (STATUS 0x100, FUNC_EN 0x5) and never raises its interrupt. Enable
+  MD in every job that runs TNR, as the vendor driver does; the flag
+  buffers start zeroed.
+- A job the engine never completes left STREAMOFF waiting in
+  v4l2_m2m_cancel_job() in uninterruptible sleep, so the device was
+  unusable until reboot. Add a 1 s watchdog that reports the engine
+  state, resets the block and fails the job's buffers.
+- At 2048x1280 with 4:2:2 input the engine reads past the end of each
+  source frame (IOMMU read faults exactly at the buffer end, output
+  still correct). Allocate MMAP source buffers with a page of slack.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../sunxi/sun50i-di300/sun50i-di300.c         | 81 ++++++++++++++++---
+ .../sunxi/sun50i-di300/sun50i-di300.h         |  5 ++
+ 2 files changed, 76 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
+index 54a2364fb..9da82c68a 100644
+--- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
++++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
+@@ -508,8 +508,13 @@ static void deinterlace_device_run(void *priv)
+ 		}
+ 	}
+ 
+-	/* TNR needs the motion flags too (vendor: md_en in TNR-only mode) */
+-	if (motion || (ctx->tnr_active && ctx->prev[0])) {
++	/*
++	 * TNR needs the motion detector, also on the first run (the flag
++	 * buffers start zeroed): with TNR on and MD off the engine stays
++	 * busy and never signals completion. The vendor enables MD in every
++	 * mode that runs TNR.
++	 */
++	if (motion || ctx->tnr_active) {
+ 		dma |= DEINTERLACE_DMA_CTL_FR | DEINTERLACE_DMA_CTL_FW;
+ 		func |= DEINTERLACE_FUNC_EN_MD;
+ 	}
+@@ -645,6 +650,8 @@ static void deinterlace_device_run(void *priv)
+ 
+ 	deinterlace_set_bits(dev, DEINTERLACE_INT_CTL,
+ 			     DEINTERLACE_INT_CTL_FINISH_EN);
++	schedule_delayed_work(&dev->watchdog_work,
++			      msecs_to_jiffies(DEINTERLACE_WATCHDOG_TIMEOUT_MS));
+ 	deinterlace_set_bits(dev, DEINTERLACE_START, DEINTERLACE_START_EN);
+ }
+ 
+@@ -695,13 +702,15 @@ static void deinterlace_tnr_adapt(struct deinterlace_ctx *ctx)
+ 	ctx->tnr_gain = clamp(gain, ctx->tnr_gain_min, ctx->tnr_gain_max);
+ }
+ 
++static void deinterlace_job_done(struct deinterlace_ctx *ctx,
++				 enum vb2_buffer_state state);
++static void deinterlace_init(struct deinterlace_dev *dev);
++
+ static irqreturn_t deinterlace_irq(int irq, void *data)
+ {
+ 	struct deinterlace_dev *dev = data;
+-	struct vb2_v4l2_buffer *src;
+ 	struct deinterlace_ctx *ctx;
+-	enum vb2_buffer_state state;
+-	unsigned int val, keep;
++	unsigned int val;
+ 
+ 	ctx = v4l2_m2m_get_curr_priv(dev->m2m_dev);
+ 	if (!ctx) {
+@@ -718,9 +727,51 @@ static irqreturn_t deinterlace_irq(int irq, void *data)
+ 	deinterlace_set_bits(dev, DEINTERLACE_STATUS, DEINTERLACE_STATUS_FINISH);
+ 	deinterlace_clr_bits(dev, DEINTERLACE_START, DEINTERLACE_START_EN);
+ 
+-	state = ctx->aborting ? VB2_BUF_STATE_ERROR : VB2_BUF_STATE_DONE;
++	/* the watchdog already failed this job */
++	if (!cancel_delayed_work(&dev->watchdog_work))
++		return IRQ_HANDLED;
+ 
+-	if (ctx->fmd_active) {
++	deinterlace_job_done(ctx, ctx->aborting ? VB2_BUF_STATE_ERROR :
++						  VB2_BUF_STATE_DONE);
++
++	return IRQ_HANDLED;
++}
++
++static void deinterlace_watchdog(struct work_struct *work)
++{
++	struct deinterlace_dev *dev =
++		container_of(to_delayed_work(work), struct deinterlace_dev,
++			     watchdog_work);
++	struct deinterlace_ctx *ctx;
++
++	ctx = v4l2_m2m_get_curr_priv(dev->m2m_dev);
++	if (!ctx)
++		return;
++
++	dev_err_ratelimited(dev->dev,
++			    "job timed out: status %#x, func %#x, dma %#x\n",
++			    deinterlace_read(dev, DEINTERLACE_STATUS),
++			    deinterlace_read(dev, DEINTERLACE_FUNC_EN),
++			    deinterlace_read(dev, DEINTERLACE_DMA_CTL));
++
++	/* stop the engine and bring it back to its defaults */
++	deinterlace_write(dev, DEINTERLACE_INT_CTL, 0);
++	deinterlace_clr_bits(dev, DEINTERLACE_START, DEINTERLACE_START_EN);
++	reset_control_assert(dev->rstc);
++	reset_control_deassert(dev->rstc);
++	deinterlace_init(dev);
++
++	deinterlace_job_done(ctx, VB2_BUF_STATE_ERROR);
++}
++
++static void deinterlace_job_done(struct deinterlace_ctx *ctx,
++				 enum vb2_buffer_state state)
++{
++	struct deinterlace_dev *dev = ctx->dev;
++	struct vb2_v4l2_buffer *src;
++	unsigned int keep;
++
++	if (ctx->fmd_active && state == VB2_BUF_STATE_DONE) {
+ 		dev->fmd_stats[0] = deinterlace_read(dev, DEINTERLACE_FMD_FID12) &
+ 				    DEINTERLACE_FMD_HIST_CNT_MASK;
+ 		dev->fmd_stats[1] = deinterlace_read(dev, DEINTERLACE_FMD_FID23) &
+@@ -741,7 +792,7 @@ static irqreturn_t deinterlace_irq(int irq, void *data)
+ 		dev->fmd_stats[9] = deinterlace_read(dev, DEINTERLACE_FMD_FIELD_HIST1);
+ 	}
+ 
+-	if (ctx->tnr_active) {
++	if (ctx->tnr_active && state == VB2_BUF_STATE_DONE) {
+ 		if (ctx->tnr_mode == DEINTERLACE_TNR_ADAPTIVE)
+ 			deinterlace_tnr_adapt(ctx);
+ 		if (ctx->mode != DEINTERLACE_MODE_TNR) {
+@@ -776,8 +827,6 @@ static irqreturn_t deinterlace_irq(int irq, void *data)
+ 		v4l2_m2m_buf_done(src, state);
+ 
+ 	v4l2_m2m_job_finish(ctx->dev->m2m_dev, ctx->fh.m2m_ctx);
+-
+-	return IRQ_HANDLED;
+ }
+ 
+ static void deinterlace_init(struct deinterlace_dev *dev)
+@@ -1112,6 +1161,14 @@ static int deinterlace_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
+ 			return -EINVAL;
+ 	} else {
+ 		sizes[0] = pix_fmt->sizeimage;
++		/*
++		 * At 2048x1280 4:2:2 the engine reads past the end of each
++		 * source frame (IOMMU read faults exactly at the buffer
++		 * end; the output is still correct). Give MMAP source
++		 * buffers a page of slack.
++		 */
++		if (V4L2_TYPE_IS_OUTPUT(vq->type))
++			sizes[0] += PAGE_SIZE;
+ 		*nplanes = 1;
+ 	}
+ 
+@@ -1766,6 +1823,8 @@ static int deinterlace_probe(struct platform_device *pdev)
+ 	if (irq <= 0)
+ 		return irq;
+ 
++	INIT_DELAYED_WORK(&dev->watchdog_work, deinterlace_watchdog);
++
+ 	ret = devm_request_irq(dev->dev, irq, deinterlace_irq,
+ 			       0, dev_name(dev->dev), dev);
+ 	if (ret) {
+@@ -1898,6 +1957,8 @@ static void deinterlace_remove(struct platform_device *pdev)
+ {
+ 	struct deinterlace_dev *dev = platform_get_drvdata(pdev);
+ 
++	cancel_delayed_work_sync(&dev->watchdog_work);
++
+ 	if (media_devnode_is_registered(dev->mdev.devnode)) {
+ 		media_device_unregister(&dev->mdev);
+ 		v4l2_m2m_unregister_media_controller(dev->m2m_dev);
+diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
+index 0925f99db..b5ca6bc8d 100644
+--- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
++++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
+@@ -394,6 +394,11 @@ struct deinterlace_dev {
+ 	 * that happened to submit that job.
+ 	 */
+ 	u32			fmd_stats[DEINTERLACE_FMD_STATS_COUNT];
++
++	/* fails a job the engine never completes */
++	struct delayed_work	watchdog_work;
+ };
+ 
++#define DEINTERLACE_WATCHDOG_TIMEOUT_MS		1000
++
+ #endif
+-- 
+2.55.0
+
