@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 3 Nov 2026 06:11:35 +0000
+Subject: [PATCH] media: sunxi: sun50i-di300: fix the UV order bit, limit
+ semi-planar output
+
+FMT_UVSEQ set means VU order (vendor DI_UVSEQ_VU for NV21/NV61), but
+the driver set it for NV12/NV16. Same-format streams were unaffected;
+on the H616 an NV12 source with a planar capture format came out with
+Cb and Cr swapped, and NV16 to YUV422P wrote a broken Cr plane. Set the
+bit for NV21/NV61, as the vendor does.
+
+A planar source with a semi-planar capture format (YUV420 to NV12)
+never completed: the engine stayed busy. Only allow a semi-planar
+capture format that equals the source format.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../sunxi/sun50i-di300/sun50i-di300.c         | 28 +++++++++++--------
+ 1 file changed, 17 insertions(+), 11 deletions(-)
+
+diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
+index 9da82c68a..a452d97a2 100644
+--- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
++++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
+@@ -99,11 +99,12 @@ static bool deinterlace_fmt_is_uv_combined(u32 pixelformat)
+ 	}
+ }
+ 
+-static bool deinterlace_fmt_is_uv_first(u32 pixelformat)
++/* V before U in the combined chroma plane (FMT_UVSEQ set, as the vendor) */
++static bool deinterlace_fmt_is_vu(u32 pixelformat)
+ {
+ 	switch (pixelformat) {
+-	case V4L2_PIX_FMT_NV12:
+-	case V4L2_PIX_FMT_NV16:
++	case V4L2_PIX_FMT_NV21:
++	case V4L2_PIX_FMT_NV61:
+ 		return true;
+ 	default:
+ 		return false;
+@@ -415,11 +416,13 @@ static void deinterlace_device_run(void *priv)
+ 	reg = DEINTERLACE_FMT_IN0(f0_hw) | DEINTERLACE_FMT_IN1(f1_hw) |
+ 	      DEINTERLACE_FMT_IN2(src_hw) | DEINTERLACE_FMT_DIT(dst_hw) |
+ 	      DEINTERLACE_FMT_TNR(tnr_hw);
+-	/* one UV order for all semi-planar buffers (try_fmt keeps them equal) */
+-	if ((deinterlace_fmt_is_uv_combined(ctx->src_fmt.pixelformat) &&
+-	     deinterlace_fmt_is_uv_first(ctx->src_fmt.pixelformat)) ||
+-	    (deinterlace_fmt_is_uv_combined(ctx->dst_fmt.pixelformat) &&
+-	     deinterlace_fmt_is_uv_first(ctx->dst_fmt.pixelformat)))
++	/*
++	 * One UV order for all semi-planar buffers (try_fmt keeps them
++	 * equal). UVSEQ set means VU order: with it set, NV12 input came out
++	 * of a planar capture format with Cb and Cr swapped.
++	 */
++	if (deinterlace_fmt_is_vu(ctx->src_fmt.pixelformat) ||
++	    deinterlace_fmt_is_vu(ctx->dst_fmt.pixelformat))
+ 		reg |= DEINTERLACE_FMT_UVSEQ;
+ 	deinterlace_write(dev, DEINTERLACE_FMT, reg);
+ 
+@@ -1029,9 +1032,12 @@ static int deinterlace_try_fmt_vid_cap(struct file *file, void *priv,
+ 	    deinterlace_fmt_is_422(f->fmt.pix.pixelformat) !=
+ 	    deinterlace_fmt_is_422(ctx->src_fmt.pixelformat))
+ 		f->fmt.pix.pixelformat = ctx->src_fmt.pixelformat;
+-	/* one UV order bit covers every semi-planar buffer */
+-	if (deinterlace_fmt_is_uv_combined(f->fmt.pix.pixelformat) &&
+-	    deinterlace_fmt_is_uv_combined(ctx->src_fmt.pixelformat))
++	/*
++	 * One UV order bit covers every semi-planar buffer. A semi-planar
++	 * output from a planar input never completed on the H616 (engine
++	 * busy forever), so a semi-planar output needs the same input.
++	 */
++	if (deinterlace_fmt_is_uv_combined(f->fmt.pix.pixelformat))
+ 		f->fmt.pix.pixelformat = ctx->src_fmt.pixelformat;
+ 	f->fmt.pix.field = V4L2_FIELD_NONE;
+ 	f->fmt.pix.width = ctx->src_fmt.width;
+-- 
+2.55.0
+
