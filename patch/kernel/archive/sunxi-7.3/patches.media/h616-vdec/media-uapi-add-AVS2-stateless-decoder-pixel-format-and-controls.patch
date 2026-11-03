@@ -1,4 +1,4 @@
-From af199b447b1102ca08e158e6aaf73d2337c0afe3 Mon Sep 17 00:00:00 2001
+From d0aa5a388df4038564a7cecbefcb32c6566b0f78 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Mon, 2 Nov 2026 22:26:42 +0000
 Subject: media: uapi: add AVS2 stateless decoder pixel format and
@@ -34,13 +34,13 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  .../media/v4l/videodev2.h.rst.exceptions      |   4 +
  .../media/v4l/vidioc-g-ext-ctrls.rst          |  16 +
  .../media/v4l/vidioc-queryctrl.rst            |  24 ++
- drivers/media/v4l2-core/v4l2-ctrls-core.c     | 177 +++++++++
+ drivers/media/v4l2-core/v4l2-ctrls-core.c     | 179 +++++++++
  drivers/media/v4l2-core/v4l2-ctrls-defs.c     |  16 +
  drivers/media/v4l2-core/v4l2-ioctl.c          |   1 +
  include/media/v4l2-ctrls.h                    |   8 +
  include/uapi/linux/v4l2-controls.h            | 230 +++++++++++
  include/uapi/linux/videodev2.h                |   6 +
- 12 files changed, 867 insertions(+)
+ 12 files changed, 869 insertions(+)
 
 diff --git a/Documentation/userspace-api/media/v4l/biblio.rst b/Documentation/userspace-api/media/v4l/biblio.rst
 index 0510aee5b..1dcfc7d38 100644
@@ -535,7 +535,7 @@ index e1e9c2217..9e61dd805 100644
  .. raw:: latex
  
 diff --git a/drivers/media/v4l2-core/v4l2-ctrls-core.c b/drivers/media/v4l2-core/v4l2-ctrls-core.c
-index e3c13990f..ae0be373c 100644
+index e3c13990f..f77c84326 100644
 --- a/drivers/media/v4l2-core/v4l2-ctrls-core.c
 +++ b/drivers/media/v4l2-core/v4l2-ctrls-core.c
 @@ -145,6 +145,8 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
@@ -547,15 +547,17 @@ index e3c13990f..ae0be373c 100644
  	void *p = ptr.p + idx * ctrl->elem_size;
  
  	if (ctrl->p_def.p_const)
-@@ -249,6 +251,27 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
+@@ -249,6 +251,29 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
  
  		p_h263_slice->quant_scale = 1;
  		break;
 +	case V4L2_CTRL_TYPE_AVS2_SEQUENCE:
 +		p_avs2_sequence = p;
 +
-+		/* 8-bit 4:2:0 Main profile, 64x64 LCUs */
++		/* 8-bit 4:2:0 Main profile, 64x64 LCUs, QCIF */
 +		p_avs2_sequence->profile_id = V4L2_AVS2_PROFILE_MAIN;
++		p_avs2_sequence->horizontal_size = 176;
++		p_avs2_sequence->vertical_size = 144;
 +		p_avs2_sequence->chroma_format = 1;
 +		p_avs2_sequence->sample_precision = 1;
 +		p_avs2_sequence->encoding_precision = 1;
@@ -575,7 +577,7 @@ index e3c13990f..ae0be373c 100644
  	case V4L2_CTRL_TYPE_FWHT_PARAMS:
  		p_fwht_params = p;
  		p_fwht_params->version = V4L2_FWHT_VERSION;
-@@ -562,6 +585,18 @@ void v4l2_ctrl_type_op_log(const struct v4l2_ctrl *ctrl)
+@@ -562,6 +587,18 @@ void v4l2_ctrl_type_op_log(const struct v4l2_ctrl *ctrl)
  	case V4L2_CTRL_TYPE_H263_SLICE_PARAMS:
  		pr_cont("H263_SLICE_PARAMS");
  		break;
@@ -594,7 +596,7 @@ index e3c13990f..ae0be373c 100644
  	case V4L2_CTRL_TYPE_RECT:
  		pr_cont("(%d,%d)/%ux%u",
  			ptr.p_rect->left, ptr.p_rect->top,
-@@ -1406,6 +1441,128 @@ static int validate_h263_slice_params(struct v4l2_ctrl_h263_slice_params *slice)
+@@ -1406,6 +1443,128 @@ static int validate_h263_slice_params(struct v4l2_ctrl_h263_slice_params *slice)
  	return 0;
  }
  
@@ -723,7 +725,7 @@ index e3c13990f..ae0be373c 100644
  /*
   * Compound controls validation requires setting unused fields/flags to zero
   * in order to properly detect unchanged controls with v4l2_ctrl_type_op_equal's
-@@ -1873,6 +2030,14 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
+@@ -1873,6 +2032,14 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
  		return validate_h263_picture(p);
  	case V4L2_CTRL_TYPE_H263_SLICE_PARAMS:
  		return validate_h263_slice_params(p);
@@ -738,7 +740,7 @@ index e3c13990f..ae0be373c 100644
  
  	case V4L2_CTRL_TYPE_AREA:
  		area = p;
-@@ -2630,6 +2795,18 @@ static struct v4l2_ctrl *v4l2_ctrl_new(struct v4l2_ctrl_handler *hdl,
+@@ -2630,6 +2797,18 @@ static struct v4l2_ctrl *v4l2_ctrl_new(struct v4l2_ctrl_handler *hdl,
  	case V4L2_CTRL_TYPE_H263_SLICE_PARAMS:
  		elem_size = sizeof(struct v4l2_ctrl_h263_slice_params);
  		break;
