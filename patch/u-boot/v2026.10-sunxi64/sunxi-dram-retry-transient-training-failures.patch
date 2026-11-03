@@ -15,27 +15,35 @@ that had been thrashing under OOM for minutes produced:
 i.e. in the first pass none of the four combinations trained, and in the
 pass after the panic induced reset the 32-bit one still failed while a
 16-bit one trained, so the board ran with half of its RAM until the next
-reboot. In 76 other boots (power-on, reboot, other watchdog resets) the
-board always came up with 1024 MiB.
+reboot. Idle resets of any kind never fail. Hardware watchdog resets
+taken while the DRAM is saturated (stress-ng cpu+vm+bigheap, real OOM
+kills, SoC ~75 C) reproduce it: in 21 such resets, two needed a
+retry and one failed all of 3 back-to-back passes (a few ms in total)
+again, so the transient lasts longer than back-to-back attempts.
 
 Make the scan robust against such transient failures:
-- run up to three passes over the combinations and keep the most
-  demanding one that trained in any pass; later passes only try the
-  combinations more demanding than the best one found so far, so a
-  board which trains its real geometry in the first pass pays only the
-  (quickly failing) more demanding attempts twice more,
-- only panic if nothing trained in any pass,
+- keep the most demanding combination that trained in any pass; once
+  something trained, two more passes retry only the more demanding
+  combinations, so a healthy board pays only for a couple of quickly
+  failing attempts (as before),
+- while nothing trained, retry with an exponential backoff (20 ms
+  doubling up to 320 ms, 8 passes, about 1.3 s) before panicking; after
+  a delay was needed, the passes for the more demanding combinations are
+  delayed as well,
 - the size probe and the final init used to ignore mctl_core_init()'s
-  result; retry them up to three times as well (the outcome on a
-  persistent failure is unchanged).
+  result; retry them with the same backoff (the outcome on a persistent
+  failure is unchanged).
 
-If any retry was needed the SPL prints "(training retried)" in the DRAM
-line, so the event remains visible.
+Every mctl_core_init() already resets and re-initializes the controller,
+PHY and DRAM PLL and runs the DRAM reset/init sequence. If any retry was
+needed the SPL prints " (training retried: pass N, M ms)" in the DRAM
+line, so the event and the duration of the transient remain visible.
+Nothing changes in timing unless a retry is needed.
 
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
 diff --git a/arch/arm/include/asm/arch-sunxi/dram_dw_helpers.h b/arch/arm/include/asm/arch-sunxi/dram_dw_helpers.h
-index bc9e0d8..da73c35 100644
+index bc9e0d86..da73c353 100644
 --- a/arch/arm/include/asm/arch-sunxi/dram_dw_helpers.h
 +++ b/arch/arm/include/asm/arch-sunxi/dram_dw_helpers.h
 @@ -13,6 +13,8 @@
@@ -48,14 +56,16 @@ index bc9e0d8..da73c35 100644
  				 struct dram_config *config);
  void mctl_auto_detect_dram_size(const struct dram_para *para,
 diff --git a/arch/arm/mach-sunxi/dram_dw_helpers.c b/arch/arm/mach-sunxi/dram_dw_helpers.c
-index d2af2d5..b296f74 100644
+index d2af2d57..22b127f2 100644
 --- a/arch/arm/mach-sunxi/dram_dw_helpers.c
 +++ b/arch/arm/mach-sunxi/dram_dw_helpers.c
-@@ -7,48 +7,93 @@
+@@ -7,48 +7,157 @@
   */
  
  #include <init.h>
 +#include <log.h>
++#include <time.h>
++#include <linux/delay.h>
 +#include <linux/kernel.h>
  #include <asm/arch/dram_dw_helpers.h>
  
@@ -76,33 +86,72 @@ index d2af2d5..b296f74 100644
 +};
 +
 +/*
-+ * PHY training can occasionally fail for a geometry the board really has
-+ * (seen on an H616 board after a watchdog reset of a heavily loaded
-+ * system: no combination trained, and after the panic induced reset only
-+ * the 16-bit one did, leaving half of the RAM unused). Taking
-+ * the first combination that trains silently falls back to a narrower
-+ * bus or a single rank in that case. Scan more than once and keep
-+ * the most demanding combination that trained in any pass. Combinations
-+ * the board does not have fail training reliably, so this only costs a few
-+ * failing training runs on boards which don't use the full 32-bit, dual
-+ * rank configuration.
++ * PHY training can occasionally fail for a geometry the board really has.
++ * On an H616 board (Orange Pi Zero2, DDR3) a hardware watchdog reset of a
++ * system that was saturating the DRAM under OOM produced:
++ *
++ *   DRAM:This DRAM setup is currently not supported.
++ *   resetting ...
++ *   DRAM: 512 MiB
++ *
++ * i.e. no combination trained in the first SPL run and only a 16-bit one
++ * trained in the run after the panic induced reset. The failure is a
++ * transient: it outlasts several back-to-back attempts (all within a few
++ * ms), but is gone some hundred ms later. Hence:
++ *
++ * - Keep the most demanding combination that trained in any pass instead
++ *   of the first one, so a narrower bus or a single rank is not silently
++ *   chosen over the real geometry. Once something trained, two more
++ *   passes retry only the more demanding combinations. Those are quick
++ *   (combinations the board does not have fail training reliably) and
++ *   are the only cost on a healthy board.
++ * - While nothing trained, do not give up after back-to-back attempts:
++ *   retry with an exponential backoff (20 ms doubling up to 320 ms,
++ *   MCTL_MAX_PASSES passes, about 1.3 s in total) before panicking.
++ *   After such a delay was needed, the passes for the more demanding
++ *   combinations are delayed as well.
++ * - Each mctl_core_init() resets and re-initializes the controller, PHY
++ *   and DRAM PLL and runs the DRAM reset/init sequence, so every attempt
++ *   starts from scratch.
++ *
++ * If a retry was needed, " (training retried: pass N, M ms)" is printed in
++ * the DRAM line, so the event (and how long the transient lasted) remains
++ * visible.
 + */
-+#define MCTL_DETECT_PASSES	3
++#define MCTL_FAST_PASSES	3
++#define MCTL_MAX_PASSES		8
++#define MCTL_BACKOFF_MS_MIN	20
++#define MCTL_BACKOFF_MS_MAX	320
++
++static void mctl_backoff(unsigned int *ms)
++{
++	mdelay(*ms);
++	*ms = min(*ms * 2, (unsigned int)MCTL_BACKOFF_MS_MAX);
++}
++
++static void mctl_report_retry(unsigned int pass, ulong start)
++{
++	printf(" (training retried: pass %u, %lu ms)", pass, get_timer(start));
++}
 +
 +bool mctl_core_init_retry(const struct dram_para *para,
 +			  const struct dram_config *config)
 +{
++	unsigned int ms = MCTL_BACKOFF_MS_MIN;
++	ulong start = get_timer(0);
 +	int i;
 +
-+	for (i = 0; i < MCTL_DETECT_PASSES; i++) {
++	for (i = 0; i < MCTL_MAX_PASSES; i++) {
++		if (i)
++			mctl_backoff(&ms);
 +		if (mctl_core_init(para, config)) {
 +			if (i)
-+				printf(" (training retried)");
++				mctl_report_retry(i + 1, start);
 +			return true;
 +		}
 +	}
 +
-+	debug("DRAM training failed %d times\n", MCTL_DETECT_PASSES);
++	debug("DRAM training failed %d times\n", MCTL_MAX_PASSES);
 +
 +	return false;
 +}
@@ -110,9 +159,12 @@ index d2af2d5..b296f74 100644
  void mctl_auto_detect_rank_width(const struct dram_para *para,
  				 struct dram_config *config)
  {
-+	unsigned int best = ARRAY_SIZE(mctl_geometries);
-+	unsigned int first = best;
-+	unsigned int pass, i;
++	const unsigned int none = ARRAY_SIZE(mctl_geometries);
++	unsigned int best = none, first = none, best_pass = 0;
++	unsigned int ms = MCTL_BACKOFF_MS_MIN;
++	unsigned int pass, i, extra = 0;
++	ulong start = get_timer(0);
++	bool delayed = false;
 +
  	/* this is minimum size that it's supported */
  	config->cols = 8;
@@ -125,7 +177,24 @@ index d2af2d5..b296f74 100644
 -	 * on HW with full bus width and rank = 2, but only 1/4 RAM would be
 -	 * visible.
 -	 */
-+	for (pass = 0; pass < MCTL_DETECT_PASSES && best > 0; pass++) {
++	for (pass = 0; best > 0; pass++) {
++		if (best == none) {
++			/* nothing trained yet: back off and try again */
++			if (pass == MCTL_MAX_PASSES)
++				break;
++			if (pass) {
++				mctl_backoff(&ms);
++				delayed = true;
++			}
++		} else {
++			/* retry the more demanding combinations a few times */
++			if (!extra)
++				break;
++			extra--;
++			if (delayed)
++				mctl_backoff(&ms);
++		}
++
 +		for (i = 0; i < best; i++) {
 +			config->bus_full_width = mctl_geometries[i].bus_full_width;
 +			config->ranks = mctl_geometries[i].ranks;
@@ -134,18 +203,21 @@ index d2af2d5..b296f74 100644
 +			if (mctl_core_init(para, config)) {
 +				if (pass == 0)
 +					first = i;
++				if (best == none)
++					extra = MCTL_FAST_PASSES - 1;
 +				best = i;
++				best_pass = pass;
 +				break;
 +			}
 +		}
 +	}
 +
-+	if (best == ARRAY_SIZE(mctl_geometries))
++	if (best == none)
 +		panic("This DRAM setup is currently not supported.\n");
 +
 +	/* tell the user that the DRAM did not train on the first attempt */
 +	if (best != first)
-+		printf(" (training retried)");
++		mctl_report_retry(best_pass + 1, start);
  
 -	debug("testing 32-bit width, rank = 2\n");
 -	config->bus_full_width = 1;
@@ -177,7 +249,7 @@ index d2af2d5..b296f74 100644
  }
  
  static void mctl_write_pattern(void)
-@@ -93,7 +138,7 @@ void mctl_auto_detect_dram_size(const struct dram_para *para,
+@@ -93,7 +202,7 @@ void mctl_auto_detect_dram_size(const struct dram_para *para,
  	/* max. config for columns, but not rows */
  	config->cols = 11;
  	config->rows = 13;
@@ -186,7 +258,7 @@ index d2af2d5..b296f74 100644
  
  	/*
  	 * Store content so it can be restored later. This is important
-@@ -119,7 +164,7 @@ void mctl_auto_detect_dram_size(const struct dram_para *para,
+@@ -119,7 +228,7 @@ void mctl_auto_detect_dram_size(const struct dram_para *para,
  	/* reconfigure to make sure that all active rows are accessible */
  	config->cols = 8;
  	config->rows = 17;
@@ -196,7 +268,7 @@ index d2af2d5..b296f74 100644
  	/* store data again as it might be moved */
  	memcpy(buffer, (u32 *)CFG_SYS_SDRAM_BASE, sizeof(buffer));
 diff --git a/arch/arm/mach-sunxi/dram_sun50i_h616.c b/arch/arm/mach-sunxi/dram_sun50i_h616.c
-index 42a0550..a019dcf 100644
+index 42a0550e..a019dcf6 100644
 --- a/arch/arm/mach-sunxi/dram_sun50i_h616.c
 +++ b/arch/arm/mach-sunxi/dram_sun50i_h616.c
 @@ -1352,7 +1352,7 @@ unsigned long sunxi_dram_init(void)
