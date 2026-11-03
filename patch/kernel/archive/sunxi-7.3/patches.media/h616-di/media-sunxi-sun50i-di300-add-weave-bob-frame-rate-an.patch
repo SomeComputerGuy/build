@@ -1,0 +1,1263 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 3 Nov 2026 01:15:40 +0000
+Subject: [PATCH] media: sunxi: sun50i-di300: add weave, bob, frame-rate and
+ TNR modes
+
+The driver only had motion-adaptive deinterlacing with both fields
+output. Add the other modes of the vendor driver (BSP 5.4
+drivers/char/sunxi-di/drv_div3x, di_client_reset() and
+di_dev_apply_fixed_para()) and the temporal noise reduction (TNR)
+block, so that every DI feature in the H616 datasheet (section 2.5.2)
+can be used:
+
+- V4L2_CID_DEINTERLACING_MODE (driver menu):
+  - Motion Adaptive, Field Rate: the existing mode, two outputs per
+    input frame (vendor "60 Hz" mode);
+  - Motion Adaptive, Frame Rate: one output per input frame, from IN_F1
+    and IN_F2 (vendor "30 Hz" mode), written to DIT output 1;
+  - Bob: spatial interpolation of one field, no motion detection;
+  - Weave: both fields of the frame put back together unchanged;
+  - Noise Reduction Only: TNR on progressive input, output from the
+    TNR write channel (only offered when FUNC_VSN reports TNR).
+  The mode decides the buffer handling, so it is grabbed while
+  streaming. The single-frame modes keep no source history; the
+  frame-rate and TNR modes keep one frame, the field-rate mode two.
+
+- Temporal noise reduction (V4L2_CID_SUNXI_DI300_TNR_MODE: off, fixed,
+  adaptive; TNR_STRENGTH for the fixed strength, vendor default 0x3a;
+  TNR_LEVEL for the adaptive bounds). The vendor's fixed TNR tuning is
+  written at resume. In the deinterlacing modes the filtered newest
+  frame goes to one of three driver buffers and the filtered previous
+  frames replace the original ones as IN_F1/IN_F0 references, as the
+  vendor userspace does (recursive filtering); the deinterlaced output
+  is then the filtered frame. The adaptive strength follows the
+  vendor's di_alg_tnr_strengths_adjustment() from the per-run TNR sums,
+  without its scene-change input. The datasheet allows TNR output only
+  in YV12 or planar YUV422, and the vendor requires planar DIT output
+  with TNR, so TNR is applied only with a planar capture format.
+
+- The capture format may differ from the output format as long as the
+  chroma subsampling is the same (the input, DIT and TNR channels have
+  separate format fields), e.g. NV12 in and YV12 out as the vendor
+  userspace uses. Semi-planar buffers share one UV order bit, so a
+  semi-planar capture format keeps the source format.
+
+- Film mode detection: enable the video-on-film detection and flip its
+  row-statistics buffer on every run, as the vendor does in field-rate
+  mode (the FIELD_HIST statistics come from it). The field-weave
+  control elements gain two flags: bit 2 keeps the video blend in
+  video-on-film areas (vendor video_exist), bit 3 also weaves chroma.
+  Values 0-3 keep their meaning.
+
+- Progressive (V4L2_FIELD_NONE) input is accepted, for the TNR-only
+  mode.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../sunxi/sun50i-di300/sun50i-di300.c         | 774 ++++++++++++++----
+ .../sunxi/sun50i-di300/sun50i-di300.h         |  88 ++
+ 2 files changed, 724 insertions(+), 138 deletions(-)
+
+diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
+index 4dc81dfbf..54a2364fb 100644
+--- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
++++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
+@@ -21,6 +21,7 @@
+ #include <linux/clk.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
++#include <linux/math64.h>
+ #include <linux/minmax.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -191,21 +192,108 @@ static void deinterlace_write_out_addr(struct deinterlace_dev *dev,
+ 	deinterlace_write(dev, hreg, 0);
+ }
+ 
++static bool deinterlace_fmt_is_planar(u32 pixelformat)
++{
++	switch (pixelformat) {
++	case V4L2_PIX_FMT_YUV420:
++	case V4L2_PIX_FMT_YVU420:
++	case V4L2_PIX_FMT_YUV422P:
++		return true;
++	default:
++		return false;
++	}
++}
++
++static bool deinterlace_fmt_is_422(u32 pixelformat)
++{
++	switch (pixelformat) {
++	case V4L2_PIX_FMT_NV16:
++	case V4L2_PIX_FMT_NV61:
++	case V4L2_PIX_FMT_YUV422P:
++		return true;
++	default:
++		return false;
++	}
++}
++
++/* frames of input history a mode keeps after a run */
++static unsigned int deinterlace_mode_history(unsigned int mode)
++{
++	switch (mode) {
++	case DEINTERLACE_MODE_MOTION_FIELD:
++		return 2;
++	case DEINTERLACE_MODE_MOTION_FRAME:
++	case DEINTERLACE_MODE_TNR:
++		return 1;
++	default:
++		return 0;
++	}
++}
++
++static unsigned int deinterlace_mode_outputs(unsigned int mode)
++{
++	return mode == DEINTERLACE_MODE_MOTION_FIELD ? 2 : 1;
++}
++
++static void deinterlace_write_pitches(struct deinterlace_dev *dev,
++				      const struct deinterlace_planes *f0,
++				      const struct deinterlace_planes *f1,
++				      const struct deinterlace_planes *f2,
++				      const struct deinterlace_planes *dit,
++				      const struct deinterlace_planes *tnr)
++{
++	unsigned int i;
++
++	/* input pitches are field pitches: two lines of the frame */
++	for (i = 0; i < 3; i++) {
++		deinterlace_write(dev, DEINTERLACE_IN_F01_PITCH(i),
++				  DEINTERLACE_IN_F01_PITCH_F0(f0->pitch[i] * 2) |
++				  DEINTERLACE_IN_F01_PITCH_F1(f1->pitch[i] * 2));
++		deinterlace_write(dev, DEINTERLACE_IN_F2_PITCH(i),
++				  f2->pitch[i] * 2);
++		deinterlace_write(dev, DEINTERLACE_OUT_DIT_PITCH(i),
++				  dit->pitch[i]);
++		deinterlace_write(dev, DEINTERLACE_OUT_TNR_PITCH(i),
++				  tnr ? tnr->pitch[i] : 0);
++	}
++}
++
++static u32 deinterlace_tnr_strength(struct deinterlace_ctx *ctx)
++{
++	u32 s = ctx->tnr_mode == DEINTERLACE_TNR_ADAPTIVE ?
++		ctx->tnr_gain : ctx->tnr_strength;
++
++	return DEINTERLACE_TNR_STRENGTH_Y(s) | DEINTERLACE_TNR_STRENGTH_U(s) |
++	       DEINTERLACE_TNR_STRENGTH_V(s);
++}
++
+ static void deinterlace_device_run(void *priv)
+ {
+ 	struct deinterlace_ctx *ctx = priv;
+ 	struct deinterlace_dev *dev = ctx->dev;
+ 	struct vb2_v4l2_buffer *src, *dst0, *dst1;
+-	struct deinterlace_planes in_pl, out_pl;
++	struct deinterlace_planes src_pl, dst_pl, tnr_pl;
++	const struct deinterlace_planes *f0_pl, *f1_pl;
+ 	struct v4l2_m2m_buffer *b;
+-	dma_addr_t next, curr, prev, out0, out1;
+-	unsigned int hwfmt = deinterlace_hw_format(ctx->src_fmt.pixelformat);
+-	unsigned int i, reg;
+-	bool motion;
++	dma_addr_t f0, f1, f2, out0, out1;
++	unsigned int src_hw = deinterlace_hw_format(ctx->src_fmt.pixelformat);
++	unsigned int dst_hw = deinterlace_hw_format(ctx->dst_fmt.pixelformat);
++	unsigned int tnr_hw = deinterlace_hw_format(ctx->tnr_fmt.pixelformat);
++	unsigned int f0_hw, f1_hw, i, reg, dma, func;
++	unsigned int mode = ctx->mode;
++	bool motion, tnr_ref;
+ 
+ 	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
+ 
+-	ctx->fmd_active = dev->has_fmd && ctx->fmd_enabled;
++	ctx->fmd_active = dev->has_fmd && ctx->fmd_enabled &&
++			  mode == DEINTERLACE_MODE_MOTION_FIELD;
++	ctx->tnr_active = dev->has_tnr && ctx->tnr_mode != DEINTERLACE_TNR_OFF &&
++			  (mode == DEINTERLACE_MODE_MOTION_FIELD ||
++			   mode == DEINTERLACE_MODE_MOTION_FRAME ||
++			   mode == DEINTERLACE_MODE_TNR) &&
++			  deinterlace_fmt_is_planar(ctx->dst_fmt.pixelformat);
++	if (mode == DEINTERLACE_MODE_TNR)
++		ctx->tnr_active = true; /* checked in start_streaming() */
+ 
+ 	/*
+ 	 * Apply this job's field-weave decision, if userspace attached a
+@@ -222,19 +310,16 @@ static void deinterlace_device_run(void *priv)
+ 	}
+ 
+ 	/*
+-	 * Pick the two buffers actually at the front of the ready
+-	 * queue. v4l2_m2m_last_dst_buf() returns the tail of the whole
+-	 * ready list, which is only the "second" buffer when exactly
+-	 * two are queued; with more buffers queued (the normal case for
+-	 * any real client) it names a buffer this job never touches,
+-	 * while the IRQ handler's two dst_buf_remove() calls always pop
+-	 * from the front and would complete a stale, never-written one.
++	 * Pick the buffers actually at the front of the ready queue; the
++	 * IRQ handler completes these same buffers by pointer.
+ 	 */
+ 	dst0 = NULL;
+ 	dst1 = NULL;
+ 	v4l2_m2m_for_each_dst_buf(ctx->fh.m2m_ctx, b) {
+ 		if (!dst0) {
+ 			dst0 = &b->vb;
++			if (deinterlace_mode_outputs(mode) < 2)
++				break;
+ 		} else if (!dst1) {
+ 			dst1 = &b->vb;
+ 			break;
+@@ -244,95 +329,190 @@ static void deinterlace_device_run(void *priv)
+ 	ctx->dst1 = dst1;
+ 
+ 	v4l2_m2m_buf_copy_metadata(src, dst0);
+-	v4l2_m2m_buf_copy_metadata(src, dst1);
+-	/*
+-	 * The second output is the second field of the same frame: put it
+-	 * half a frame interval after the first one, so field-rate output
+-	 * keeps monotonic, evenly spaced timestamps.
+-	 */
+-	if (ctx->prev[0] && src->vb2_buf.timestamp > ctx->prev[0]->vb2_buf.timestamp)
+-		dst1->vb2_buf.timestamp +=
+-			(src->vb2_buf.timestamp -
+-			 ctx->prev[0]->vb2_buf.timestamp) / 2;
++	if (dst1) {
++		v4l2_m2m_buf_copy_metadata(src, dst1);
++		/*
++		 * The second output is the second field of the same frame:
++		 * put it half a frame interval after the first one, so
++		 * field-rate output keeps monotonic, evenly spaced
++		 * timestamps.
++		 */
++		if (ctx->prev[0] &&
++		    src->vb2_buf.timestamp > ctx->prev[0]->vb2_buf.timestamp)
++			dst1->vb2_buf.timestamp +=
++				(src->vb2_buf.timestamp -
++				 ctx->prev[0]->vb2_buf.timestamp) / 2;
++	}
+ 
+-	next = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
+-	curr = ctx->prev[0] ?
+-		vb2_dma_contig_plane_dma_addr(&ctx->prev[0]->vb2_buf, 0) : next;
+-	prev = ctx->prev[1] ?
+-		vb2_dma_contig_plane_dma_addr(&ctx->prev[1]->vb2_buf, 0) : curr;
++	deinterlace_get_planes(&ctx->src_fmt, &src_pl);
++	deinterlace_get_planes(&ctx->dst_fmt, &dst_pl);
++	deinterlace_get_planes(&ctx->tnr_fmt, &tnr_pl);
+ 
+ 	/*
+-	 * A single real temporal neighbour (prev[0]) is enough to turn
+-	 * motion mode on: the missing prev[1] slot then just duplicates
+-	 * curr, which reads as "no motion" between those two and leaves
+-	 * the genuine next-vs-curr comparison to drive the spatial/
+-	 * temporal blend. Requiring both slots real only delays real
+-	 * motion-adaptive output by an extra frame at stream start.
++	 * Input slots are in temporal order, oldest first: the vendor
++	 * userspace (libcedarc omx_deinterlace.cpp, diSetPara()) puts the
++	 * frame before last in IN_F0, the previous frame in IN_F1 and the
++	 * newest frame in IN_F2. The DIT deinterlaces IN_F1 (fields 2 and
++	 * 3) and the TNR filters IN_F2 against IN_F1. The single-frame
++	 * modes (bob, weave) read IN_F1 only.
++	 *
++	 * With TNR on, the filtered copies of the previous frames, kept in
++	 * driver buffers, replace the original frames as references, as
++	 * the vendor does (recursive filtering): the frame the DIT outputs
++	 * is then the filtered one.
+ 	 */
+-	motion = ctx->prev[0] != NULL;
++	f2 = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
++	f1_pl = &src_pl;
++	f0_pl = &src_pl;
++	f1_hw = src_hw;
++	f0_hw = src_hw;
++
++	switch (mode) {
++	case DEINTERLACE_MODE_BOB:
++	case DEINTERLACE_MODE_WEAVE:
++		f1 = f2;
++		f0 = f2;
++		motion = false;
++		break;
++	default:
++		f1 = ctx->prev[0] ?
++			vb2_dma_contig_plane_dma_addr(&ctx->prev[0]->vb2_buf, 0) :
++			f2;
++		f0 = ctx->prev[1] ?
++			vb2_dma_contig_plane_dma_addr(&ctx->prev[1]->vb2_buf, 0) :
++			f1;
++		/*
++		 * A single real temporal neighbour is enough for motion
++		 * detection; the first run has none and falls back to
++		 * spatial interpolation.
++		 */
++		motion = ctx->prev[0] != NULL;
++		break;
++	}
++
++	tnr_ref = false;
++	if (ctx->tnr_active && ctx->tnr_hist[0] >= 0) {
++		f1 = ctx->tnr_dma[ctx->tnr_hist[0]];
++		f1_pl = &tnr_pl;
++		f1_hw = tnr_hw;
++		f0 = f1;
++		f0_pl = f1_pl;
++		f0_hw = f1_hw;
++		tnr_ref = true;
++	}
++	if (tnr_ref && ctx->tnr_hist[1] >= 0) {
++		f0 = ctx->tnr_dma[ctx->tnr_hist[1]];
++	} else if (tnr_ref && ctx->prev[1]) {
++		f0 = vb2_dma_contig_plane_dma_addr(&ctx->prev[1]->vb2_buf, 0);
++		f0_pl = &src_pl;
++		f0_hw = src_hw;
++	}
+ 
+ 	deinterlace_write(dev, DEINTERLACE_SIZE,
+ 			  DEINTERLACE_SIZE_WIDTH(ctx->src_fmt.width) |
+ 			  DEINTERLACE_SIZE_HEIGHT(ctx->src_fmt.height));
+ 
+-	reg = DEINTERLACE_FMT_IN0(hwfmt) | DEINTERLACE_FMT_IN1(hwfmt) |
+-	      DEINTERLACE_FMT_IN2(hwfmt) | DEINTERLACE_FMT_DIT(hwfmt);
+-	if (deinterlace_fmt_is_uv_combined(ctx->src_fmt.pixelformat) &&
+-	    deinterlace_fmt_is_uv_first(ctx->src_fmt.pixelformat))
++	reg = DEINTERLACE_FMT_IN0(f0_hw) | DEINTERLACE_FMT_IN1(f1_hw) |
++	      DEINTERLACE_FMT_IN2(src_hw) | DEINTERLACE_FMT_DIT(dst_hw) |
++	      DEINTERLACE_FMT_TNR(tnr_hw);
++	/* one UV order for all semi-planar buffers (try_fmt keeps them equal) */
++	if ((deinterlace_fmt_is_uv_combined(ctx->src_fmt.pixelformat) &&
++	     deinterlace_fmt_is_uv_first(ctx->src_fmt.pixelformat)) ||
++	    (deinterlace_fmt_is_uv_combined(ctx->dst_fmt.pixelformat) &&
++	     deinterlace_fmt_is_uv_first(ctx->dst_fmt.pixelformat)))
+ 		reg |= DEINTERLACE_FMT_UVSEQ;
+ 	deinterlace_write(dev, DEINTERLACE_FMT, reg);
+ 
+-	if (ctx->first_field)
+-		deinterlace_write(dev, DEINTERLACE_FIELD_ORDER,
+-				  DEINTERLACE_FIELD_ORDER_BFF);
+-	else
+-		deinterlace_write(dev, DEINTERLACE_FIELD_ORDER, 0);
+-
+-	deinterlace_get_planes(&ctx->src_fmt, &in_pl);
+-	deinterlace_get_planes(&ctx->dst_fmt, &out_pl);
+-
+-	/* input pitches are field pitches: two lines of the frame */
+-	for (i = 0; i < 3; i++) {
+-		unsigned int in_pitch = in_pl.pitch[i] * 2;
+-
+-		deinterlace_write(dev, DEINTERLACE_IN_F01_PITCH(i),
+-				  DEINTERLACE_IN_F01_PITCH_F0(in_pitch) |
+-				  DEINTERLACE_IN_F01_PITCH_F1(in_pitch));
+-		deinterlace_write(dev, DEINTERLACE_IN_F2_PITCH(i), in_pitch);
+-		deinterlace_write(dev, DEINTERLACE_OUT_DIT_PITCH(i),
+-				  out_pl.pitch[i]);
+-	}
++	deinterlace_write(dev, DEINTERLACE_FIELD_ORDER,
++			  ctx->first_field ? DEINTERLACE_FIELD_ORDER_BFF : 0);
+ 
+-	/*
+-	 * Input slots are in temporal order, oldest first: the vendor
+-	 * userspace (libcedarc omx_deinterlace.cpp, diSetPara()) puts the
+-	 * frame before last in in_fb0, the previous frame in in_fb1 and the
+-	 * newest frame in in_fb2, and the hardware deinterlaces the middle
+-	 * slot (fields 2 and 3).
+-	 */
++	deinterlace_write_pitches(dev, f0_pl, f1_pl, &src_pl, &dst_pl,
++				  ctx->tnr_active ? (mode == DEINTERLACE_MODE_TNR ?
++						     &dst_pl : &tnr_pl) : NULL);
+ 
+ 	deinterlace_write_in_addr(dev, DEINTERLACE_IN_F0_TOP_ADDR(0),
+ 				  DEINTERLACE_IN_F0_TOP_HADDR,
+ 				  DEINTERLACE_IN_F0_BOT_ADDR(0),
+-				  DEINTERLACE_IN_F0_BOT_HADDR,
+-				  prev, &in_pl);
++				  DEINTERLACE_IN_F0_BOT_HADDR, f0, f0_pl);
+ 	deinterlace_write_in_addr(dev, DEINTERLACE_IN_F1_TOP_ADDR(0),
+ 				  DEINTERLACE_IN_F1_TOP_HADDR,
+ 				  DEINTERLACE_IN_F1_BOT_ADDR(0),
+-				  DEINTERLACE_IN_F1_BOT_HADDR,
+-				  curr, &in_pl);
++				  DEINTERLACE_IN_F1_BOT_HADDR, f1, f1_pl);
+ 	deinterlace_write_in_addr(dev, DEINTERLACE_IN_F2_TOP_ADDR(0),
+ 				  DEINTERLACE_IN_F2_TOP_HADDR,
+ 				  DEINTERLACE_IN_F2_BOT_ADDR(0),
+-				  DEINTERLACE_IN_F2_BOT_HADDR,
+-				  next, &in_pl);
++				  DEINTERLACE_IN_F2_BOT_HADDR, f2, &src_pl);
+ 
+ 	out0 = vb2_dma_contig_plane_dma_addr(&dst0->vb2_buf, 0);
+-	out1 = vb2_dma_contig_plane_dma_addr(&dst1->vb2_buf, 0);
+-	deinterlace_write_out_addr(dev, DEINTERLACE_OUT_DIT0_ADDR(0),
+-				   DEINTERLACE_OUT_DIT0_HADDR, out0, &out_pl);
+-	deinterlace_write_out_addr(dev, DEINTERLACE_OUT_DIT1_ADDR(0),
+-				   DEINTERLACE_OUT_DIT1_HADDR, out1, &out_pl);
++	out1 = dst1 ? vb2_dma_contig_plane_dma_addr(&dst1->vb2_buf, 0) : 0;
++
++	/*
++	 * Output routing, from the vendor driver (di_client_reset()):
++	 * field-rate motion mode writes both DIT outputs; the single-frame
++	 * modes write DIT output 1 only; TNR-only mode writes only the TNR
++	 * output. Other modes with TNR write the filtered newest frame to
++	 * a driver buffer, for use as reference by the next runs.
++	 */
++	dma = DEINTERLACE_DMA_CTL_MCLK_GATE;
++	func = 0;
++	switch (mode) {
++	case DEINTERLACE_MODE_MOTION_FIELD:
++		dma |= DEINTERLACE_DMA_CTL_DI | DEINTERLACE_DMA_CTL_P |
++		       DEINTERLACE_DMA_CTL_C | DEINTERLACE_DMA_CTL_W0 |
++		       DEINTERLACE_DMA_CTL_W1;
++		func |= DEINTERLACE_FUNC_EN_DIT;
++		deinterlace_write_out_addr(dev, DEINTERLACE_OUT_DIT0_ADDR(0),
++					   DEINTERLACE_OUT_DIT0_HADDR, out0,
++					   &dst_pl);
++		deinterlace_write_out_addr(dev, DEINTERLACE_OUT_DIT1_ADDR(0),
++					   DEINTERLACE_OUT_DIT1_HADDR, out1,
++					   &dst_pl);
++		break;
++	case DEINTERLACE_MODE_MOTION_FRAME:
++		dma |= DEINTERLACE_DMA_CTL_P | DEINTERLACE_DMA_CTL_C |
++		       DEINTERLACE_DMA_CTL_W1;
++		func |= DEINTERLACE_FUNC_EN_DIT;
++		deinterlace_write_out_addr(dev, DEINTERLACE_OUT_DIT1_ADDR(0),
++					   DEINTERLACE_OUT_DIT1_HADDR, out0,
++					   &dst_pl);
++		break;
++	case DEINTERLACE_MODE_BOB:
++	case DEINTERLACE_MODE_WEAVE:
++		dma |= DEINTERLACE_DMA_CTL_P | DEINTERLACE_DMA_CTL_W1;
++		func |= DEINTERLACE_FUNC_EN_DIT;
++		deinterlace_write_out_addr(dev, DEINTERLACE_OUT_DIT1_ADDR(0),
++					   DEINTERLACE_OUT_DIT1_HADDR, out0,
++					   &dst_pl);
++		break;
++	case DEINTERLACE_MODE_TNR:
++		dma |= DEINTERLACE_DMA_CTL_P | DEINTERLACE_DMA_CTL_C;
++		deinterlace_write_out_addr(dev, DEINTERLACE_OUT_TNR_ADDR(0),
++					   DEINTERLACE_OUT_TNR_HADDR, out0,
++					   &dst_pl);
++		break;
++	}
++
++	if (ctx->tnr_active) {
++		dma |= DEINTERLACE_DMA_CTL_TNR;
++		func |= DEINTERLACE_FUNC_EN_TNR;
++		if (mode != DEINTERLACE_MODE_TNR) {
++			ctx->tnr_cur = 0;
++			while (ctx->tnr_cur == ctx->tnr_hist[0] ||
++			       ctx->tnr_cur == ctx->tnr_hist[1])
++				ctx->tnr_cur++;
++			deinterlace_write_out_addr(dev,
++						   DEINTERLACE_OUT_TNR_ADDR(0),
++						   DEINTERLACE_OUT_TNR_HADDR,
++						   ctx->tnr_dma[ctx->tnr_cur],
++						   &tnr_pl);
++		}
++	}
++
++	/* TNR needs the motion flags too (vendor: md_en in TNR-only mode) */
++	if (motion || (ctx->tnr_active && ctx->prev[0])) {
++		dma |= DEINTERLACE_DMA_CTL_FR | DEINTERLACE_DMA_CTL_FW;
++		func |= DEINTERLACE_FUNC_EN_MD;
++	}
+ 
+ 	/*
+ 	 * Motion flags: two bits per pixel, read from the previous run and
+@@ -344,20 +524,23 @@ static void deinterlace_device_run(void *priv)
+ 	deinterlace_write(dev, DEINTERLACE_OUT_FLAG_ADDR,
+ 			  ctx->flag_dma[!ctx->flag_idx]);
+ 	deinterlace_write(dev, DEINTERLACE_FLAG_HADDR, 0);
+-	ctx->flag_idx = !ctx->flag_idx;
++	if (func & DEINTERLACE_FUNC_EN_MD)
++		ctx->flag_idx = !ctx->flag_idx;
+ 
+ 	/*
+-	 * Restrict the deinterlace and motion-detect blocks to the full
+-	 * frame. The crop registers power up as an empty (zero) window;
+-	 * left at zero the engine asserts busy but processes nothing and
+-	 * never signals completion.
++	 * Restrict the deinterlace, motion-detect and TNR blocks to the
++	 * full frame. The crop registers power up as an empty (zero)
++	 * window; left at zero the engine asserts busy but processes
++	 * nothing and never signals completion.
+ 	 */
+ 	reg = (ctx->src_fmt.width - 1) << 16;
+ 	deinterlace_write(dev, DEINTERLACE_DIT_CROP_H, reg);
+ 	deinterlace_write(dev, DEINTERLACE_MD_CROP_H, reg);
++	deinterlace_write(dev, DEINTERLACE_TNR_CROP_H, reg);
+ 	reg = (ctx->src_fmt.height - 1) << 16;
+ 	deinterlace_write(dev, DEINTERLACE_DIT_CROP_V, reg);
+ 	deinterlace_write(dev, DEINTERLACE_MD_CROP_V, reg);
++	deinterlace_write(dev, DEINTERLACE_TNR_CROP_V, reg);
+ 
+ 	if (ctx->fmd_active) {
+ 		reg = (ctx->src_fmt.width - 1) << 16;
+@@ -368,56 +551,97 @@ static void deinterlace_device_run(void *priv)
+ 		/*
+ 		 * Row thresholds scale with frame area relative to the
+ 		 * vendor's 720x480 reference, verbatim from
+-		 * di_dev_apply_fixed_para(). Fixed to the 8x8 block size
+-		 * selected by leaving FMD_GLB at its DEINTERLACE_FMD_GLB
+-		 * default of 0.
++		 * di_dev_apply_fixed_para(), for the 8x8 block size.
+ 		 */
+ 		reg = 3 * ctx->src_fmt.width * ctx->src_fmt.height / (720 * 480);
+ 		reg |= (2 * ctx->src_fmt.width * ctx->src_fmt.height /
+ 			(720 * 480)) << 8;
+ 		reg |= DEINTERLACE_FMD_ROW_TH_EXIT_VIDEO(60);
+ 		deinterlace_write(dev, DEINTERLACE_FMD_ROW_TH, reg);
++
++		/*
++		 * Video-on-film detection: the vendor enables it in
++		 * field-rate mode and flips between its two row-statistics
++		 * buffers on every run.
++		 */
++		deinterlace_write(dev, DEINTERLACE_FMD_GLB,
++				  DEINTERLACE_FMD_GLB_VOF_EN |
++				  DEINTERLACE_FMD_GLB_VOF_BUF_SEL(ctx->vof_sel));
++		ctx->vof_sel ^= 1;
++		func |= DEINTERLACE_FUNC_EN_FMD;
++	} else {
++		deinterlace_write(dev, DEINTERLACE_FMD_GLB, 0);
++	}
++
++	if (ctx->tnr_active) {
++		/* the sums are accumulated over a run: clear them first */
++		for (reg = DEINTERLACE_TNR_SUM_WEIGHT_Y;
++		     reg <= DEINTERLACE_TNR_SUM_GAIN_Y_CNT; reg += 4)
++			deinterlace_write(dev, reg, 0);
++		deinterlace_write(dev, DEINTERLACE_TNR_STRENGTH,
++				  deinterlace_tnr_strength(ctx));
++		/* no scene change or bad-frame information from software */
++		deinterlace_write(dev, DEINTERLACE_TNR_MD_RESULT, 0);
+ 	}
+ 
+-	reg = DEINTERLACE_FUNC_EN_DIT;
+-	if (motion)
+-		reg |= DEINTERLACE_FUNC_EN_MD;
+-	if (ctx->fmd_active)
+-		reg |= DEINTERLACE_FUNC_EN_FMD;
+-	deinterlace_write(dev, DEINTERLACE_FUNC_EN, reg);
++	deinterlace_write(dev, DEINTERLACE_FUNC_EN, func);
+ 
++	/* DIT method, from di_dev_apply_fixed_para() */
+ 	reg = DEINTERLACE_DIT_SETTING_DIAG_INTP_EN;
+-	if (motion)
++	switch (mode) {
++	case DEINTERLACE_MODE_MOTION_FIELD:
++	case DEINTERLACE_MODE_MOTION_FRAME:
++		if (motion) {
++			reg |= DEINTERLACE_DIT_SETTING_MODE_LUMA |
++			       DEINTERLACE_DIT_SETTING_MOTION_BLEND_LUMA |
++			       DEINTERLACE_DIT_SETTING_MODE_CHROMA;
++			if (mode == DEINTERLACE_MODE_MOTION_FIELD)
++				reg |= DEINTERLACE_DIT_SETTING_MOTION_BLEND_CHROMA;
++			break;
++		}
++		fallthrough;
++	case DEINTERLACE_MODE_BOB:
++		/* motion adaptive without motion: spatial interpolation */
+ 		reg |= DEINTERLACE_DIT_SETTING_MODE_LUMA |
+-		       DEINTERLACE_DIT_SETTING_MOTION_BLEND_LUMA |
+-		       DEINTERLACE_DIT_SETTING_MODE_CHROMA |
+-		       DEINTERLACE_DIT_SETTING_MOTION_BLEND_CHROMA;
++		       DEINTERLACE_DIT_SETTING_MODE_CHROMA;
++		break;
++	default:
++		/* weave: both fields put back together unchanged */
++		break;
++	}
++	if (deinterlace_mode_outputs(mode) < 2)
++		reg |= DEINTERLACE_DIT_SETTING_OUTPUT_1FRAME;
+ 	deinterlace_write(dev, DEINTERLACE_DIT_SETTING, reg);
+ 
+ 	reg = DEINTERLACE_DIT_INTER_PARA_DEFAULT;
+ 	if (ctx->fmd_active && ctx->weave_ctrl) {
+-		unsigned int phase0, phase1;
++		unsigned int w[2];
+ 
+ 		v4l2_ctrl_lock(ctx->weave_ctrl);
+-		phase0 = ctx->weave_ctrl->p_cur.p_u32[0];
+-		phase1 = ctx->weave_ctrl->p_cur.p_u32[1];
++		w[0] = ctx->weave_ctrl->p_cur.p_u32[0];
++		w[1] = ctx->weave_ctrl->p_cur.p_u32[1];
+ 		v4l2_ctrl_unlock(ctx->weave_ctrl);
+ 
+-		if (phase0 < 3)
+-			reg |= DEINTERLACE_DIT_INTER_PARA_FIELD_WEAVE_F1 |
+-			       DEINTERLACE_DIT_INTER_PARA_FIELD_WEAVE_PHASE_F1(phase0);
+-		if (phase1 < 3)
+-			reg |= DEINTERLACE_DIT_INTER_PARA_FIELD_WEAVE_F2 |
+-			       DEINTERLACE_DIT_INTER_PARA_FIELD_WEAVE_PHASE_F2(phase1);
++		for (i = 0; i < 2; i++) {
++			unsigned int phase = w[i] & DEINTERLACE_FMD_WEAVE_PHASE_MASK;
++			unsigned int shift = i * 16;
++
++			if (phase == DEINTERLACE_FMD_WEAVE_DISABLED)
++				continue;
++			reg |= (DEINTERLACE_DIT_INTER_PARA_FIELD_WEAVE_F1 |
++				DEINTERLACE_DIT_INTER_PARA_FIELD_WEAVE_PHASE_F1(phase))
++			       << shift;
++			if (w[i] & DEINTERLACE_FMD_WEAVE_VIDEO)
++				reg |= DEINTERLACE_DIT_INTER_PARA_VIDEO_EXIST_F1
++				       << shift;
++			if (w[i] & DEINTERLACE_FMD_WEAVE_CHROMA)
++				reg |= DEINTERLACE_DIT_INTER_PARA_FIELD_WEAVE_CHROMA_F1
++				       << shift;
++		}
+ 	}
+ 	deinterlace_write(dev, DEINTERLACE_DIT_INTER_PARA, reg);
+ 
+-	reg = DEINTERLACE_DMA_CTL_C | DEINTERLACE_DMA_CTL_P |
+-	      DEINTERLACE_DMA_CTL_DI | DEINTERLACE_DMA_CTL_W0 |
+-	      DEINTERLACE_DMA_CTL_W1 | DEINTERLACE_DMA_CTL_MCLK_GATE;
+-	if (motion)
+-		reg |= DEINTERLACE_DMA_CTL_FR | DEINTERLACE_DMA_CTL_FW;
+-	deinterlace_write(dev, DEINTERLACE_DMA_CTL, reg);
++	deinterlace_write(dev, DEINTERLACE_DMA_CTL, dma);
+ 
+ 	deinterlace_set_bits(dev, DEINTERLACE_INT_CTL,
+ 			     DEINTERLACE_INT_CTL_FINISH_EN);
+@@ -429,7 +653,8 @@ static int deinterlace_job_ready(void *priv)
+ 	struct deinterlace_ctx *ctx = priv;
+ 
+ 	return v4l2_m2m_num_src_bufs_ready(ctx->fh.m2m_ctx) >= 1 &&
+-	       v4l2_m2m_num_dst_bufs_ready(ctx->fh.m2m_ctx) >= 2;
++	       v4l2_m2m_num_dst_bufs_ready(ctx->fh.m2m_ctx) >=
++	       deinterlace_mode_outputs(ctx->mode);
+ }
+ 
+ static void deinterlace_job_abort(void *priv)
+@@ -439,13 +664,44 @@ static void deinterlace_job_abort(void *priv)
+ 	ctx->aborting = 1;
+ }
+ 
++/*
++ * Adaptive TNR strength, from the vendor's
++ * di_alg_tnr_strengths_adjustment(): the measured noise against the
++ * expected noise at the current gain, weighted by the still area, low
++ * pass filtered (1/32) and clamped to the level's bounds.
++ */
++static void deinterlace_tnr_adapt(struct deinterlace_ctx *ctx)
++{
++	struct deinterlace_dev *dev = ctx->dev;
++	u64 gain_y = deinterlace_read(dev, DEINTERLACE_TNR_SUM_GAIN_Y);
++	u64 gain_cnt = deinterlace_read(dev, DEINTERLACE_TNR_SUM_GAIN_Y_CNT);
++	u64 still = deinterlace_read(dev, DEINTERLACE_TNR_SUM_STILL_OUT);
++	u64 noise_num, noise_den, still_num, still_den, weight;
++	unsigned int gain;
++
++	/* vendor constants: k_max_noise 2/1, k_max_still 5/2 */
++	noise_num = gain_y * 1 * 63;
++	noise_den = gain_cnt * ctx->tnr_gain * 2 * 64;
++	still_num = still * 2;
++	still_den = (u64)ctx->src_fmt.width * ctx->src_fmt.height * 5;
++
++	if (!noise_den || !still_den)
++		weight = 0;
++	else
++		weight = mul_u64_u64_div_u64(noise_num, still_num,
++					     noise_den * still_den);
++
++	gain = (min_t(u64, weight, U32_MAX / 2) + 31 * ctx->tnr_gain) / 32;
++	ctx->tnr_gain = clamp(gain, ctx->tnr_gain_min, ctx->tnr_gain_max);
++}
++
+ static irqreturn_t deinterlace_irq(int irq, void *data)
+ {
+ 	struct deinterlace_dev *dev = data;
+-	struct vb2_v4l2_buffer *src, *dst0, *dst1;
++	struct vb2_v4l2_buffer *src;
+ 	struct deinterlace_ctx *ctx;
+ 	enum vb2_buffer_state state;
+-	unsigned int val;
++	unsigned int val, keep;
+ 
+ 	ctx = v4l2_m2m_get_curr_priv(dev->m2m_dev);
+ 	if (!ctx) {
+@@ -485,18 +741,39 @@ static irqreturn_t deinterlace_irq(int irq, void *data)
+ 		dev->fmd_stats[9] = deinterlace_read(dev, DEINTERLACE_FMD_FIELD_HIST1);
+ 	}
+ 
+-	dst0 = ctx->dst0;
+-	dst1 = ctx->dst1;
+-	v4l2_m2m_dst_buf_remove_by_buf(ctx->fh.m2m_ctx, dst0);
+-	v4l2_m2m_buf_done(dst0, state);
+-	v4l2_m2m_dst_buf_remove_by_buf(ctx->fh.m2m_ctx, dst1);
+-	v4l2_m2m_buf_done(dst1, state);
++	if (ctx->tnr_active) {
++		if (ctx->tnr_mode == DEINTERLACE_TNR_ADAPTIVE)
++			deinterlace_tnr_adapt(ctx);
++		if (ctx->mode != DEINTERLACE_MODE_TNR) {
++			ctx->tnr_hist[1] = ctx->tnr_hist[0];
++			ctx->tnr_hist[0] = ctx->tnr_cur;
++		}
++	}
++
++	v4l2_m2m_dst_buf_remove_by_buf(ctx->fh.m2m_ctx, ctx->dst0);
++	v4l2_m2m_buf_done(ctx->dst0, state);
++	if (ctx->dst1) {
++		v4l2_m2m_dst_buf_remove_by_buf(ctx->fh.m2m_ctx, ctx->dst1);
++		v4l2_m2m_buf_done(ctx->dst1, state);
++	}
+ 
++	/* keep as many source frames as the mode reads back */
+ 	src = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
++	keep = deinterlace_mode_history(ctx->mode);
+ 	if (ctx->prev[1])
+ 		v4l2_m2m_buf_done(ctx->prev[1], state);
+-	ctx->prev[1] = ctx->prev[0];
+-	ctx->prev[0] = src;
++	ctx->prev[1] = NULL;
++	if (keep < 2) {
++		if (ctx->prev[0])
++			v4l2_m2m_buf_done(ctx->prev[0], state);
++		ctx->prev[0] = NULL;
++	}
++	if (keep == 2)
++		ctx->prev[1] = ctx->prev[0];
++	if (keep)
++		ctx->prev[0] = src;
++	else
++		v4l2_m2m_buf_done(src, state);
+ 
+ 	v4l2_m2m_job_finish(ctx->dev->m2m_dev, ctx->fh.m2m_ctx);
+ 
+@@ -508,6 +785,7 @@ static void deinterlace_init(struct deinterlace_dev *dev)
+ 	u32 vsn = deinterlace_read(dev, DEINTERLACE_FUNC_VSN);
+ 
+ 	dev->has_fmd = DEINTERLACE_FUNC_VSN_FMD_EXIST(vsn) != 0;
++	dev->has_tnr = DEINTERLACE_FUNC_VSN_TNR_EXIST(vsn) != 0;
+ 
+ 	deinterlace_write(dev, DEINTERLACE_MD_PARA, DEINTERLACE_MD_PARA_DEFAULT);
+ 
+@@ -542,6 +820,28 @@ static void deinterlace_init(struct deinterlace_dev *dev)
+ 				  DEINTERLACE_FMD_BLK_TH_DEFAULT);
+ 		deinterlace_write(dev, DEINTERLACE_FMD_GLB, 0);
+ 	}
++
++	if (dev->has_tnr) {
++		/* fixed TNR tuning, verbatim from di_dev_apply_fixed_para() */
++		deinterlace_write(dev, DEINTERLACE_TNR_STRENGTH,
++				  DEINTERLACE_TNR_STRENGTH_DEFAULT);
++		deinterlace_write(dev, DEINTERLACE_TNR_DARK_TH, 0x00010101);
++		deinterlace_write(dev, DEINTERLACE_TNR_DARK_PROTECT, 0x00030303);
++		deinterlace_write(dev, DEINTERLACE_TNR_DARK_PARA_Y, 0x01000100);
++		deinterlace_write(dev, DEINTERLACE_TNR_DARK_PARA_U, 0x01000100);
++		deinterlace_write(dev, DEINTERLACE_TNR_DARK_PARA_V, 0x01000100);
++		deinterlace_write(dev, DEINTERLACE_TNR_FTH_DETECT, 0x00640101);
++		deinterlace_write(dev, DEINTERLACE_TNR_DT_FILTER, 0x0040000f);
++		deinterlace_write(dev, DEINTERLACE_TNR_WEIGHT_LBOUND, 0x3f201610);
++		deinterlace_write(dev, DEINTERLACE_TNR_ABN_DETECT, 0x00780101);
++		deinterlace_write(dev, DEINTERLACE_TNR_TH_SUM, 0);
++		deinterlace_write(dev, DEINTERLACE_TNR_TH_DARK_DITHER, 0x00000202);
++		deinterlace_write(dev, DEINTERLACE_TNR_RANDOM_CFG, 0x02031c01);
++		deinterlace_write(dev, DEINTERLACE_TNR_RANDOM_GEN, 0);
++		deinterlace_write(dev, DEINTERLACE_TNR_MD_RESULT, 0);
++		deinterlace_write(dev, DEINTERLACE_TNR_DEMO_H, 0);
++		deinterlace_write(dev, DEINTERLACE_TNR_DEMO_V, 0);
++	}
+ }
+ 
+ static inline struct deinterlace_ctx *deinterlace_file2ctx(struct file *file)
+@@ -671,7 +971,19 @@ static int deinterlace_try_fmt_vid_cap(struct file *file, void *priv,
+ 	if (!deinterlace_check_format(ctx->src_fmt.pixelformat))
+ 		return -EINVAL;
+ 
+-	f->fmt.pix.pixelformat = ctx->src_fmt.pixelformat;
++	/*
++	 * Input and output have separate format fields, so the output may
++	 * use another layout with the same chroma subsampling (e.g. NV12
++	 * in, YV12 out, as the vendor userspace does for TNR).
++	 */
++	if (!deinterlace_check_format(f->fmt.pix.pixelformat) ||
++	    deinterlace_fmt_is_422(f->fmt.pix.pixelformat) !=
++	    deinterlace_fmt_is_422(ctx->src_fmt.pixelformat))
++		f->fmt.pix.pixelformat = ctx->src_fmt.pixelformat;
++	/* one UV order bit covers every semi-planar buffer */
++	if (deinterlace_fmt_is_uv_combined(f->fmt.pix.pixelformat) &&
++	    deinterlace_fmt_is_uv_combined(ctx->src_fmt.pixelformat))
++		f->fmt.pix.pixelformat = ctx->src_fmt.pixelformat;
+ 	f->fmt.pix.field = V4L2_FIELD_NONE;
+ 	f->fmt.pix.width = ctx->src_fmt.width;
+ 	f->fmt.pix.height = ctx->src_fmt.height;
+@@ -687,9 +999,11 @@ static int deinterlace_try_fmt_vid_out(struct file *file, void *priv,
+ 	if (!deinterlace_check_format(f->fmt.pix.pixelformat))
+ 		f->fmt.pix.pixelformat = deinterlace_formats[0];
+ 
++	/* progressive input is for the TNR-only mode */
+ 	if (f->fmt.pix.field != V4L2_FIELD_INTERLACED_TB &&
+ 	    f->fmt.pix.field != V4L2_FIELD_INTERLACED_BT &&
+-	    f->fmt.pix.field != V4L2_FIELD_INTERLACED)
++	    f->fmt.pix.field != V4L2_FIELD_INTERLACED &&
++	    f->fmt.pix.field != V4L2_FIELD_NONE)
+ 		f->fmt.pix.field = V4L2_FIELD_INTERLACED;
+ 
+ 	deinterlace_prepare_format(&f->fmt.pix);
+@@ -873,6 +1187,57 @@ static void deinterlace_queue_cleanup(struct vb2_queue *vq, u32 state)
+ 	}
+ }
+ 
++static void deinterlace_tnr_free(struct deinterlace_ctx *ctx)
++{
++	unsigned int i;
++
++	for (i = 0; i < DEINTERLACE_TNR_BUFS; i++) {
++		if (ctx->tnr_buf[i])
++			dma_free_coherent(ctx->dev->dev, ctx->tnr_fmt.sizeimage,
++					  ctx->tnr_buf[i], ctx->tnr_dma[i]);
++		ctx->tnr_buf[i] = NULL;
++	}
++}
++
++/*
++ * The TNR output is planar (datasheet: YV12 or planar YUV422) and, in
++ * the deinterlacing modes, goes to driver buffers that serve as the
++ * filtered references of the next runs: the newest frame written, the
++ * two previous ones read.
++ */
++static int deinterlace_tnr_alloc(struct deinterlace_ctx *ctx)
++{
++	unsigned int i;
++
++	ctx->tnr_fmt = ctx->src_fmt;
++	ctx->tnr_fmt.pixelformat =
++		deinterlace_fmt_is_422(ctx->src_fmt.pixelformat) ?
++		V4L2_PIX_FMT_YUV422P : V4L2_PIX_FMT_YUV420;
++	deinterlace_prepare_format(&ctx->tnr_fmt);
++
++	ctx->tnr_hist[0] = -1;
++	ctx->tnr_hist[1] = -1;
++	ctx->tnr_gain = ctx->tnr_gain_max;
++
++	if (!ctx->dev->has_tnr || ctx->tnr_mode == DEINTERLACE_TNR_OFF ||
++	    ctx->mode == DEINTERLACE_MODE_TNR ||
++	    deinterlace_mode_history(ctx->mode) == 0)
++		return 0;
++
++	for (i = 0; i < DEINTERLACE_TNR_BUFS; i++) {
++		ctx->tnr_buf[i] = dma_alloc_coherent(ctx->dev->dev,
++						     ctx->tnr_fmt.sizeimage,
++						     &ctx->tnr_dma[i],
++						     GFP_KERNEL);
++		if (!ctx->tnr_buf[i]) {
++			deinterlace_tnr_free(ctx);
++			return -ENOMEM;
++		}
++	}
++
++	return 0;
++}
++
+ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
+ {
+ 	struct deinterlace_ctx *ctx = vb2_get_drv_priv(vq);
+@@ -893,6 +1258,20 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
+ 		ctx->prev[0] = NULL;
+ 		ctx->prev[1] = NULL;
+ 		ctx->aborting = 0;
++		ctx->vof_sel = 0;
++
++		if (ctx->mode == DEINTERLACE_MODE_TNR &&
++		    (!ctx->dev->has_tnr ||
++		     !deinterlace_fmt_is_planar(ctx->dst_fmt.pixelformat))) {
++			dev_dbg(dev, "TNR-only mode needs TNR and planar output\n");
++			ret = -EINVAL;
++
++			goto err_runtime_put;
++		}
++
++		ret = deinterlace_tnr_alloc(ctx);
++		if (ret)
++			goto err_runtime_put;
+ 
+ 		/* two bits per pixel, lines padded to 32 bytes (vendor) */
+ 		ctx->flag_pitch = ALIGN(ctx->src_fmt.width * 2, 256) / 8;
+@@ -916,6 +1295,10 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
+ 
+ 			goto err_no_mem2;
+ 		}
++
++		/* the mode decides the buffer handling: no change mid-stream */
++		v4l2_ctrl_grab(ctx->mode_ctrl, true);
++		v4l2_ctrl_grab(ctx->tnr_ctrl, true);
+ 	}
+ 
+ 	return 0;
+@@ -924,6 +1307,8 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
+ 	dma_free_coherent(dev, ctx->flag_size, ctx->flag_buf[0],
+ 			  ctx->flag_dma[0]);
+ err_no_mem1:
++	deinterlace_tnr_free(ctx);
++err_runtime_put:
+ 	pm_runtime_put(dev);
+ err_runtime_get:
+ 	deinterlace_queue_cleanup(vq, VB2_BUF_STATE_QUEUED);
+@@ -942,6 +1327,9 @@ static void deinterlace_stop_streaming(struct vb2_queue *vq)
+ 				  ctx->flag_dma[0]);
+ 		dma_free_coherent(dev, ctx->flag_size, ctx->flag_buf[1],
+ 				  ctx->flag_dma[1]);
++		deinterlace_tnr_free(ctx);
++		v4l2_ctrl_grab(ctx->mode_ctrl, false);
++		v4l2_ctrl_grab(ctx->tnr_ctrl, false);
+ 
+ 		pm_runtime_put(dev);
+ 	}
+@@ -1015,6 +1403,49 @@ static int deinterlace_queue_init(void *priv, struct vb2_queue *src_vq,
+  */
+ #define V4L2_CID_SUNXI_DI300_FMD_ENABLE	(V4L2_CID_USER_BASE + 0x1101)
+ 
++/*
++ * Deinterlacing method (standard V4L2_CID_DEINTERLACING_MODE, driver
++ * menu). The vendor driver's modes: motion adaptive with both fields
++ * output ("60 Hz"), motion adaptive with one frame out per frame in
++ * ("30 Hz"), bob, weave, and TNR only (progressive input).
++ */
++static const char * const deinterlace_mode_menu[] = {
++	[DEINTERLACE_MODE_MOTION_FIELD]	= "Motion Adaptive, Field Rate",
++	[DEINTERLACE_MODE_MOTION_FRAME]	= "Motion Adaptive, Frame Rate",
++	[DEINTERLACE_MODE_BOB]		= "Bob",
++	[DEINTERLACE_MODE_WEAVE]	= "Weave",
++	[DEINTERLACE_MODE_TNR]		= "Noise Reduction Only",
++	NULL,
++};
++
++/* temporal noise reduction: off, fixed strength, adaptive strength */
++#define V4L2_CID_SUNXI_DI300_TNR_MODE	(V4L2_CID_USER_BASE + 0x1103)
++/* fixed strength, 0-255, vendor default 0x3a */
++#define V4L2_CID_SUNXI_DI300_TNR_STRENGTH (V4L2_CID_USER_BASE + 0x1104)
++/* adaptive strength bounds: the vendor's high/middle/low levels */
++#define V4L2_CID_SUNXI_DI300_TNR_LEVEL	(V4L2_CID_USER_BASE + 0x1105)
++
++static const char * const deinterlace_tnr_mode_menu[] = {
++	"Off",
++	"Fixed",
++	"Adaptive",
++	NULL,
++};
++
++static const char * const deinterlace_tnr_level_menu[] = {
++	"High",
++	"Middle",
++	"Low",
++	NULL,
++};
++
++/* adaptive gain bounds per level, from di_alg_fixed_para() */
++static const u8 deinterlace_tnr_gain_bounds[3][2] = {
++	{ 52, 62 },	/* high */
++	{ 28, 48 },	/* middle */
++	{ 16, 38 },	/* low */
++};
++
+ static int deinterlace_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
+ {
+ 	struct deinterlace_ctx *ctx =
+@@ -1041,6 +1472,19 @@ static int deinterlace_s_ctrl(struct v4l2_ctrl *ctrl)
+ 	case V4L2_CID_SUNXI_DI300_FMD_ENABLE:
+ 		ctx->fmd_enabled = ctrl->val;
+ 		break;
++	case V4L2_CID_DEINTERLACING_MODE:
++		ctx->mode = ctrl->val;
++		break;
++	case V4L2_CID_SUNXI_DI300_TNR_MODE:
++		ctx->tnr_mode = ctrl->val;
++		break;
++	case V4L2_CID_SUNXI_DI300_TNR_STRENGTH:
++		ctx->tnr_strength = ctrl->val;
++		break;
++	case V4L2_CID_SUNXI_DI300_TNR_LEVEL:
++		ctx->tnr_gain_min = deinterlace_tnr_gain_bounds[ctrl->val][0];
++		ctx->tnr_gain_max = deinterlace_tnr_gain_bounds[ctrl->val][1];
++		break;
+ 	default:
+ 		return -EINVAL;
+ 	}
+@@ -1066,6 +1510,37 @@ static const struct v4l2_ctrl_config deinterlace_fmd_stats_ctrl = {
+ 	.dims	= { DEINTERLACE_FMD_STATS_COUNT },
+ };
+ 
++static const struct v4l2_ctrl_config deinterlace_tnr_mode_ctrl = {
++	.ops	= &deinterlace_ctrl_ops,
++	.id	= V4L2_CID_SUNXI_DI300_TNR_MODE,
++	.name	= "Temporal Noise Reduction",
++	.type	= V4L2_CTRL_TYPE_MENU,
++	.max	= DEINTERLACE_TNR_ADAPTIVE,
++	.def	= DEINTERLACE_TNR_OFF,
++	.qmenu	= deinterlace_tnr_mode_menu,
++};
++
++static const struct v4l2_ctrl_config deinterlace_tnr_strength_ctrl = {
++	.ops	= &deinterlace_ctrl_ops,
++	.id	= V4L2_CID_SUNXI_DI300_TNR_STRENGTH,
++	.name	= "TNR Fixed Strength",
++	.type	= V4L2_CTRL_TYPE_INTEGER,
++	.min	= 0,
++	.max	= 255,
++	.step	= 1,
++	.def	= DEINTERLACE_TNR_STRENGTH_DEF,
++};
++
++static const struct v4l2_ctrl_config deinterlace_tnr_level_ctrl = {
++	.ops	= &deinterlace_ctrl_ops,
++	.id	= V4L2_CID_SUNXI_DI300_TNR_LEVEL,
++	.name	= "TNR Adaptive Level",
++	.type	= V4L2_CTRL_TYPE_MENU,
++	.max	= 2,
++	.def	= 0,
++	.qmenu	= deinterlace_tnr_level_menu,
++};
++
+ static const struct v4l2_ctrl_config deinterlace_fmd_enable_ctrl = {
+ 	.ops	= &deinterlace_ctrl_ops,
+ 	.id	= V4L2_CID_SUNXI_DI300_FMD_ENABLE,
+@@ -1079,22 +1554,25 @@ static const struct v4l2_ctrl_config deinterlace_fmd_enable_ctrl = {
+ 
+ /*
+  * Per-job field-weave decision: [0] for the job's first output
+- * (dst0), [1] for its second (dst1). 0-2 select a weave phase for
+- * that output (direct field combine instead of motion-adaptive
+- * blend); 3 disables weave for that output, falling back to whatever
+- * DIT_SETTING already configures. Bound to a request the way
+- * stateless codec controls are -- see the comment on ctx->weave_ctrl.
++ * (dst0), [1] for its second (dst1). Bits 1:0 = 0-2 select a weave
++ * phase for that output (direct field combine instead of
++ * motion-adaptive blend); 3 disables weave for that output, falling
++ * back to whatever DIT_SETTING already configures. With weave on,
++ * bit 2 keeps the video blend for video-on-film areas (vendor
++ * video_exist) and bit 3 weaves chroma too (the vendor never does
++ * this). Bound to a request the way stateless codec controls are --
++ * see the comment on ctx->weave_ctrl.
+  */
+ #define V4L2_CID_SUNXI_DI300_FMD_WEAVE	(V4L2_CID_USER_BASE + 0x1102)
+ #define DEINTERLACE_FMD_WEAVE_COUNT	2
+-#define DEINTERLACE_FMD_WEAVE_DISABLED	3
+ 
+ static const struct v4l2_ctrl_config deinterlace_fmd_weave_ctrl = {
+ 	.id	= V4L2_CID_SUNXI_DI300_FMD_WEAVE,
+ 	.name	= "FMD Field Weave",
+ 	.type	= V4L2_CTRL_TYPE_U32,
+ 	.min	= 0,
+-	.max	= DEINTERLACE_FMD_WEAVE_DISABLED,
++	.max	= DEINTERLACE_FMD_WEAVE_PHASE_MASK |
++		  DEINTERLACE_FMD_WEAVE_VIDEO | DEINTERLACE_FMD_WEAVE_CHROMA,
+ 	.step	= 1,
+ 	.def	= DEINTERLACE_FMD_WEAVE_DISABLED,
+ 	.dims	= { DEINTERLACE_FMD_WEAVE_COUNT },
+@@ -1130,21 +1608,41 @@ static int deinterlace_open(struct file *file)
+ 	v4l2_fh_init(&ctx->fh, video_devdata(file));
+ 	ctx->dev = dev;
+ 
++	ctx->tnr_strength = DEINTERLACE_TNR_STRENGTH_DEF;
++	ctx->tnr_gain_min = deinterlace_tnr_gain_bounds[0][0];
++	ctx->tnr_gain_max = deinterlace_tnr_gain_bounds[0][1];
++
++	v4l2_ctrl_handler_init(&ctx->hdl, 7);
++	ctx->mode_ctrl =
++		v4l2_ctrl_new_std_menu_items(&ctx->hdl, &deinterlace_ctrl_ops,
++					     V4L2_CID_DEINTERLACING_MODE,
++					     dev->has_tnr ? DEINTERLACE_MODE_TNR :
++					     DEINTERLACE_MODE_WEAVE, 0,
++					     DEINTERLACE_MODE_MOTION_FIELD,
++					     deinterlace_mode_menu);
++	if (dev->has_tnr) {
++		ctx->tnr_ctrl = v4l2_ctrl_new_custom(&ctx->hdl,
++						     &deinterlace_tnr_mode_ctrl,
++						     NULL);
++		v4l2_ctrl_new_custom(&ctx->hdl, &deinterlace_tnr_strength_ctrl,
++				     NULL);
++		v4l2_ctrl_new_custom(&ctx->hdl, &deinterlace_tnr_level_ctrl,
++				     NULL);
++	}
+ 	if (dev->has_fmd) {
+-		v4l2_ctrl_handler_init(&ctx->hdl, 3);
+ 		v4l2_ctrl_new_custom(&ctx->hdl, &deinterlace_fmd_stats_ctrl, NULL);
+ 		v4l2_ctrl_new_custom(&ctx->hdl, &deinterlace_fmd_enable_ctrl, NULL);
+ 		ctx->weave_ctrl = v4l2_ctrl_new_custom(&ctx->hdl,
+ 						      &deinterlace_fmd_weave_ctrl,
+ 						      NULL);
+-		if (ctx->hdl.error) {
+-			ret = ctx->hdl.error;
+-			v4l2_ctrl_handler_free(&ctx->hdl);
+-			v4l2_fh_exit(&ctx->fh);
+-			goto err_free;
+-		}
+-		ctx->fh.ctrl_handler = &ctx->hdl;
+ 	}
++	if (ctx->hdl.error) {
++		ret = ctx->hdl.error;
++		v4l2_ctrl_handler_free(&ctx->hdl);
++		v4l2_fh_exit(&ctx->fh);
++		goto err_free;
++	}
++	ctx->fh.ctrl_handler = &ctx->hdl;
+ 
+ 	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(dev->m2m_dev, ctx,
+ 					    &deinterlace_queue_init);
+diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
+index b572fe532..0925f99db 100644
+--- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
++++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
+@@ -26,6 +26,7 @@
+ 
+ /* per-instance hardware capability bits, read-only */
+ #define DEINTERLACE_FUNC_VSN			0x00c
++#define DEINTERLACE_FUNC_VSN_TNR_EXIST(v)		(((v) >> 24) & 3)
+ #define DEINTERLACE_FUNC_VSN_FMD_EXIST(v)		(((v) >> 26) & 3)
+ 
+ #define DEINTERLACE_START			0x010
+@@ -41,6 +42,7 @@
+ #define DEINTERLACE_FUNC_EN			0x020
+ #define DEINTERLACE_FUNC_EN_DIT			BIT(0)
+ #define DEINTERLACE_FUNC_EN_MD				BIT(1)
++#define DEINTERLACE_FUNC_EN_TNR				BIT(2)
+ #define DEINTERLACE_FUNC_EN_FMD			BIT(3)
+ 
+ #define DEINTERLACE_DMA_CTL			0x024
+@@ -66,6 +68,7 @@
+ #define DEINTERLACE_FMT_IN0(v)				((v) & 3)
+ #define DEINTERLACE_FMT_IN1(v)				(((v) & 3) << 4)
+ #define DEINTERLACE_FMT_IN2(v)				(((v) & 3) << 8)
++#define DEINTERLACE_FMT_TNR(v)				(((v) & 3) << 12)
+ #define DEINTERLACE_FMT_DIT(v)				(((v) & 3) << 16)
+ #define DEINTERLACE_FMT_UVSEQ				BIT(28)
+ 
+@@ -80,6 +83,9 @@
+ /* pitch of in_f2 */
+ #define DEINTERLACE_IN_F2_PITCH(p)		(0x050 + (p) * 4)
+ 
++/* pitch of tnr output */
++#define DEINTERLACE_OUT_TNR_PITCH(p)		(0x060 + (p) * 4)
++
+ /* pitch of dit output */
+ #define DEINTERLACE_OUT_DIT_PITCH(p)		(0x070 + (p) * 4)
+ 
+@@ -100,6 +106,9 @@
+ #define DEINTERLACE_IN_F2_BOT_ADDR(p)		(0x0e0 + (p) * 4)
+ #define DEINTERLACE_IN_F2_BOT_HADDR		0x0ec
+ 
++#define DEINTERLACE_OUT_TNR_ADDR(p)		(0x0f0 + (p) * 4)
++#define DEINTERLACE_OUT_TNR_HADDR		0x0fc
++
+ #define DEINTERLACE_OUT_DIT0_ADDR(p)		(0x100 + (p) * 4)
+ #define DEINTERLACE_OUT_DIT0_HADDR		0x10c
+ 
+@@ -147,6 +156,8 @@
+  * driver's own "for safety" comment.
+  */
+ #define DEINTERLACE_DIT_INTER_PARA_FIELD_WEAVE_F1	BIT(0)
++#define DEINTERLACE_DIT_INTER_PARA_VIDEO_EXIST_F1	BIT(1)
++#define DEINTERLACE_DIT_INTER_PARA_FIELD_WEAVE_CHROMA_F1	BIT(2)
+ #define DEINTERLACE_DIT_INTER_PARA_FIELD_WEAVE_PHASE_F1(v)	(((v) & 3) << 4)
+ #define DEINTERLACE_DIT_INTER_PARA_FIELD_WEAVE_F2	BIT(16)
+ #define DEINTERLACE_DIT_INTER_PARA_FIELD_WEAVE_PHASE_F2(v)	(((v) & 3) << 20)
+@@ -214,12 +225,67 @@
+ #define DEINTERLACE_FMD_FIELD_HIST1		0x220
+ 
+ #define DEINTERLACE_FMD_GLB			0x224
++#define DEINTERLACE_FMD_GLB_VOF_BUF_SEL(v)		(((v) & 3) << 4)
++#define DEINTERLACE_FMD_GLB_VOF_EN			BIT(31)
+ 
+ #define DEINTERLACE_FMD_CROP_H			0x230
+ #define DEINTERLACE_FMD_CROP_V			0x234
+ 
++/* Temporal noise reduction, on instances with FUNC_VSN tnr_exist */
++#define DEINTERLACE_TNR_STRENGTH		0x240
++#define DEINTERLACE_TNR_STRENGTH_V(v)			((v) & 0xff)
++#define DEINTERLACE_TNR_STRENGTH_U(v)			(((v) & 0xff) << 8)
++#define DEINTERLACE_TNR_STRENGTH_Y(v)			(((v) & 0xff) << 16)
++#define DEINTERLACE_TNR_STRENGTH_DEF			0x3a
++#define DEINTERLACE_TNR_STRENGTH_DEFAULT		0x003a3a3a
++#define DEINTERLACE_TNR_DARK_TH			0x244
++#define DEINTERLACE_TNR_DARK_PROTECT		0x248
++#define DEINTERLACE_TNR_DARK_PARA_Y		0x24c
++#define DEINTERLACE_TNR_DARK_PARA_U		0x250
++#define DEINTERLACE_TNR_DARK_PARA_V		0x254
++#define DEINTERLACE_TNR_FTH_DETECT		0x258
++#define DEINTERLACE_TNR_DT_FILTER		0x25c
++#define DEINTERLACE_TNR_WEIGHT_LBOUND		0x260
++#define DEINTERLACE_TNR_ABN_DETECT		0x264
++#define DEINTERLACE_TNR_TH_SUM			0x268
++/* per-run sums, read back for the adaptive strength */
++#define DEINTERLACE_TNR_SUM_WEIGHT_Y		0x26c
++#define DEINTERLACE_TNR_SUM_GAIN_Y		0x278
++#define DEINTERLACE_TNR_SUM_STILL_OUT		0x284
++#define DEINTERLACE_TNR_SUM_GAIN_Y_CNT		0x28c
++#define DEINTERLACE_TNR_TH_DARK_DITHER		0x290
++#define DEINTERLACE_TNR_RANDOM_CFG		0x294
++#define DEINTERLACE_TNR_RANDOM_GEN		0x298
++#define DEINTERLACE_TNR_MD_RESULT		0x29c
++#define DEINTERLACE_TNR_CROP_H			0x2a0
++#define DEINTERLACE_TNR_CROP_V			0x2a4
++#define DEINTERLACE_TNR_DEMO_H			0x2a8
++#define DEINTERLACE_TNR_DEMO_V			0x2ac
++
+ #define DEINTERLACE_FMD_STATS_COUNT	10
+ 
++/* V4L2_CID_SUNXI_DI300_FMD_WEAVE element bits */
++#define DEINTERLACE_FMD_WEAVE_PHASE_MASK	3
++#define DEINTERLACE_FMD_WEAVE_DISABLED		3
++#define DEINTERLACE_FMD_WEAVE_VIDEO		BIT(2)
++#define DEINTERLACE_FMD_WEAVE_CHROMA		BIT(3)
++
++enum deinterlace_mode {
++	DEINTERLACE_MODE_MOTION_FIELD,
++	DEINTERLACE_MODE_MOTION_FRAME,
++	DEINTERLACE_MODE_BOB,
++	DEINTERLACE_MODE_WEAVE,
++	DEINTERLACE_MODE_TNR,
++};
++
++enum deinterlace_tnr_mode {
++	DEINTERLACE_TNR_OFF,
++	DEINTERLACE_TNR_FIXED,
++	DEINTERLACE_TNR_ADAPTIVE,
++};
++
++#define DEINTERLACE_TNR_BUFS	3
++
+ /* H616 datasheet 2.5.2: 32x32 to 2048x1280 */
+ #define DEINTERLACE_MIN_WIDTH	32U
+ #define DEINTERLACE_MIN_HEIGHT	32U
+@@ -233,6 +299,27 @@ struct deinterlace_ctx {
+ 	struct v4l2_pix_format	src_fmt;
+ 	struct v4l2_pix_format	dst_fmt;
+ 
++	/* enum deinterlace_mode, fixed while streaming */
++	unsigned int		mode;
++	struct v4l2_ctrl	*mode_ctrl;
++
++	/* temporal noise reduction */
++	unsigned int		tnr_mode;
++	struct v4l2_ctrl	*tnr_ctrl;
++	unsigned int		tnr_strength;
++	unsigned int		tnr_gain;
++	unsigned int		tnr_gain_min;
++	unsigned int		tnr_gain_max;
++	bool			tnr_active;
++	/* filtered reference frames (planar), newest first in tnr_hist */
++	struct v4l2_pix_format	tnr_fmt;
++	void			*tnr_buf[DEINTERLACE_TNR_BUFS];
++	dma_addr_t		tnr_dma[DEINTERLACE_TNR_BUFS];
++	int			tnr_hist[2];
++	int			tnr_cur;
++
++	unsigned int		vof_sel;
++
+ 	/* motion flag buffers, read and written alternately */
+ 	void			*flag_buf[2];
+ 	dma_addr_t		flag_dma[2];
+@@ -297,6 +384,7 @@ struct deinterlace_dev {
+ 
+ 	/* set once at probe from DEINTERLACE_FUNC_VSN, never changes */
+ 	bool			has_fmd;
++	bool			has_tnr;
+ 
+ 	/*
+ 	 * Raw FMD counters latched at the last completed job, if any.
+-- 
+2.55.0
+

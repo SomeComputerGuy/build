@@ -1,0 +1,107 @@
+From 15b90ec7fb91c6cc7e2a6a20074566c72ce5c766 Mon Sep 17 00:00:00 2001
+From: Jernej Skrabec <jernej.skrabec@gmail.com>
+Date: Wed, 31 Jul 2024 18:44:11 +0200
+Subject: [PATCH 1/5] media: cedrus: Setup secondary output formats
+
+It's needed for JPEG codec, since engine outputs to it for some reason.
+
+Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
+Link: https://lore.kernel.org/r/20240731164422.206503-2-linkmauve@linkmauve.fr
+[Arun Iyengar: rebased onto the H616 series, whose cedrus_dst_format_set()
+ already has the linear YU12/YV12/NV21 cases and the secondary stride
+ register. Setting the secondary output there would change the register
+ writes of every codec (H.265/VP9 use the secondary output for P010), so
+ the secondary setup is a separate cedrus_dst_secondary_format_set()
+ that only the JPEG decoder calls; it covers all four linear formats.]
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../staging/media/sunxi/cedrus/cedrus_hw.c    | 42 +++++++++++++++++++
+ .../staging/media/sunxi/cedrus/cedrus_hw.h    |  2 +
+ .../staging/media/sunxi/cedrus/cedrus_regs.h  |  4 ++
+ 3 files changed, 48 insertions(+)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+index 683440f3e..8fa8c1798 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -171,6 +171,48 @@ void cedrus_dst_format_set(struct cedrus_dev *dev,
+ 	}
+ }
+ 
++/*
++ * Set up the secondary output for a linear capture format, mirroring the
++ * primary setup done by cedrus_dst_format_set(). The JPEG decoder writes
++ * its picture through the rotate/scale path, which takes its layout from
++ * the secondary ("EXT") output registers.
++ */
++void cedrus_dst_secondary_format_set(struct cedrus_dev *dev,
++				     struct v4l2_pix_format *fmt)
++{
++	unsigned int bytesperline = fmt->bytesperline;
++	u32 chroma_size = bytesperline * ALIGN(fmt->height, 16) / 2;
++	u32 reg;
++
++	switch (fmt->pixelformat) {
++	case V4L2_PIX_FMT_NV12:
++		reg = VE_PRIMARY_OUT_FMT_NV12 | VE_SECONDARY_OUT_FMT_EXT_NV12;
++		break;
++	case V4L2_PIX_FMT_NV21:
++		reg = VE_PRIMARY_OUT_FMT_NV21 | VE_SECONDARY_OUT_FMT_EXT_NV21;
++		break;
++	case V4L2_PIX_FMT_YUV420:
++		reg = VE_PRIMARY_OUT_FMT_YU12 | VE_SECONDARY_OUT_FMT_EXT_YU12;
++		break;
++	case V4L2_PIX_FMT_YVU420:
++		reg = VE_PRIMARY_OUT_FMT_YV12 | VE_SECONDARY_OUT_FMT_EXT_YV12;
++		break;
++	default:
++		/* tiled: the primary setup already covers both outputs */
++		return;
++	}
++	cedrus_write(dev, VE_PRIMARY_OUT_FMT, reg);
++
++	reg = VE_CHROMA_BUF_LEN_SDRT(chroma_size / 2) |
++	      VE_CHROMA_WIDTH_ALIGN_8 |
++	      VE_SECONDARY_OUT_FMT_EXT;
++	cedrus_write(dev, VE_CHROMA_BUF_LEN, reg);
++
++	reg = VE_PRIMARY_FB_LINE_STRIDE_LUMA(bytesperline) |
++	      VE_PRIMARY_FB_LINE_STRIDE_CHROMA(bytesperline / 2);
++	cedrus_write(dev, VE_SECONDARY_FB_LINE_STRIDE, reg);
++}
++
+ /*
+  * Program the secondary ("scale-down/rotate") output engine to write the
+  * userspace-visible P010 surface at the start of the capture buffer.  The
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.h b/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
+index 6f3dea749..089462900 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
+@@ -21,6 +21,8 @@ void cedrus_engine_disable(struct cedrus_dev *dev);
+ 
+ void cedrus_dst_format_set(struct cedrus_dev *dev,
+ 			   struct v4l2_pix_format *fmt);
++void cedrus_dst_secondary_format_set(struct cedrus_dev *dev,
++				     struct v4l2_pix_format *fmt);
+ 
+ void cedrus_dst_p010_output_set(struct cedrus_ctx *ctx,
+ 				struct vb2_buffer *dst_buf);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+index c569a94d5..347453bf7 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+@@ -89,6 +89,10 @@
+ #define VE_SECONDARY_OUT_FMT_EXT		(0x01 << 30)
+ #define VE_SECONDARY_OUT_FMT_YU12		(0x02 << 30)
+ #define VE_SECONDARY_OUT_FMT_YV12		(0x03 << 30)
++#define VE_CHROMA_WIDTH_ALIGN_16		(0x00 << 29)
++#define VE_CHROMA_WIDTH_ALIGN_8			(0x01 << 29)
++#define VE_LUMA_WIDTH_ALIGN_16			(0x00 << 28)
++#define VE_LUMA_WIDTH_ALIGN_32			(0x01 << 28)
+ #define VE_CHROMA_BUF_LEN_SDRT(l)		SHIFT_AND_MASK_BITS(l, 27, 0)
+ 
+ #define VE_PRIMARY_OUT_FMT			0xec
+-- 
+2.55.0
+
