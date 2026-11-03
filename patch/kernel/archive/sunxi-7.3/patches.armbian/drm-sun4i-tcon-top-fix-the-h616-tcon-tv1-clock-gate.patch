@@ -1,0 +1,64 @@
+From 892c9d3091cb340b435fc8ed10289b11a8ba92f5 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 3 Nov 2026 06:47:50 +0000
+Subject: [PATCH 1/2] drm/sun4i: tcon-top: Fix the H616 TCON TV1 clock gate
+
+The TCON TOP clock gates were laid out after the R40, where the TCON TV1
+gate is bit 24 of GATE_SRC. The H616 puts it right next to the TCON TV0
+gate, at bit 21: the Allwinner BSP (lowlevel_v33x, tcon_clk_gate_reg_t)
+defines dsi0/dsi1 at bits 16/17, tv0/tv1 at bits 20/21 and the HDMI
+source at bits 29:28. Bit 24 has no effect on the H616.
+
+With the R40 bit, the "tcon-top-tv1" gate reports enabled while TCON TV1
+receives no clock at all: on an Orange Pi Zero2 with the TV encoder
+enabled the TCON TV1 line counter stays at 0, its interrupt never fires
+and every commit on that CRTC times out waiting for a vblank.
+
+The wrong bit dates back to patches.drm/0041 ("drm/sun4i: Add support
+for H616 TCON TOP"). Let the quirks name the TCON TV1 gate bit and use
+bit 21 on the H616.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/sun4i/sun8i_tcon_top.c | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/drivers/gpu/drm/sun4i/sun8i_tcon_top.c b/drivers/gpu/drm/sun4i/sun8i_tcon_top.c
+index f6e47c0a4..8ebec2f11 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_tcon_top.c
++++ b/drivers/gpu/drm/sun4i/sun8i_tcon_top.c
+@@ -18,6 +18,8 @@
+ struct sun8i_tcon_top_quirks {
+ 	bool has_tcon_tv1;
+ 	bool has_dsi;
++	/* TCON TV1 clock gate bit in GATE_SRC, if not the R40 one */
++	u8 tcon_tv1_gate;
+ };
+ 
+ static bool sun8i_tcon_top_node_is_tcon_top(struct device_node *node)
+@@ -287,6 +289,7 @@ static int sun8i_tcon_top_bind(struct device *dev, struct device *master,
+ 		clk_data->hws[CLK_TCON_TOP_TV1] =
+ 			sun8i_tcon_top_register_gate(dev, "tcon-tv1", regs,
+ 						     &tcon_top->reg_lock,
++						     quirks->tcon_tv1_gate ?:
+ 						     TCON_TOP_TCON_TV1_GATE, i++);
+ 
+ 	if (quirks->has_dsi)
+@@ -367,6 +370,13 @@ static const struct sun8i_tcon_top_quirks sun50i_h6_tcon_top_quirks = {
+ 
+ static const struct sun8i_tcon_top_quirks sun50i_h616_tcon_top_quirks = {
+ 	.has_tcon_tv1	= true,
++	/*
++	 * Unlike the R40, the H616 gates TCON TV1 with the bit right next to
++	 * the TCON TV0 one (Allwinner BSP, lowlevel_v33x de_lcd_type.h,
++	 * tcon_clk_gate_reg_t). Bit 24 does nothing here, so TCON TV1 never
++	 * gets a pixel clock and never raises a vblank interrupt.
++	 */
++	.tcon_tv1_gate	= TCON_TOP_TCON_TV0_GATE + 1,
+ };
+ 
+ /* sun4i_drv uses this list to check if a device node is a TCON TOP */
+-- 
+2.55.0
+
