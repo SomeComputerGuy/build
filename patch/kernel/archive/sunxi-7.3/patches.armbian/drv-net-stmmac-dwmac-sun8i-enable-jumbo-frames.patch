@@ -29,8 +29,14 @@ There are two independent limits:
    norm_set_tx_desc_len_on_chain() masks the length to 11 bits, so a
    linear frame longer than 2047 bytes would be silently truncated.
 
+Moreover, the RX DMA only fills a multiple of 4 bytes of a buffer: on
+the H616, with 2047 programmed, a 2044 byte frame (FCS included) is
+received in one descriptor and a 2045 byte frame already spills into a
+second one. The usable size is therefore 2044 bytes, the same value as
+DESC_BUF_MAX in the original sun8i-emac submission and the U-Boot driver.
+
 Limit max_mtu so that a frame with two VLAN tags and the FCS fits in
-one 2047 byte buffer (MTU 2021). A device tree max-frame-size can still
+2044 bytes (MTU 2018). A device tree max-frame-size can still
 lower it further. Frames that are still too large are dropped whole by
 ndesc_get_rx_status() (see the preceding norm_desc patch).
 
@@ -48,7 +54,7 @@ diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/eth
  #include <linux/io.h>
  
  extern int sunxi_get_soc_chipid(unsigned char *chipid);
-@@ -220,12 +221,23 @@
+@@ -220,12 +221,25 @@
  
  /* Used in RX_CTL0 */
  #define EMAC_RX_RECEIVER_EN             BIT(31)
@@ -60,19 +66,21 @@ diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/eth
  #define EMAC_TX_TRANSMITTER_EN  BIT(31)
  
 +/* The buffer size field of the EMAC DMA descriptors is 11 bits wide, and
-+ * the stmmac normal descriptor code used for this EMAC only handles frames
-+ * that fit in a single RX descriptor and a single TX descriptor buffer.
-+ * Bound the MTU so that a frame, including two VLAN tags and the FCS, always
-+ * fits in one 2047 byte buffer.
++ * the RX DMA only fills a multiple of 4 bytes of a buffer: with 2047
++ * programmed, frames longer than 2044 bytes spill into a second
++ * descriptor. The stmmac normal descriptor code used for this EMAC only
++ * handles frames that fit in a single RX descriptor and a single TX
++ * descriptor buffer. Bound the MTU so that a frame, including two VLAN
++ * tags and the FCS, always fits in 2044 bytes.
 + */
-+#define EMAC_MAX_FRAME_LEN	(BUF_SIZE_2KiB - 1)
++#define EMAC_MAX_FRAME_LEN	2044
 +#define EMAC_MAX_MTU		(EMAC_MAX_FRAME_LEN - ETH_HLEN - \
 +				 2 * VLAN_HLEN - ETH_FCS_LEN)
 +
  /* Used in EMAC_TX_FLOW_CTL */
  #define EMAC_TX_FLOW_CTL_EN             BIT(0)
  
-@@ -654,6 +666,15 @@
+@@ -654,6 +668,15 @@
  
  	v = (8 << EMAC_BURSTLEN_SHIFT); /* burst len */
  	writel(v, ioaddr + EMAC_BASIC_CTL1);
@@ -88,7 +96,7 @@ diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/eth
  }
  
  static void sun8i_dwmac_set_mac(void __iomem *ioaddr, bool enable)
-@@ -1267,6 +1288,7 @@
+@@ -1267,6 +1290,7 @@
  	plat_dat->mac_setup = sun8i_dwmac_setup;
  	plat_dat->tx_fifo_size = 4096;
  	plat_dat->rx_fifo_size = 16384;
