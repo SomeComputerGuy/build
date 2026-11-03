@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 03 Nov 2026 04:07:08 +0000
+Subject: media: cedrus: mpeg2: decode MPEG-1
+
+The engine has an MPEG-1 mode, selected with the MPEG-1 decoder type in
+the trigger register, and takes the full pel flags and the picture
+coding type (D-pictures included) in the picture header register. Jens
+Kuske's VE MPEG test program decoded MPEG-1 that way. Use it for
+sequences with V4L2_MPEG2_SEQ_FLAG_MPEG1, and reject the MPEG-1-only
+features (D-pictures, full pel vectors) in MPEG-2 sequences and field
+pictures in MPEG-1 sequences.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -229,6 +229,7 @@
+ 			bool		pair_pending;
+ 			unsigned int	pair_dst;
+ 			u8		pair_structure;
++			bool		mpeg1;
+ 		} mpeg2;
+ 		struct {
+ 			unsigned int	last_frame_p_type;
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
+@@ -52,7 +52,7 @@
+ {
+ 	struct vb2_buffer *fwd, *bwd;
+ 	unsigned int mb_height;
+-	bool field, tff;
++	bool field, tff, mpeg1;
+ 	const struct v4l2_ctrl_mpeg2_sequence *seq;
+ 	const struct v4l2_ctrl_mpeg2_picture *pic;
+ 	const struct v4l2_ctrl_mpeg2_quantisation *quantisation;
+@@ -66,6 +66,26 @@
+ 	seq = run->mpeg2.sequence;
+ 	pic = run->mpeg2.picture;
+ 
++	/*
++	 * MPEG-1 differs from MPEG-2 in its inverse quantisation mismatch
++	 * control (ISO/IEC 11172-2 2.4.4: each coefficient made odd, instead
++	 * of the parity of the sum), full pel motion vectors and D-pictures
++	 * (DC coefficients only). The engine has an MPEG-1 mode for it,
++	 * selected in the trigger register, and takes the full pel flags and
++	 * the picture coding type in the picture header register; Jens
++	 * Kuske's VE MPEG test program drives MPEG-1 that way. MPEG-1 has
++	 * frame pictures only.
++	 */
++	mpeg1 = seq->flags & V4L2_MPEG2_SEQ_FLAG_MPEG1;
++	if (mpeg1 && pic->picture_structure != V4L2_MPEG2_PIC_FRAME)
++		return -EINVAL;
++	if (!mpeg1 &&
++	    (pic->picture_coding_type == V4L2_MPEG2_PIC_CODING_TYPE_D ||
++	     pic->flags & (V4L2_MPEG2_PIC_FLAG_FULL_PEL_FORWARD |
++			   V4L2_MPEG2_PIC_FLAG_FULL_PEL_BACKWARD)))
++		return -EINVAL;
++	ctx->codec.mpeg2.mpeg1 = mpeg1;
++
+ 	quantisation = run->mpeg2.quantisation;
+ 
+ 	/* Activate MPEG engine. */
+@@ -124,8 +144,10 @@
+ 	reg |= VE_DEC_MPEG_MP12HDR_Q_SCALE_TYPE(pic->flags & V4L2_MPEG2_PIC_FLAG_Q_SCALE_TYPE);
+ 	reg |= VE_DEC_MPEG_MP12HDR_INTRA_VLC_FORMAT(pic->flags & V4L2_MPEG2_PIC_FLAG_INTRA_VLC);
+ 	reg |= VE_DEC_MPEG_MP12HDR_ALTERNATE_SCAN(pic->flags & V4L2_MPEG2_PIC_FLAG_ALT_SCAN);
+-	reg |= VE_DEC_MPEG_MP12HDR_FULL_PEL_FORWARD_VECTOR(0);
+-	reg |= VE_DEC_MPEG_MP12HDR_FULL_PEL_BACKWARD_VECTOR(0);
++	reg |= VE_DEC_MPEG_MP12HDR_FULL_PEL_FORWARD_VECTOR(pic->flags &
++				V4L2_MPEG2_PIC_FLAG_FULL_PEL_FORWARD);
++	reg |= VE_DEC_MPEG_MP12HDR_FULL_PEL_BACKWARD_VECTOR(pic->flags &
++				V4L2_MPEG2_PIC_FLAG_FULL_PEL_BACKWARD);
+ 
+ 	cedrus_write(dev, VE_DEC_MPEG_MP12HDR, reg);
+ 
+@@ -248,8 +270,9 @@
+ 	u32 reg;
+ 
+ 	/* Trigger MPEG engine. */
+-	reg = VE_DEC_MPEG_TRIGGER_HW_MPEG_VLD | VE_DEC_MPEG_TRIGGER_MPEG2 |
+-	      VE_DEC_MPEG_TRIGGER_MB_BOUNDARY;
++	reg = VE_DEC_MPEG_TRIGGER_HW_MPEG_VLD | VE_DEC_MPEG_TRIGGER_MB_BOUNDARY;
++	reg |= ctx->codec.mpeg2.mpeg1 ? VE_DEC_MPEG_TRIGGER_MPEG1 :
++					VE_DEC_MPEG_TRIGGER_MPEG2;
+ 
+ 	cedrus_write(dev, VE_DEC_MPEG_TRIGGER, reg);
+ }
+-- 
+2.47.0
+
