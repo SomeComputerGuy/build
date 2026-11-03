@@ -1,0 +1,141 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 3 Nov 2026 01:08:30 +0000
+Subject: ASoC: sun4i-codec: add DRC and HPF controls for the H616
+
+The H616 audio codec has a dynamic range controller and a high-pass
+filter in front of the DAC (user manual v1.0, 8.4.3.8 and the
+AC_DAC_DAP_CTRL/AC_DAC_DRC_* registers at 0xf0-0x1bc), but the driver
+exposes no way to use them.
+
+Add ALSA controls for the DAP block: switches for the DRC and the HPF
+(the shared DAP bypass bit follows them), for the limiter, expander,
+noise detection and max/min gain limit stages in AC_DAC_DRC_CTRL, and
+an enum for the RMS or peak level detector. The coefficient registers
+reset to Allwinner's reference curve, which is also what the vendor
+driver programs, so arm the same stages at component probe and leave
+the curve itself at the reset values. Both DRC and HPF stay off by
+default, so playback is unchanged until userspace enables them.
+
+Exposing the curve parameters (thresholds, slopes and time constants)
+needs the offset terms to be recomputed together with them and is left
+for later.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ sound/soc/sunxi/sun4i-codec.c | 84 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 84 insertions(+)
+
+diff --git a/sound/soc/sunxi/sun4i-codec.c b/sound/soc/sunxi/sun4i-codec.c
+index 111111111111..222222222222 100644
+--- a/sound/soc/sunxi/sun4i-codec.c
++++ b/sound/soc/sunxi/sun4i-codec.c
+@@ -240,6 +240,16 @@
+ #define SUN50I_DAC_CNT				(0x24)
+ #define SUN50I_DAC_DG_REG			(0x28)
+ #define SUN50I_DAC_DAP_CTL			(0xf0)
++#define SUN50I_DAC_DAP_EN			(31)
++#define SUN50I_DAC_DAP_DRC_EN			(29)
++#define SUN50I_DAC_DAP_HPF_EN			(28)
++#define SUN50I_DAC_DRC_CTRL			(0x108)
++#define SUN50I_DAC_DRC_GAIN_MAX_EN		(6)
++#define SUN50I_DAC_DRC_GAIN_MIN_EN		(5)
++#define SUN50I_DAC_DRC_NOISE_DET_EN		(4)
++#define SUN50I_DAC_DRC_SIGNAL_SEL		(3)
++#define SUN50I_DAC_DRC_LT_EN			(1)
++#define SUN50I_DAC_DRC_ET_EN			(0)
+ 
+ #define SUN50I_H616_DAC_AC_DAC_REG		(0x310)
+ #define SUN50I_H616_DAC_LEN			(15)
+@@ -1932,7 +1942,58 @@ static struct snd_soc_card *sun8i_v3s_codec_create_card(struct device *dev)
+ 	return card;
+ };
+ 
++/*
++ * The DRC and the HPF sit in the DAC "DAP" block, which has its own
++ * bypass bit: keep the block enabled while either of them is on.
++ */
++static int sun50i_h616_codec_dap_put(struct snd_kcontrol *kcontrol,
++				     struct snd_ctl_elem_value *ucontrol)
++{
++	struct snd_soc_component *component = snd_kcontrol_chip(kcontrol);
++	unsigned int val;
++	int ret, err;
++
++	ret = snd_soc_put_volsw(kcontrol, ucontrol);
++	if (ret < 0)
++		return ret;
++
++	val = snd_soc_component_read(component, SUN50I_DAC_DAP_CTL);
++	val &= BIT(SUN50I_DAC_DAP_DRC_EN) | BIT(SUN50I_DAC_DAP_HPF_EN);
++	err = snd_soc_component_update_bits(component, SUN50I_DAC_DAP_CTL,
++					    BIT(SUN50I_DAC_DAP_EN),
++					    val ? BIT(SUN50I_DAC_DAP_EN) : 0);
++	if (err < 0)
++		return err;
++
++	return ret;
++}
++
++static const char * const sun50i_h616_codec_drc_detector_text[] = {
++	"RMS", "Peak",
++};
++
++static SOC_ENUM_SINGLE_DECL(sun50i_h616_codec_drc_detector_enum,
++			    SUN50I_DAC_DRC_CTRL, SUN50I_DAC_DRC_SIGNAL_SEL,
++			    sun50i_h616_codec_drc_detector_text);
++
+ static const struct snd_kcontrol_new sun50i_h616_codec_codec_controls[] = {
++	SOC_SINGLE_EXT("DAC DRC Playback Switch", SUN50I_DAC_DAP_CTL,
++		       SUN50I_DAC_DAP_DRC_EN, 1, 0,
++		       snd_soc_get_volsw, sun50i_h616_codec_dap_put),
++	SOC_SINGLE_EXT("DAC HPF Playback Switch", SUN50I_DAC_DAP_CTL,
++		       SUN50I_DAC_DAP_HPF_EN, 1, 0,
++		       snd_soc_get_volsw, sun50i_h616_codec_dap_put),
++	SOC_SINGLE("DAC DRC Limiter Playback Switch", SUN50I_DAC_DRC_CTRL,
++		   SUN50I_DAC_DRC_LT_EN, 1, 0),
++	SOC_SINGLE("DAC DRC Expander Playback Switch", SUN50I_DAC_DRC_CTRL,
++		   SUN50I_DAC_DRC_ET_EN, 1, 0),
++	SOC_SINGLE("DAC DRC Noise Detect Playback Switch", SUN50I_DAC_DRC_CTRL,
++		   SUN50I_DAC_DRC_NOISE_DET_EN, 1, 0),
++	SOC_SINGLE("DAC DRC Max Gain Limit Playback Switch",
++		   SUN50I_DAC_DRC_CTRL, SUN50I_DAC_DRC_GAIN_MAX_EN, 1, 0),
++	SOC_SINGLE("DAC DRC Min Gain Limit Playback Switch",
++		   SUN50I_DAC_DRC_CTRL, SUN50I_DAC_DRC_GAIN_MIN_EN, 1, 0),
++	SOC_ENUM("DAC DRC Level Detector", sun50i_h616_codec_drc_detector_enum),
+ 	SOC_SINGLE_TLV("DAC Playback Volume", SUN4I_CODEC_DAC_DPC,
+ 		       SUN4I_CODEC_DAC_DPC_DVOL, 0x3f, 1,
+ 		       sun6i_codec_dvol_scale),
+@@ -1999,7 +2060,30 @@ static const struct snd_soc_dapm_widget sun50i_h616_codec_codec_widgets[] = {
+ 	SND_SOC_DAPM_OUTPUT("LINEOUT"),
+ };
+ 
++static int sun50i_h616_codec_component_probe(struct snd_soc_component *component)
++{
++	const unsigned int stages = BIT(SUN50I_DAC_DRC_GAIN_MAX_EN) |
++				    BIT(SUN50I_DAC_DRC_GAIN_MIN_EN) |
++				    BIT(SUN50I_DAC_DRC_NOISE_DET_EN) |
++				    BIT(SUN50I_DAC_DRC_LT_EN) |
++				    BIT(SUN50I_DAC_DRC_ET_EN);
++	int ret;
++
++	/*
++	 * The DRC coefficient registers reset to Allwinner's reference
++	 * curve (compressor at -40 dB with 2:1, limiter and expander
++	 * thresholds, 1 ms attack). Arm the same stages the vendor driver
++	 * sets when it turns the DRC on. The DRC itself stays bypassed
++	 * until "DAC DRC Playback Switch" is set.
++	 */
++	ret = snd_soc_component_update_bits(component, SUN50I_DAC_DRC_CTRL,
++					    stages, stages);
++
++	return ret < 0 ? ret : 0;
++}
++
+ static const struct snd_soc_component_driver sun50i_h616_codec_codec = {
++	.probe      = sun50i_h616_codec_component_probe,
+ 	.controls   = sun50i_h616_codec_codec_controls,
+ 	.num_controls   = ARRAY_SIZE(sun50i_h616_codec_codec_controls),
+ 	.dapm_widgets   = sun50i_h616_codec_codec_widgets,
+-- 
+Armbian
