@@ -1,4 +1,4 @@
-From 3bedd3a438113c74a7dc891a4319cef251d7db62 Mon Sep 17 00:00:00 2001
+From 79e233a3f900b7100c41e15625d96fb342741c6f Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Mon, 2 Nov 2026 22:26:59 +0000
 Subject: media: cedrus: add AVS2 decoding
@@ -42,12 +42,12 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  drivers/staging/media/sunxi/cedrus/Makefile   |   2 +-
  drivers/staging/media/sunxi/cedrus/cedrus.c   |  63 ++
  drivers/staging/media/sunxi/cedrus/cedrus.h   |  21 +
- .../staging/media/sunxi/cedrus/cedrus_avs2.c  | 621 ++++++++++++++++++
+ .../staging/media/sunxi/cedrus/cedrus_avs2.c  | 629 ++++++++++++++++++
  .../staging/media/sunxi/cedrus/cedrus_dec.c   |  19 +-
  .../staging/media/sunxi/cedrus/cedrus_hw.c    |   2 +
  .../staging/media/sunxi/cedrus/cedrus_regs.h  |  80 +++
  .../staging/media/sunxi/cedrus/cedrus_video.c |  13 +-
- 8 files changed, 817 insertions(+), 4 deletions(-)
+ 8 files changed, 825 insertions(+), 4 deletions(-)
  create mode 100644 drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
 
 diff --git a/drivers/staging/media/sunxi/cedrus/Makefile b/drivers/staging/media/sunxi/cedrus/Makefile
@@ -210,10 +210,10 @@ index 3e10b0470..0a823942f 100644
  {
 diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c b/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
 new file mode 100644
-index 000000000..37db91e43
+index 000000000..d0c30762e
 --- /dev/null
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
-@@ -0,0 +1,621 @@
+@@ -0,0 +1,629 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * Cedrus VPU driver: AVS2 (GB/T 33475.2, IEEE 1857.4) decoding
@@ -257,8 +257,14 @@ index 000000000..37db91e43
 +	u8	chroma[2][8];
 +	u8	luma_centre[16];
 +	u8	chroma_centre[2];
-+	u8	reserved[2];
-+	/* Filter index of regions 2n (bits 3:0) and 2n + 1 (bits 7:4). */
++	u8	reserved[6];
++	/*
++	 * Filter index of regions 2n (bits 3:0) and 2n + 1 (bits 7:4), at
++	 * byte 168. The vendor library builds a 172 byte table with this
++	 * map at byte 164, but the engine on the H616 reads it 4 bytes
++	 * further on (measured: with the map at 164, pictures with more than
++	 * one luma filter decode wrongly; at 168 they are bit-exact).
++	 */
 +	u8	region[8];
 +} __packed;
 +
@@ -281,7 +287,9 @@ index 000000000..37db91e43
 +	__le32	ref_poc[7][2];
 +} __packed;
 +
-+static_assert(sizeof(struct cedrus_avs2_alf_table) == 172);
++static_assert(sizeof(struct cedrus_avs2_alf_table) == 176);
++static_assert(CEDRUS_AVS2_ALF_OFFSET + sizeof(struct cedrus_avs2_alf_table) <=
++	      CEDRUS_AVS2_WQM_OFFSET);
 +static_assert(sizeof(struct cedrus_avs2_wqm_table) == 80);
 +static_assert(sizeof(struct cedrus_avs2_ref_table) == 184);
 +static_assert(CEDRUS_AVS2_REF_OFFSET + sizeof(struct cedrus_avs2_ref_table) <=
