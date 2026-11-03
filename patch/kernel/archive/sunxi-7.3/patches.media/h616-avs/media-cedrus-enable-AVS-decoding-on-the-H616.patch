@@ -1,0 +1,32 @@
+From 2574f0b90226a0c10fbcff14e7fde6e81d3f9e6b Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 3 Nov 2026 01:56:29 +0000
+Subject: [PATCH 3/3] media: cedrus: enable AVS decoding on the H616
+
+The H616 video engine decodes AVS1 and AVS+ up to 1080p (H616 user
+manual, section 4.4.1), and the vendor library drives it on this IC.
+Enable the AVS decoder for the H616 variant.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/staging/media/sunxi/cedrus/cedrus.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+index 5964b65af..8563fac3a 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -1102,7 +1102,8 @@ static const struct cedrus_variant sun50i_h616_cedrus_variant = {
+ 			  CEDRUS_CAPABILITY_VC1_DEC |
+ 			  CEDRUS_CAPABILITY_MPEG4_DEC |
+ 			  CEDRUS_CAPABILITY_AVS2_DEC |
+-			  CEDRUS_CAPABILITY_JPEG_DEC,
++			  CEDRUS_CAPABILITY_JPEG_DEC |
++			  CEDRUS_CAPABILITY_AVS_DEC,
+ 	.mod_rate	= 600000000,
+ 	/*
+ 	 * With the 128-bit DDR mode, H.264 and VP8 read corrupted reference
+-- 
+2.55.0
+

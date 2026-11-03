@@ -1,0 +1,882 @@
+From bea6a96b0d5b68be9ed9ca879a8b3956eff49717 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 3 Nov 2026 01:56:20 +0000
+Subject: [PATCH 2/3] media: cedrus: add AVS decoding
+
+Add AVS1 (JiZhun) and AVS+ (Guangdian) decoding through the stateless
+AVS uAPI. The decoder runs in the H.264 engine slot of the video engine,
+like VP8, with VE_MODE set to the H.264 decoder and bit 28 of the
+control register selecting AVS. The register layout and the programming
+sequence were recovered, for interoperability, from the debug
+information and the disassembly of the vendor libawavs.so; no vendor
+code is used.
+
+- The engine is started once per picture at the first slice start code
+  and parses the slice headers itself, decoding all the slices of the
+  picture, of both fields for a field coded picture. Bit 26 of the
+  control register makes it remove the pseudo start code bits of the
+  slice data. Bitstream initialisation (trigger 7) comes before the
+  picture decode trigger (9), as the vendor library does, both with
+  start code detection type 1.
+- Software provides the sequence header, the picture header with its
+  AVS+ tools (AEC, enhanced field B, no forward reference, weighting
+  quantisation, as coded), and the picture distances and coding of the
+  references. A P picture has two forward references; the engine takes
+  the second one in the registers of the backward reference of a B
+  picture. A missing reference is replaced by the picture itself.
+- Co-located motion vectors (32 bytes per macroblock) are kept per
+  capture buffer: I and P pictures write their own, B pictures read
+  those of their backward reference. A 48 KiB macroblock information
+  buffer per context is placed on a 16 KiB boundary.
+- Requests must carry the sequence and picture controls.
+- The VE is reset when switching to or from AVS, as for VP9 and AVS2:
+  the H.264 slot registers have an AVS specific meaning in this mode.
+- Pictures from 16x16 to 1920x1088, 8-bit 4:2:0, decoded to the tiled
+  and, where supported, the linear capture formats.
+
+The capability is not enabled for any variant yet.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/staging/media/sunxi/cedrus/Makefile   |   3 +-
+ drivers/staging/media/sunxi/cedrus/cedrus.c   |  55 +++
+ drivers/staging/media/sunxi/cedrus/cedrus.h   |  21 +
+ .../staging/media/sunxi/cedrus/cedrus_avs.c   | 446 ++++++++++++++++++
+ .../staging/media/sunxi/cedrus/cedrus_dec.c   |  17 +-
+ .../staging/media/sunxi/cedrus/cedrus_hw.c    |   3 +-
+ .../staging/media/sunxi/cedrus/cedrus_regs.h  |  88 ++++
+ .../staging/media/sunxi/cedrus/cedrus_video.c |  15 +
+ .../staging/media/sunxi/cedrus/cedrus_video.h |   2 +
+ 9 files changed, 646 insertions(+), 4 deletions(-)
+ create mode 100644 drivers/staging/media/sunxi/cedrus/cedrus_avs.c
+
+diff --git a/drivers/staging/media/sunxi/cedrus/Makefile b/drivers/staging/media/sunxi/cedrus/Makefile
+index 47b9ce781..5c352ed0c 100644
+--- a/drivers/staging/media/sunxi/cedrus/Makefile
++++ b/drivers/staging/media/sunxi/cedrus/Makefile
+@@ -4,4 +4,5 @@ obj-$(CONFIG_VIDEO_SUNXI_CEDRUS) += sunxi-cedrus.o
+ sunxi-cedrus-y = cedrus.o cedrus_video.o cedrus_hw.o cedrus_dec.o \
+ 		 cedrus_mpeg2.o cedrus_h264.o cedrus_h265.o \
+ 		 cedrus_vp8.o cedrus_vp9.o cedrus_vc1.o \
+-		 cedrus_mpeg4.o cedrus_avs2.o cedrus_jpeg.o
++		 cedrus_mpeg4.o cedrus_avs2.o cedrus_jpeg.o \
++		 cedrus_avs.o
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+index 7fbdca8ac..5964b65af 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -186,6 +186,28 @@ static int cedrus_try_ctrl(struct v4l2_ctrl *ctrl)
+ 			ctx->bit_depth = bit_depth;
+ 			cedrus_reset_cap_format(ctx);
+ 		}
++	} else if (ctrl->id == V4L2_CID_STATELESS_AVS_SEQUENCE) {
++		const struct v4l2_ctrl_avs_sequence *seq =
++			ctrl->p_new.p_avs_sequence;
++		struct cedrus_ctx *ctx = container_of(ctrl->handler,
++						      struct cedrus_ctx, hdl);
++		struct vb2_queue *vq;
++
++		/* Only 8-bit 4:2:0 is supported */
++		if (seq->chroma_format != 1 || seq->sample_precision != 1)
++			return -EINVAL;
++
++		if (cedrus_check_pic_size(ctx, seq->horizontal_size,
++					  seq->vertical_size))
++			return -EINVAL;
++
++		vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx,
++				     V4L2_BUF_TYPE_VIDEO_CAPTURE);
++
++		if (!vb2_is_busy(vq) && ctx->bit_depth != 8) {
++			ctx->bit_depth = 8;
++			cedrus_reset_cap_format(ctx);
++		}
+ 	} else if (ctrl->id == V4L2_CID_STATELESS_VC1_SEQUENCE) {
+ 		const struct v4l2_ctrl_vc1_sequence *seq = ctrl->p_new.p_vc1_sequence;
+ 
+@@ -574,6 +596,25 @@ static const struct cedrus_control cedrus_controls[] = {
+ 		},
+ 		.capabilities	= CEDRUS_CAPABILITY_AVS2_DEC,
+ 	},
++	{
++		.cfg = {
++			.id	= V4L2_CID_STATELESS_AVS_SEQUENCE,
++			.ops	= &cedrus_ctrl_ops,
++		},
++		.capabilities	= CEDRUS_CAPABILITY_AVS_DEC,
++	},
++	{
++		.cfg = {
++			.id	= V4L2_CID_STATELESS_AVS_PICTURE,
++		},
++		.capabilities	= CEDRUS_CAPABILITY_AVS_DEC,
++	},
++	{
++		.cfg = {
++			.id	= V4L2_CID_STATELESS_AVS_WEIGHT_QUANT,
++		},
++		.capabilities	= CEDRUS_CAPABILITY_AVS_DEC,
++	},
+ };
+ 
+ #define CEDRUS_CONTROLS_COUNT	ARRAY_SIZE(cedrus_controls)
+@@ -701,6 +742,20 @@ static int cedrus_request_validate(struct media_request *req)
+ 		return -EINVAL;
+ 	}
+ 
++	/*
++	 * Each AVS picture comes with its sequence and picture headers;
++	 * there is no sensible default for either.
++	 */
++	if (ctx->src_fmt.pixelformat == V4L2_PIX_FMT_AVS_FRAME &&
++	    (!cedrus_ctrl_in_request(ctx, req,
++				     V4L2_CID_STATELESS_AVS_SEQUENCE) ||
++	     !cedrus_ctrl_in_request(ctx, req,
++				     V4L2_CID_STATELESS_AVS_PICTURE))) {
++		v4l2_info(&ctx->dev->v4l2_dev,
++			  "Missing required codec control(s)\n");
++		return -ENOENT;
++	}
++
+ 	return vb2_request_validate(req);
+ }
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+index 28caf9016..5c927a0c7 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -39,6 +39,7 @@
+ #define CEDRUS_CAPABILITY_MPEG4_DEC	BIT(8)
+ #define CEDRUS_CAPABILITY_AVS2_DEC	BIT(9)
+ #define CEDRUS_CAPABILITY_JPEG_DEC	BIT(10)
++#define CEDRUS_CAPABILITY_AVS_DEC	BIT(11)
+ 
+ #define CEDRUS_VC1_MIN_WIDTH		128
+ 
+@@ -141,6 +142,12 @@ struct cedrus_avs2_run {
+ 	const struct v4l2_ctrl_avs2_alf			*alf;
+ };
+ 
++struct cedrus_avs_run {
++	const struct v4l2_ctrl_avs_sequence		*sequence;
++	const struct v4l2_ctrl_avs_picture		*picture;
++	const struct v4l2_ctrl_avs_weight_quant		*weight_quant;
++};
++
+ struct cedrus_run {
+ 	struct vb2_v4l2_buffer	*src;
+ 	struct vb2_v4l2_buffer	*dst;
+@@ -154,6 +161,7 @@ struct cedrus_run {
+ 		struct cedrus_vc1_run	vc1;
+ 		struct cedrus_mpeg4_run	mpeg4;
+ 		struct cedrus_avs2_run	avs2;
++		struct cedrus_avs_run	avs;
+ 	};
+ };
+ 
+@@ -191,6 +199,11 @@ struct cedrus_buffer {
+ 			dma_addr_t	mv_col_buf_dma;
+ 			ssize_t		mv_col_buf_size;
+ 		} avs2;
++		struct {
++			void		*mv_col_buf;
++			dma_addr_t	mv_col_buf_dma;
++			ssize_t		mv_col_buf_size;
++		} avs;
+ 	} codec;
+ };
+ 
+@@ -267,6 +280,13 @@ struct cedrus_ctx {
+ 		struct {
+ 			unsigned int	subsampling;
+ 		} jpeg;
++		struct {
++			void		*mb_info_buf;
++			dma_addr_t	mb_info_buf_dma;
++			size_t		mb_info_buf_size;
++			/* 16 KiB aligned address in the buffer */
++			dma_addr_t	mb_info_buf_addr;
++		} avs;
+ 	} codec;
+ };
+ 
+@@ -357,6 +377,7 @@ extern struct cedrus_dec_ops cedrus_dec_ops_vc1;
+ extern struct cedrus_dec_ops cedrus_dec_ops_mpeg4;
+ extern struct cedrus_dec_ops cedrus_dec_ops_avs2;
+ extern struct cedrus_dec_ops cedrus_dec_ops_jpeg;
++extern struct cedrus_dec_ops cedrus_dec_ops_avs;
+ 
+ static inline void cedrus_write(struct cedrus_dev *dev, u32 reg, u32 val)
+ {
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_avs.c b/drivers/staging/media/sunxi/cedrus/cedrus_avs.c
+new file mode 100644
+index 000000000..340f84eb8
+--- /dev/null
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_avs.c
+@@ -0,0 +1,446 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Cedrus VPU driver: AVS1 (GB/T 20090.2 JiZhun) and AVS+ (GY/T 257.1
++ * Guangdian) decoding
++ *
++ * The decoder runs in the H.264 engine slot of the video engine, like VP8,
++ * selected by a mode bit of the control register. Software parses the
++ * sequence and picture headers; the engine is started once per picture,
++ * parses the slice headers itself and decodes all the slices of the
++ * picture, of both fields for a field coded picture. It removes the
++ * pseudo start code bits from the slice data itself.
++ *
++ * The register sequence was recovered, for interoperability, from the
++ * debug information and the disassembly of the vendor libawavs.so
++ * (libcedarc); no vendor code is used.
++ */
++
++#include <linux/types.h>
++
++#include <media/videobuf2-dma-contig.h>
++
++#include "cedrus.h"
++#include "cedrus_hw.h"
++#include "cedrus_regs.h"
++
++/* Macroblock neighbour information, whatever the picture size. */
++#define CEDRUS_AVS_MB_INFO_BUF_SIZE	(48 * SZ_1K)
++#define CEDRUS_AVS_MB_INFO_BUF_ALIGN	SZ_16K
++/* Co-located motion vectors: 32 bytes per macroblock. */
++#define CEDRUS_AVS_MV_COL_MB_SIZE	32
++
++#define CEDRUS_AVS_GUANGDIAN_FLAGS \
++	(V4L2_AVS_PICTURE_FLAG_NO_FORWARD_REFERENCE | \
++	 V4L2_AVS_PICTURE_FLAG_PB_FIELD_ENHANCED | \
++	 V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT | \
++	 V4L2_AVS_PICTURE_FLAG_AEC)
++
++static enum cedrus_irq_status cedrus_avs_irq_status(struct cedrus_ctx *ctx)
++{
++	struct cedrus_dev *dev = ctx->dev;
++	u32 reg = cedrus_read(dev, VE_H264_STATUS);
++
++	/*
++	 * The whole picture is in the buffer, so a request for more data
++	 * means that the picture is truncated or corrupted.
++	 */
++	if (reg & (VE_H264_STATUS_DECODE_ERR_INT |
++		   VE_H264_STATUS_VLD_DATA_REQ_INT)) {
++		dev_warn_ratelimited(dev->dev,
++				     "AVS decode error: status %#x, error case %#x, mb %u\n",
++				     reg, cedrus_read(dev, VE_H264_ERROR_CASE),
++				     cedrus_read(dev, VE_H264_CUR_MB_NUM) & 0xffff);
++		return CEDRUS_IRQ_ERROR;
++	}
++
++	if (reg & VE_H264_STATUS_SLICE_DECODE_INT) {
++		dev_dbg(dev->dev, "AVS picture done: status %#x, mb %u\n",
++			reg, cedrus_read(dev, VE_H264_CUR_MB_NUM) & 0xffff);
++		return CEDRUS_IRQ_OK;
++	}
++
++	return CEDRUS_IRQ_NONE;
++}
++
++static void cedrus_avs_irq_clear(struct cedrus_ctx *ctx)
++{
++	cedrus_write(ctx->dev, VE_H264_STATUS, VE_H264_STATUS_INT_MASK);
++}
++
++static void cedrus_avs_irq_disable(struct cedrus_ctx *ctx)
++{
++	struct cedrus_dev *dev = ctx->dev;
++	u32 reg = cedrus_read(dev, VE_H264_CTRL);
++
++	cedrus_write(dev, VE_H264_CTRL, reg & ~VE_H264_CTRL_INT_MASK);
++}
++
++static int cedrus_avs_mv_col_alloc(struct cedrus_ctx *ctx,
++				   struct cedrus_buffer *buf)
++{
++	unsigned int mb_width, mb_height;
++
++	if (buf->codec.avs.mv_col_buf_size)
++		return 0;
++
++	/* The vendor library rounds the macroblock counts as follows. */
++	mb_width = ((ctx->src_fmt.width + 63) >> 4) & ~3;
++	mb_height = ((ctx->src_fmt.height + 63) >> 4) & ~3;
++
++	buf->codec.avs.mv_col_buf_size =
++		mb_width * mb_height * CEDRUS_AVS_MV_COL_MB_SIZE;
++
++	/* Buffer is never accessed by CPU, so we can skip kernel mapping. */
++	buf->codec.avs.mv_col_buf =
++		dma_alloc_attrs(ctx->dev->dev, buf->codec.avs.mv_col_buf_size,
++				&buf->codec.avs.mv_col_buf_dma, GFP_KERNEL,
++				DMA_ATTR_NO_KERNEL_MAPPING);
++	if (!buf->codec.avs.mv_col_buf) {
++		buf->codec.avs.mv_col_buf_size = 0;
++		return -ENOMEM;
++	}
++
++	return 0;
++}
++
++static struct vb2_buffer *cedrus_avs_ref_buf(struct vb2_queue *vq,
++					     const struct v4l2_avs_ref_pic *ref)
++{
++	if (!(ref->flags & V4L2_AVS_REF_FLAG_VALID))
++		return NULL;
++
++	return vb2_find_buffer(vq, ref->timestamp);
++}
++
++static u8 cedrus_avs_ref_distance(const struct v4l2_avs_ref_pic *ref)
++{
++	return (ref->flags & V4L2_AVS_REF_FLAG_VALID) ?
++	       ref->picture_distance : 0;
++}
++
++static void cedrus_avs_write_ref(struct cedrus_ctx *ctx,
++				 struct vb2_buffer *buf, struct vb2_buffer *cur,
++				 u32 luma_reg, u32 chroma_reg)
++{
++	struct cedrus_dev *dev = ctx->dev;
++
++	/* A missing reference is replaced by the current picture. */
++	if (!buf)
++		buf = cur;
++
++	cedrus_write(dev, luma_reg, cedrus_dst_buf_addr(ctx, buf, 0));
++	cedrus_write(dev, chroma_reg, cedrus_dst_buf_addr(ctx, buf, 1));
++}
++
++static int cedrus_avs_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
++{
++	const struct v4l2_ctrl_avs_sequence *seq = run->avs.sequence;
++	const struct v4l2_ctrl_avs_picture *pic = run->avs.picture;
++	const struct v4l2_ctrl_avs_weight_quant *wq = run->avs.weight_quant;
++	const struct v4l2_avs_ref_pic *fwd, *bwd, *prev_fwd;
++	struct vb2_buffer *src_buf = &run->src->vb2_buf;
++	struct vb2_buffer *dst_buf = &run->dst->vb2_buf;
++	struct cedrus_dev *dev = ctx->dev;
++	struct cedrus_buffer *cedrus_buf;
++	struct vb2_buffer *fwd_buf, *bwd_buf;
++	struct vb2_queue *vq;
++	dma_addr_t src_addr, mv_col_addr;
++	size_t payload, plane_size;
++	u32 reg, ctrl;
++	int ret;
++
++	if (!seq || !pic)
++		return -EINVAL;
++
++	payload = vb2_get_plane_payload(src_buf, 0);
++	plane_size = vb2_plane_size(src_buf, 0);
++	if (pic->data_offset >= payload)
++		return -EINVAL;
++
++	if (seq->horizontal_size > ctx->src_fmt.width ||
++	    seq->vertical_size > ctx->src_fmt.height)
++		return -EINVAL;
++
++	if (seq->profile_id == V4L2_AVS_PROFILE_JIZHUN &&
++	    (pic->flags & CEDRUS_AVS_GUANGDIAN_FLAGS))
++		return -EINVAL;
++
++	if ((pic->flags & V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT) && !wq)
++		return -EINVAL;
++
++	cedrus_buf = vb2_to_cedrus_buffer(dst_buf);
++	ret = cedrus_avs_mv_col_alloc(ctx, cedrus_buf);
++	if (ret)
++		return ret;
++
++	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE);
++
++	/*
++	 * A P picture has two forward references; the engine takes the
++	 * second one where a B picture has its backward reference.
++	 */
++	fwd = &pic->refs[V4L2_AVS_REF_FORWARD];
++	prev_fwd = &pic->refs[V4L2_AVS_REF_SECOND_FORWARD];
++	if (pic->picture_type == V4L2_AVS_PICTURE_TYPE_B)
++		bwd = &pic->refs[V4L2_AVS_REF_BACKWARD];
++	else
++		bwd = prev_fwd;
++
++	fwd_buf = cedrus_avs_ref_buf(vq, fwd);
++	/* The vendor library gives an I picture itself as second reference. */
++	bwd_buf = pic->picture_type == V4L2_AVS_PICTURE_TYPE_I ? NULL :
++		  cedrus_avs_ref_buf(vq, bwd);
++
++	/*
++	 * I and P pictures write their co-located motion vectors, which the
++	 * B pictures that follow read from their backward reference.
++	 */
++	mv_col_addr = cedrus_buf->codec.avs.mv_col_buf_dma;
++	if (pic->picture_type == V4L2_AVS_PICTURE_TYPE_B && bwd_buf) {
++		struct cedrus_buffer *bwd_cbuf = vb2_to_cedrus_buffer(bwd_buf);
++
++		if (bwd_cbuf->codec.avs.mv_col_buf_size)
++			mv_col_addr = bwd_cbuf->codec.avs.mv_col_buf_dma;
++	}
++
++	/* Activate the H.264 engine, which also decodes AVS. */
++	cedrus_engine_enable(ctx);
++
++	src_addr = vb2_dma_contig_plane_dma_addr(src_buf, 0);
++
++	ctrl = VE_AVS_CTRL_IS_AVS | VE_H264_CTRL_INT_MASK;
++	cedrus_write(dev, VE_H264_CTRL, ctrl);
++
++	reg = VE_AVS_PIC_MB_SIZE_HEIGHT(seq->vertical_size) |
++	      VE_AVS_PIC_MB_SIZE_WIDTH(seq->horizontal_size);
++	cedrus_write(dev, VE_AVS_PIC_MB_SIZE, reg);
++
++	reg = VE_AVS_PIC_SIZE_HEIGHT(seq->vertical_size) |
++	      VE_AVS_PIC_SIZE_WIDTH(seq->horizontal_size);
++	cedrus_write(dev, VE_AVS_PIC_SIZE, reg);
++
++	/* Sequence header and the AVS+ tools of the picture. */
++	reg = VE_AVS_PIC_SET_PARAM_PROFILE(seq->profile_id) |
++	      VE_AVS_PIC_SET_PARAM_LEVEL(seq->level_id) |
++	      VE_AVS_PIC_SET_PARAM_CHROMA_FORMAT(seq->chroma_format) |
++	      VE_AVS_PIC_SET_PARAM_SAMPLE_PRECISION(seq->sample_precision);
++	if (pic->flags & V4L2_AVS_PICTURE_FLAG_NO_FORWARD_REFERENCE)
++		reg |= VE_AVS_PIC_SET_PARAM_NO_FORWARD_REF;
++	if (pic->flags & V4L2_AVS_PICTURE_FLAG_PB_FIELD_ENHANCED)
++		reg |= VE_AVS_PIC_SET_PARAM_PB_FIELD_ENHANCED;
++	if (pic->flags & V4L2_AVS_PICTURE_FLAG_AEC)
++		reg |= VE_AVS_PIC_SET_PARAM_AEC;
++	if (pic->flags & V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT) {
++		reg |= VE_AVS_PIC_SET_PARAM_WEIGHTING_QUANT;
++		if (wq->flags &
++		    V4L2_AVS_WEIGHT_QUANT_FLAG_CHROMA_QUANT_PARAM_DISABLE)
++			reg |= VE_AVS_PIC_SET_PARAM_CHROMA_QUANT_DISABLE;
++	}
++	cedrus_write(dev, VE_AVS_PIC_SET_PARAM, reg);
++
++	/*
++	 * Weighting quantization: the engine derives the matrices from the
++	 * syntax elements. The deltas are those of the parameter set chosen
++	 * by the index, zero for the default parameters.
++	 */
++	if (pic->flags & V4L2_AVS_PICTURE_FLAG_WEIGHTING_QUANT) {
++		const s16 *delta = NULL;
++		u8 d[V4L2_AVS_WEIGHT_QUANT_NUM_PARAMS] = {};
++		unsigned int i;
++
++		if (wq->weighting_quant_param_index == 1)
++			delta = wq->weighting_quant_param_delta1;
++		else if (wq->weighting_quant_param_index == 2)
++			delta = wq->weighting_quant_param_delta2;
++
++		for (i = 0; delta && i < ARRAY_SIZE(d); i++)
++			d[i] = delta[i];
++
++		reg = VE_AVS_WEIGHT_QUANT1_DELTA1(d[1]) |
++		      VE_AVS_WEIGHT_QUANT1_DELTA0(d[0]) |
++		      VE_AVS_WEIGHT_QUANT1_MODEL(wq->weighting_quant_model) |
++		      VE_AVS_WEIGHT_QUANT1_PARAM_INDEX(wq->weighting_quant_param_index) |
++		      VE_AVS_WEIGHT_QUANT1_DELTA_CR(wq->chroma_quant_param_delta_cr) |
++		      VE_AVS_WEIGHT_QUANT1_DELTA_CB(wq->chroma_quant_param_delta_cb);
++		cedrus_write(dev, VE_AVS_WEIGHT_QUANT1, reg);
++
++		reg = VE_AVS_WEIGHT_QUANT2_DELTA5(d[5]) |
++		      VE_AVS_WEIGHT_QUANT2_DELTA4(d[4]) |
++		      VE_AVS_WEIGHT_QUANT2_DELTA3(d[3]) |
++		      VE_AVS_WEIGHT_QUANT2_DELTA2(d[2]);
++		cedrus_write(dev, VE_AVS_WEIGHT_QUANT2, reg);
++	} else {
++		cedrus_write(dev, VE_AVS_WEIGHT_QUANT1, 0);
++		cedrus_write(dev, VE_AVS_WEIGHT_QUANT2, 0);
++	}
++
++	/*
++	 * Picture distances as coded; the engine derives the temporal
++	 * distances. The fourth one is that of the second forward reference
++	 * of an I or P picture, and for a B picture that of the reference
++	 * before its forward reference.
++	 */
++	reg = VE_AVS_PIC_DIST_CUR(pic->picture_distance) |
++	      VE_AVS_PIC_DIST_FWD(cedrus_avs_ref_distance(fwd)) |
++	      VE_AVS_PIC_DIST_PREV_FWD(cedrus_avs_ref_distance(prev_fwd));
++	if (pic->picture_type == V4L2_AVS_PICTURE_TYPE_B)
++		reg |= VE_AVS_PIC_DIST_BWD(cedrus_avs_ref_distance(bwd));
++	cedrus_write(dev, VE_AVS_PIC_DIST, reg);
++
++	/* Picture header. */
++	reg = VE_AVS_PIC_PARAM_TYPE(pic->picture_type) |
++	      VE_AVS_PIC_PARAM_QP(pic->picture_qp) |
++	      VE_AVS_PIC_PARAM_ALPHA_C_OFFSET(pic->alpha_c_offset) |
++	      VE_AVS_PIC_PARAM_BETA_OFFSET(pic->beta_offset);
++	if (pic->flags & V4L2_AVS_PICTURE_FLAG_PICTURE_STRUCTURE)
++		reg |= VE_AVS_PIC_PARAM_FRAME;
++	if (pic->flags & V4L2_AVS_PICTURE_FLAG_PROGRESSIVE_FRAME)
++		reg |= VE_AVS_PIC_PARAM_PROGRESSIVE_FRAME;
++	if (pic->flags & V4L2_AVS_PICTURE_FLAG_TOP_FIELD_FIRST)
++		reg |= VE_AVS_PIC_PARAM_TOP_FIELD_FIRST;
++	if (pic->flags & V4L2_AVS_PICTURE_FLAG_PICTURE_REFERENCE)
++		reg |= VE_AVS_PIC_PARAM_PICTURE_REFERENCE;
++	if (pic->flags & V4L2_AVS_PICTURE_FLAG_ADVANCED_PRED_MODE_DISABLE)
++		reg |= VE_AVS_PIC_PARAM_ADVANCED_PRED_DISABLE;
++	if (pic->flags & V4L2_AVS_PICTURE_FLAG_SKIP_MODE)
++		reg |= VE_AVS_PIC_PARAM_SKIP_MODE;
++	if (pic->flags & V4L2_AVS_PICTURE_FLAG_FIXED_PICTURE_QP)
++		reg |= VE_AVS_PIC_PARAM_FIXED_QP;
++	if (pic->flags & V4L2_AVS_PICTURE_FLAG_LOOP_FILTER_DISABLE)
++		reg |= VE_AVS_PIC_PARAM_LOOP_FILTER_DISABLE;
++
++	/* Coding of the references; the vendor library leaves it 0 for I. */
++	if (pic->picture_type != V4L2_AVS_PICTURE_TYPE_I) {
++		if (fwd->flags & V4L2_AVS_REF_FLAG_PICTURE_STRUCTURE)
++			reg |= VE_AVS_PIC_PARAM_FWD_FRAME;
++		if (fwd->flags & V4L2_AVS_REF_FLAG_TOP_FIELD_FIRST)
++			reg |= VE_AVS_PIC_PARAM_FWD_TOP_FIELD_FIRST;
++		if (fwd->flags & V4L2_AVS_REF_FLAG_INTRA)
++			reg |= VE_AVS_PIC_PARAM_FWD_INTRA;
++		if (bwd->flags & V4L2_AVS_REF_FLAG_PICTURE_STRUCTURE)
++			reg |= VE_AVS_PIC_PARAM_BWD_FRAME;
++		if (bwd->flags & V4L2_AVS_REF_FLAG_TOP_FIELD_FIRST)
++			reg |= VE_AVS_PIC_PARAM_BWD_TOP_FIELD_FIRST;
++		if (bwd->flags & V4L2_AVS_REF_FLAG_INTRA)
++			reg |= VE_AVS_PIC_PARAM_BWD_INTRA;
++	}
++	cedrus_write(dev, VE_AVS_PIC_PARAM, reg);
++
++	ctrl |= VE_AVS_CTRL_MCRI_CACHE_EN;
++	cedrus_write(dev, VE_H264_CTRL, ctrl);
++
++	cedrus_write(dev, VE_AVS_MV_COL_ADDR, mv_col_addr);
++	cedrus_write(dev, VE_AVS_MB_INFO_ADDR, ctx->codec.avs.mb_info_buf_addr);
++
++	/* Reconstruction and references. */
++	cedrus_write(dev, VE_AVS_REC_LUMA, cedrus_dst_buf_addr(ctx, dst_buf, 0));
++	cedrus_write(dev, VE_AVS_REC_CHROMA,
++		     cedrus_dst_buf_addr(ctx, dst_buf, 1));
++	cedrus_avs_write_ref(ctx, fwd_buf, dst_buf,
++			     VE_AVS_FWD_LUMA, VE_AVS_FWD_CHROMA);
++	cedrus_avs_write_ref(ctx, bwd_buf, dst_buf,
++			     VE_AVS_BWD_LUMA, VE_AVS_BWD_CHROMA);
++
++	/* The engine removes the pseudo start code bits of the slice data. */
++	ctrl |= VE_AVS_CTRL_PSEUDO_START_CODE_REMOVE;
++	cedrus_write(dev, VE_H264_CTRL, ctrl);
++
++	/* Bitstream, from the first slice start code to the end of the data. */
++	cedrus_write(dev, VE_H264_VLD_OFFSET, pic->data_offset * 8);
++	cedrus_write(dev, VE_H264_VLD_LEN, (payload - pic->data_offset) * 8);
++	cedrus_write(dev, VE_H264_VLD_ADDR,
++		     VE_H264_VLD_ADDR_VAL(src_addr) |
++		     VE_H264_VLD_ADDR_FIRST | VE_H264_VLD_ADDR_VALID |
++		     VE_H264_VLD_ADDR_LAST);
++	cedrus_write(dev, VE_H264_VLD_END, src_addr + plane_size);
++
++	/* Reset the registers changed by the hardware. */
++	cedrus_write(dev, VE_H264_MB_ADDR, 0);
++	cedrus_write(dev, VE_H264_ERROR_CASE, 0);
++	cedrus_write(dev, VE_H264_CUR_MB_NUM, 0);
++
++	/* Initialize bitstream access. */
++	cedrus_write(dev, VE_H264_TRIGGER_TYPE,
++		     VE_AVS_TRIGGER_STCD_TYPE(1) |
++		     VE_H264_TRIGGER_TYPE_INIT_SWDEC);
++
++	return 0;
++}
++
++static int cedrus_avs_start(struct cedrus_ctx *ctx)
++{
++	struct cedrus_dev *dev = ctx->dev;
++
++	/*
++	 * Allocate enough to place the buffer on a 16 KiB boundary, which
++	 * the vendor library computes for it (but does not program).
++	 */
++	ctx->codec.avs.mb_info_buf_size = CEDRUS_AVS_MB_INFO_BUF_SIZE +
++					  CEDRUS_AVS_MB_INFO_BUF_ALIGN;
++	ctx->codec.avs.mb_info_buf =
++		dma_alloc_attrs(dev->dev, ctx->codec.avs.mb_info_buf_size,
++				&ctx->codec.avs.mb_info_buf_dma, GFP_KERNEL,
++				DMA_ATTR_NO_KERNEL_MAPPING);
++	if (!ctx->codec.avs.mb_info_buf)
++		return -ENOMEM;
++
++	ctx->codec.avs.mb_info_buf_addr =
++		ALIGN(ctx->codec.avs.mb_info_buf_dma,
++		      CEDRUS_AVS_MB_INFO_BUF_ALIGN);
++
++	return 0;
++}
++
++static void cedrus_avs_buf_cleanup(struct cedrus_ctx *ctx,
++				   struct cedrus_buffer *buf)
++{
++	if (buf->codec.avs.mv_col_buf_size > 0) {
++		dma_free_attrs(ctx->dev->dev, buf->codec.avs.mv_col_buf_size,
++			       buf->codec.avs.mv_col_buf,
++			       buf->codec.avs.mv_col_buf_dma,
++			       DMA_ATTR_NO_KERNEL_MAPPING);
++
++		buf->codec.avs.mv_col_buf_size = 0;
++	}
++}
++
++static void cedrus_avs_stop(struct cedrus_ctx *ctx)
++{
++	struct cedrus_dev *dev = ctx->dev;
++	struct vb2_queue *vq;
++	unsigned int i;
++
++	vq = v4l2_m2m_get_vq(ctx->fh.m2m_ctx, V4L2_BUF_TYPE_VIDEO_CAPTURE);
++
++	for (i = 0; i < vb2_get_num_buffers(vq); i++) {
++		struct vb2_buffer *vb = vb2_get_buffer(vq, i);
++
++		if (!vb)
++			continue;
++
++		cedrus_avs_buf_cleanup(ctx, vb2_to_cedrus_buffer(vb));
++	}
++
++	dma_free_attrs(dev->dev, ctx->codec.avs.mb_info_buf_size,
++		       ctx->codec.avs.mb_info_buf,
++		       ctx->codec.avs.mb_info_buf_dma,
++		       DMA_ATTR_NO_KERNEL_MAPPING);
++}
++
++static void cedrus_avs_trigger(struct cedrus_ctx *ctx)
++{
++	cedrus_write(ctx->dev, VE_H264_TRIGGER_TYPE,
++		     VE_AVS_TRIGGER_STCD_TYPE(1) |
++		     VE_AVS_TRIGGER_TYPE_PIC_DECODE);
++}
++
++struct cedrus_dec_ops cedrus_dec_ops_avs = {
++	.irq_clear	= cedrus_avs_irq_clear,
++	.irq_disable	= cedrus_avs_irq_disable,
++	.irq_status	= cedrus_avs_irq_status,
++	.setup		= cedrus_avs_setup,
++	.start		= cedrus_avs_start,
++	.stop		= cedrus_avs_stop,
++	.buf_cleanup	= cedrus_avs_buf_cleanup,
++	.trigger	= cedrus_avs_trigger,
++};
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+index 5346c6f48..7942d49f3 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+@@ -159,6 +159,15 @@ void cedrus_device_run(void *priv)
+ 			cedrus_find_control_data(ctx, V4L2_CID_STATELESS_AVS2_ALF);
+ 		break;
+ 
++	case V4L2_PIX_FMT_AVS_FRAME:
++		run.avs.sequence =
++			cedrus_find_control_data(ctx, V4L2_CID_STATELESS_AVS_SEQUENCE);
++		run.avs.picture =
++			cedrus_find_control_data(ctx, V4L2_CID_STATELESS_AVS_PICTURE);
++		run.avs.weight_quant =
++			cedrus_find_control_data(ctx, V4L2_CID_STATELESS_AVS_WEIGHT_QUANT);
++		break;
++
+ 	default:
+ 		break;
+ 	}
+@@ -174,14 +183,18 @@ void cedrus_device_run(void *priv)
+ 	 * library does whenever it sets up a decoder; every job programs all
+ 	 * the registers and SRAM it uses. AVS2 shares the H.265 engine slot
+ 	 * in another decoder mode (bits 31:30 of register 0x04) and is reset
+-	 * the same way.
++	 * the same way, as is AVS, which shares the H.264 engine slot with
++	 * H.264 and VP8 in another mode (bit 28 of its control register)
++	 * and gives its registers there an AVS specific meaning.
+ 	 */
+ 	if (dev->last_src_pixelformat &&
+ 	    dev->last_src_pixelformat != ctx->src_fmt.pixelformat &&
+ 	    (dev->last_src_pixelformat == V4L2_PIX_FMT_VP9_FRAME ||
+ 	     ctx->src_fmt.pixelformat == V4L2_PIX_FMT_VP9_FRAME ||
+ 	     dev->last_src_pixelformat == V4L2_PIX_FMT_AVS2_FRAME ||
+-	     ctx->src_fmt.pixelformat == V4L2_PIX_FMT_AVS2_FRAME))
++	     ctx->src_fmt.pixelformat == V4L2_PIX_FMT_AVS2_FRAME ||
++	     dev->last_src_pixelformat == V4L2_PIX_FMT_AVS_FRAME ||
++	     ctx->src_fmt.pixelformat == V4L2_PIX_FMT_AVS_FRAME))
+ 		reset_control_reset(dev->rstc);
+ 	dev->last_src_pixelformat = ctx->src_fmt.pixelformat;
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+index 0366c87ee..08edea898 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -56,9 +56,10 @@ int cedrus_engine_enable(struct cedrus_ctx *ctx)
+ 		reg |= VE_MODE_DEC_MPEG;
+ 		break;
+ 
+-	/* H.264 and VP8 both use the same decoding mode bit. */
++	/* H.264, VP8 and AVS all use the same decoding mode bit. */
+ 	case V4L2_PIX_FMT_H264_SLICE:
+ 	case V4L2_PIX_FMT_VP8_FRAME:
++	case V4L2_PIX_FMT_AVS_FRAME:
+ 		reg |= VE_MODE_DEC_H264;
+ 		break;
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+index b4b1be3b9..dc2ff8c92 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+@@ -959,6 +959,94 @@
+ #define VE_VP8_LF_DELTA1(v)			SHIFT_AND_MASK_BITS(v, 14, 8)
+ #define VE_VP8_LF_DELTA0(v)			SHIFT_AND_MASK_BITS(v, 6, 0)
+ 
++/*
++ * AVS1 / AVS+ decoder, in the H.264 engine slot (VE_MODE_DEC_H264). The
++ * control, trigger, status and bitstream registers are the H.264 ones;
++ * the others have an AVS specific meaning. The layout was recovered, for
++ * interoperability, from the debug information of the vendor libawavs.so
++ * (libcedarc, Allwinner); see harness/research/avs1/regmap.md in the
++ * integration tree.
++ */
++#define VE_AVS_PIC_SET_PARAM		0x204
++#define VE_AVS_PIC_SET_PARAM_PROFILE(v)		SHIFT_AND_MASK_BITS(v, 7, 0)
++#define VE_AVS_PIC_SET_PARAM_LEVEL(v)		SHIFT_AND_MASK_BITS(v, 15, 8)
++#define VE_AVS_PIC_SET_PARAM_CHROMA_FORMAT(v)	SHIFT_AND_MASK_BITS(v, 17, 16)
++#define VE_AVS_PIC_SET_PARAM_SAMPLE_PRECISION(v) SHIFT_AND_MASK_BITS(v, 20, 18)
++#define VE_AVS_PIC_SET_PARAM_NO_FORWARD_REF	BIT(22)
++#define VE_AVS_PIC_SET_PARAM_PB_FIELD_ENHANCED	BIT(23)
++#define VE_AVS_PIC_SET_PARAM_AEC		BIT(24)
++#define VE_AVS_PIC_SET_PARAM_WEIGHTING_QUANT	BIT(25)
++#define VE_AVS_PIC_SET_PARAM_CHROMA_QUANT_DISABLE BIT(26)
++
++#define VE_AVS_WEIGHT_QUANT1		0x20c
++#define VE_AVS_WEIGHT_QUANT1_DELTA1(v)		SHIFT_AND_MASK_BITS(v, 7, 0)
++#define VE_AVS_WEIGHT_QUANT1_DELTA0(v)		SHIFT_AND_MASK_BITS(v, 15, 8)
++#define VE_AVS_WEIGHT_QUANT1_MODEL(v)		SHIFT_AND_MASK_BITS(v, 17, 16)
++#define VE_AVS_WEIGHT_QUANT1_PARAM_INDEX(v)	SHIFT_AND_MASK_BITS(v, 19, 18)
++#define VE_AVS_WEIGHT_QUANT1_DELTA_CR(v)	SHIFT_AND_MASK_BITS(v, 25, 20)
++#define VE_AVS_WEIGHT_QUANT1_DELTA_CB(v)	SHIFT_AND_MASK_BITS(v, 31, 26)
++
++#define VE_AVS_WEIGHT_QUANT2		0x210
++#define VE_AVS_WEIGHT_QUANT2_DELTA5(v)		SHIFT_AND_MASK_BITS(v, 7, 0)
++#define VE_AVS_WEIGHT_QUANT2_DELTA4(v)		SHIFT_AND_MASK_BITS(v, 15, 8)
++#define VE_AVS_WEIGHT_QUANT2_DELTA3(v)		SHIFT_AND_MASK_BITS(v, 23, 16)
++#define VE_AVS_WEIGHT_QUANT2_DELTA2(v)		SHIFT_AND_MASK_BITS(v, 31, 24)
++
++#define VE_AVS_PIC_PARAM		0x214
++#define VE_AVS_PIC_PARAM_ALPHA_C_OFFSET(v)	SHIFT_AND_MASK_BITS(v, 4, 0)
++#define VE_AVS_PIC_PARAM_FWD_FRAME		BIT(5)
++#define VE_AVS_PIC_PARAM_FWD_TOP_FIELD_FIRST	BIT(6)
++#define VE_AVS_PIC_PARAM_FWD_INTRA		BIT(7)
++#define VE_AVS_PIC_PARAM_BETA_OFFSET(v)		SHIFT_AND_MASK_BITS(v, 12, 8)
++#define VE_AVS_PIC_PARAM_BWD_FRAME		BIT(13)
++#define VE_AVS_PIC_PARAM_BWD_TOP_FIELD_FIRST	BIT(14)
++#define VE_AVS_PIC_PARAM_BWD_INTRA		BIT(15)
++#define VE_AVS_PIC_PARAM_QP(v)			SHIFT_AND_MASK_BITS(v, 21, 16)
++#define VE_AVS_PIC_PARAM_LOOP_FILTER_DISABLE	BIT(22)
++#define VE_AVS_PIC_PARAM_FIXED_QP		BIT(23)
++#define VE_AVS_PIC_PARAM_SKIP_MODE		BIT(24)
++#define VE_AVS_PIC_PARAM_ADVANCED_PRED_DISABLE	BIT(25)
++#define VE_AVS_PIC_PARAM_PICTURE_REFERENCE	BIT(26)
++#define VE_AVS_PIC_PARAM_TOP_FIELD_FIRST	BIT(27)
++#define VE_AVS_PIC_PARAM_PROGRESSIVE_FRAME	BIT(28)
++#define VE_AVS_PIC_PARAM_FRAME			BIT(29)
++#define VE_AVS_PIC_PARAM_TYPE(v)		SHIFT_AND_MASK_BITS(v, 31, 30)
++
++#define VE_AVS_PIC_DIST			0x218
++#define VE_AVS_PIC_DIST_CUR(v)			SHIFT_AND_MASK_BITS(v, 7, 0)
++#define VE_AVS_PIC_DIST_FWD(v)			SHIFT_AND_MASK_BITS(v, 15, 8)
++#define VE_AVS_PIC_DIST_BWD(v)			SHIFT_AND_MASK_BITS(v, 23, 16)
++#define VE_AVS_PIC_DIST_PREV_FWD(v)		SHIFT_AND_MASK_BITS(v, 31, 24)
++
++/* VE_H264_CTRL bits of the AVS mode */
++#define VE_AVS_CTRL_IS_AVS			BIT(28)
++#define VE_AVS_CTRL_PSEUDO_START_CODE_REMOVE	BIT(26)
++#define VE_AVS_CTRL_MCRI_CACHE_EN		BIT(10)
++
++/* VE_H264_TRIGGER_TYPE values of the AVS mode */
++#define VE_AVS_TRIGGER_STCD_TYPE(v)		SHIFT_AND_MASK_BITS(v, 5, 4)
++#define VE_AVS_TRIGGER_TYPE_PIC_DECODE		(9 << 0)
++
++#define VE_AVS_MV_COL_ADDR		0x250
++#define VE_AVS_MB_INFO_ADDR		0x254
++
++#define VE_AVS_PIC_MB_SIZE		0x258
++#define VE_AVS_PIC_MB_SIZE_HEIGHT(h) \
++	SHIFT_AND_MASK_BITS(DIV_ROUND_UP(h, 16), 7, 0)
++#define VE_AVS_PIC_MB_SIZE_WIDTH(w) \
++	SHIFT_AND_MASK_BITS(DIV_ROUND_UP(w, 16), 15, 8)
++
++#define VE_AVS_PIC_SIZE			0x25c
++#define VE_AVS_PIC_SIZE_HEIGHT(h)		SHIFT_AND_MASK_BITS(ALIGN(h, 16), 11, 0)
++#define VE_AVS_PIC_SIZE_WIDTH(w)		SHIFT_AND_MASK_BITS(ALIGN(w, 16), 27, 16)
++
++#define VE_AVS_REC_LUMA			0x2ac
++#define VE_AVS_FWD_LUMA			0x2b0
++#define VE_AVS_BWD_LUMA			0x2b4
++#define VE_AVS_REC_CHROMA		0x2d0
++#define VE_AVS_FWD_CHROMA		0x2d4
++#define VE_AVS_BWD_CHROMA		0x2d8
++
+ #define VE_ISP_INPUT_SIZE		0xa00
+ #define VE_ISP_INPUT_STRIDE		0xa04
+ #define VE_ISP_CTRL			0xa08
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+index b7aa7872d..ade3ae05b 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -65,6 +65,11 @@ static struct cedrus_format cedrus_formats[] = {
+ 		.directions	= CEDRUS_DECODE_SRC,
+ 		.capabilities	= CEDRUS_CAPABILITY_AVS2_DEC,
+ 	},
++	{
++		.pixelformat	= V4L2_PIX_FMT_AVS_FRAME,
++		.directions	= CEDRUS_DECODE_SRC,
++		.capabilities	= CEDRUS_CAPABILITY_AVS_DEC,
++	},
+ 	{
+ 		.pixelformat	= V4L2_PIX_FMT_P010,
+ 		.directions	= CEDRUS_DECODE_DST,
+@@ -209,6 +214,12 @@ void cedrus_max_size(struct cedrus_dev *dev, u32 src_pixelformat,
+ 		*width = dev->h265_max_width;
+ 		*height = dev->h265_max_height;
+ 	}
++
++	/* 1080p is the largest AVS picture the vendor states (H616 UM 4.4.1). */
++	if (src_pixelformat == V4L2_PIX_FMT_AVS_FRAME) {
++		*width = CEDRUS_AVS_MAX_WIDTH;
++		*height = CEDRUS_AVS_MAX_HEIGHT;
++	}
+ }
+ 
+ void cedrus_prepare_format(struct v4l2_pix_format *pix_fmt,
+@@ -236,6 +247,7 @@ void cedrus_prepare_format(struct v4l2_pix_format *pix_fmt,
+ 	case V4L2_PIX_FMT_H263_SLICE:
+ 	case V4L2_PIX_FMT_SPK_SLICE:
+ 	case V4L2_PIX_FMT_AVS2_FRAME:
++	case V4L2_PIX_FMT_AVS_FRAME:
+ 	case V4L2_PIX_FMT_JPEG:
+ 		/* Zero bytes per line for encoded source. */
+ 		bytesperline = 0;
+@@ -555,6 +567,9 @@ static int cedrus_s_fmt_vid_out_p(struct cedrus_ctx *ctx,
+ 	case V4L2_PIX_FMT_AVS2_FRAME:
+ 		ctx->current_codec = &cedrus_dec_ops_avs2;
+ 		break;
++	case V4L2_PIX_FMT_AVS_FRAME:
++		ctx->current_codec = &cedrus_dec_ops_avs;
++		break;
+ 	case V4L2_PIX_FMT_VC1_SLICE:
+ 		ctx->current_codec = &cedrus_dec_ops_vc1;
+ 		break;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.h b/drivers/staging/media/sunxi/cedrus/cedrus_video.h
+index 93b597071..e8dd6bd5a 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.h
+@@ -28,6 +28,8 @@ struct cedrus_format {
+ #define CEDRUS_MIN_HEIGHT	16U
+ #define CEDRUS_MAX_WIDTH	4096U
+ #define CEDRUS_MAX_HEIGHT	2304U
++#define CEDRUS_AVS_MAX_WIDTH	1920U
++#define CEDRUS_AVS_MAX_HEIGHT	1088U
+ 
+ extern const struct v4l2_ioctl_ops cedrus_ioctl_ops;
+ 
+-- 
+2.55.0
+
