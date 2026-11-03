@@ -1,0 +1,192 @@
+From c69e2b77b3c20113c5eefa874644f4daf927fd7d Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 3 Nov 2026 06:49:00 +0000
+Subject: [PATCH 2/2] drm/sun4i: sun8i-tve: Report the Composite connector from
+ DAC load detection
+
+The Composite connector had no .detect, so the probe helper always
+reported it connected. fbcon and every other client therefore enabled
+the TV output on each boot, with or without a TV. On the Orange Pi Zero2
+that turned the TCON TV1 vblank problem into a boot loop: fbcon waited on
+one 10 s commit timeout after the other with the console held, PID 1
+stalled behind it and the 15 s hardware watchdog reset the board.
+
+The encoder has a DAC load detector. Program it as the vendor driver
+does (lowlevel tve_low_dac_autocheck_enable(): 0x200 detect pulse,
+20 ms x 10 debounce, the "new detect mode" bit the BSP sets on the H616)
+and report the connector connected only when DAC 0 sees a load. Keep the
+encoder clock enabled while bound (also across mode sets and disables),
+as the detector runs on it; the vendor driver polls it continuously,
+including while the output is active. Poll the connector so that plugging
+a TV in or out is noticed.
+
+Without a TV the connector now reads disconnected and clients leave it
+alone. It can still be forced on with video=Composite-1:e or through the
+connector's sysfs status.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/sun4i/sun8i_tve.c | 74 +++++++++++++++++++++++++++++--
+ 1 file changed, 71 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun8i_tve.c b/drivers/gpu/drm/sun4i/sun8i_tve.c
+index 7ea2dddd1..a0ed6b64e 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_tve.c
++++ b/drivers/gpu/drm/sun4i/sun8i_tve.c
+@@ -113,7 +113,12 @@
+ #define SUN8I_TVE_LEVEL_BLACK(x)			((x) & 0x3ff)
+ 
+ #define SUN8I_TVE_AUTO_DETECT_EN_REG		0x030
++/* Not in the manual; the vendor driver sets it on the H616 ("new detect mode") */
++#define SUN8I_TVE_AUTO_DETECT_EN_NEW_MODE		BIT(31)
++#define SUN8I_TVE_AUTO_DETECT_EN_DAC(dac)		BIT(dac)
+ #define SUN8I_TVE_AUTO_DETECT_STATUS_REG	0x038
++#define SUN8I_TVE_AUTO_DETECT_STATUS_DAC(dac, x)	(((x) >> (8 * (dac))) & 0x3)
++#define SUN8I_TVE_AUTO_DETECT_STATUS_CONNECTED		1
+ #define SUN8I_TVE_AUTO_DETECT_DEBOUNCE_REG	0x03c
+ 
+ #define SUN8I_TVE_AUTO_DETECT_CFG0_REG		0x0f8
+@@ -272,6 +277,12 @@ drm_encoder_to_sun8i_tve(struct drm_encoder *encoder)
+ 	return container_of(encoder, struct sun8i_tve, encoder);
+ }
+ 
++static inline struct sun8i_tve *
++drm_connector_to_sun8i_tve(struct drm_connector *connector)
++{
++	return container_of(connector, struct sun8i_tve, connector);
++}
++
+ static const struct sun8i_tve_mode *sun8i_tve_find_mode(unsigned int tv_mode)
+ {
+ 	int i;
+@@ -306,6 +317,33 @@ static void sun8i_tve_dac_init(struct sun8i_tve *tve)
+ 		     SUN8I_TVE_TOP_DAC_CFG0_BIAS_EXT_SEL);
+ }
+ 
++/*
++ * DAC load (cable) detection, programmed as the vendor driver does: one
++ * check every 20 ms, ten in a row before the status changes. It needs the
++ * encoder clock, which therefore stays on while the device is bound, and it
++ * keeps running while the output is active.
++ */
++static void sun8i_tve_load_detect_init(struct sun8i_tve *tve)
++{
++	regmap_set_bits(tve->regs, SUN8I_TVE_GCTL_REG,
++			SUN8I_TVE_GCTL_CLOCK_EN);
++	regmap_write(tve->regs, SUN8I_TVE_AUTO_DETECT_CFG0_REG,
++		     SUN8I_TVE_AUTO_DETECT_CFG0_PULSE_VALUE(0x200));
++	regmap_write(tve->regs, SUN8I_TVE_AUTO_DETECT_CFG1_REG, 0x0a3c00ff);
++	regmap_write(tve->regs, SUN8I_TVE_AUTO_DETECT_DEBOUNCE_REG, 0x9999);
++	regmap_set_bits(tve->regs, SUN8I_TVE_AUTO_DETECT_EN_REG,
++			SUN8I_TVE_AUTO_DETECT_EN_NEW_MODE |
++			SUN8I_TVE_AUTO_DETECT_EN_DAC(0));
++}
++
++static void sun8i_tve_load_detect_fini(struct sun8i_tve *tve)
++{
++	regmap_clear_bits(tve->regs, SUN8I_TVE_AUTO_DETECT_EN_REG,
++			  SUN8I_TVE_AUTO_DETECT_EN_DAC(0));
++	regmap_clear_bits(tve->regs, SUN8I_TVE_GCTL_REG,
++			  SUN8I_TVE_GCTL_CLOCK_EN);
++}
++
+ static void sun8i_tve_dac_set_enabled(struct sun8i_tve *tve, bool enable)
+ {
+ 	regmap_update_bits(tve->top_regs, SUN8I_TVE_TOP_DAC_CFG0_REG(0),
+@@ -317,8 +355,12 @@ static void sun8i_tve_mode_set(struct sun8i_tve *tve,
+ 			       const struct sun8i_tve_mode *tv_mode,
+ 			       const struct drm_display_mode *mode)
+ {
+-	/* 216 MHz DAC clock, encoder disabled while reprogramming */
++	/*
++	 * 216 MHz DAC clock, encoder disabled while reprogramming. The clock
++	 * stays enabled for the load detection.
++	 */
+ 	regmap_write(tve->regs, SUN8I_TVE_GCTL_REG,
++		     SUN8I_TVE_GCTL_CLOCK_EN |
+ 		     SUN8I_TVE_GCTL_CVBS_UPSAMPLE_216M);
+ 
+ 	regmap_write(tve->regs, SUN8I_TVE_CFG_REG,
+@@ -444,8 +486,8 @@ static void sun8i_tve_atomic_disable(struct drm_encoder *encoder,
+ 
+ 	DRM_DEBUG_DRIVER("Disabling the TV Output\n");
+ 
+-	regmap_update_bits(tve->regs, SUN8I_TVE_GCTL_REG,
+-			   SUN8I_TVE_GCTL_CLOCK_EN | SUN8I_TVE_GCTL_ENABLE, 0);
++	/* Keep the encoder clock: load detection runs on it */
++	regmap_clear_bits(tve->regs, SUN8I_TVE_GCTL_REG, SUN8I_TVE_GCTL_ENABLE);
+ 	sun8i_tve_dac_set_enabled(tve, false);
+ 
+ 	sunxi_engine_disable_color_correction(crtc->engine);
+@@ -491,6 +533,26 @@ static const struct drm_connector_helper_funcs sun8i_tve_connector_helper_funcs
+ 	.get_modes	= drm_connector_helper_tv_get_modes,
+ };
+ 
++/*
++ * Only report a TV when the DAC sees a load. Reporting the connector as
++ * always connected made fbcon and other clients light it up on every boot,
++ * TV or not. Without a load it is reported disconnected; it can still be
++ * forced on (video=Composite-1:e, or the connector's sysfs "status").
++ */
++static enum drm_connector_status
++sun8i_tve_connector_detect(struct drm_connector *connector, bool force)
++{
++	struct sun8i_tve *tve = drm_connector_to_sun8i_tve(connector);
++	u32 val;
++
++	if (regmap_read(tve->regs, SUN8I_TVE_AUTO_DETECT_STATUS_REG, &val))
++		return connector_status_unknown;
++
++	return SUN8I_TVE_AUTO_DETECT_STATUS_DAC(0, val) ==
++	       SUN8I_TVE_AUTO_DETECT_STATUS_CONNECTED ?
++	       connector_status_connected : connector_status_disconnected;
++}
++
+ static void sun8i_tve_connector_reset(struct drm_connector *connector)
+ {
+ 	drm_atomic_helper_connector_reset(connector);
+@@ -498,6 +560,7 @@ static void sun8i_tve_connector_reset(struct drm_connector *connector)
+ }
+ 
+ static const struct drm_connector_funcs sun8i_tve_connector_funcs = {
++	.detect			= sun8i_tve_connector_detect,
+ 	.fill_modes		= drm_helper_probe_single_connector_modes,
+ 	.destroy		= drm_connector_cleanup,
+ 	.reset			= sun8i_tve_connector_reset,
+@@ -605,6 +668,7 @@ static int sun8i_tve_bind(struct device *dev, struct device *master,
+ 				     "Couldn't get the TV encoder module clock\n");
+ 
+ 	sun8i_tve_dac_init(tve);
++	sun8i_tve_load_detect_init(tve);
+ 
+ 	drm_encoder_helper_add(&tve->encoder, &sun8i_tve_helper_funcs);
+ 	ret = drm_simple_encoder_init(drm, &tve->encoder,
+@@ -631,6 +695,8 @@ static int sun8i_tve_bind(struct device *dev, struct device *master,
+ 		goto err_cleanup_encoder;
+ 	}
+ 	tve->connector.interlace_allowed = true;
++	tve->connector.polled = DRM_CONNECTOR_POLL_CONNECT |
++				DRM_CONNECTOR_POLL_DISCONNECT;
+ 
+ 	drm_connector_attach_encoder(&tve->connector, &tve->encoder);
+ 
+@@ -650,6 +716,7 @@ static int sun8i_tve_bind(struct device *dev, struct device *master,
+ 	drm_connector_cleanup(&tve->connector);
+ err_cleanup_encoder:
+ 	drm_encoder_cleanup(&tve->encoder);
++	sun8i_tve_load_detect_fini(tve);
+ 	return ret;
+ }
+ 
+@@ -659,6 +726,7 @@ static void sun8i_tve_unbind(struct device *dev, struct device *master,
+ 	struct sun8i_tve *tve = dev_get_drvdata(dev);
+ 
+ 	sun8i_tve_dac_set_enabled(tve, false);
++	sun8i_tve_load_detect_fini(tve);
+ }
+ 
+ static const struct component_ops sun8i_tve_ops = {
+-- 
+2.55.0
+
