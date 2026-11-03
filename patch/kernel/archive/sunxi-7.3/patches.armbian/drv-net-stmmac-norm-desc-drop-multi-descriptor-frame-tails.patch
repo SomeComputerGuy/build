@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 3 Nov 2026 02:35:00 +0000
+Subject: [PATCH] net: stmmac: norm_desc: Drop all descriptors of a
+ multi-descriptor frame
+
+With normal descriptors, ndesc_get_rx_status() never reports rx_not_ls.
+It discards any descriptor without the last-descriptor bit, so frames
+larger than one RX buffer are not supported. A frame that overflows into
+a second descriptor is only partly dropped, though: its first
+descriptor(s) are discarded, but the final descriptor has
+RDES0_LAST_DESCRIPTOR set and no error bits, so stmmac_rx() starts a new
+skb from it. The tail of the oversized frame is then passed up the stack
+as a separate packet, with a bogus Ethernet header and a length taken
+from the whole frame.
+
+Discard descriptors that are missing either the first or the last
+descriptor bit, so an oversized frame is dropped as a whole and counted
+in rx_length.
+
+This shows up on dwmac-sun8i (normal descriptors, 2047 byte buffers)
+once the MAC is set to accept frames longer than 1518 bytes.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c b/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
+--- a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
++++ b/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
+@@ -68,7 +68,13 @@
+ 	if (unlikely(rdes0 & RDES0_OWN))
+ 		return dma_own;
+ 
+-	if (unlikely(!(rdes0 & RDES0_LAST_DESCRIPTOR))) {
++	/* Frames spanning more than one descriptor are not supported with
++	 * normal descriptors: drop every descriptor of such a frame. Checking
++	 * only the last descriptor bit would hand the tail of the frame to
++	 * stmmac_rx() as if it were a complete frame.
++	 */
++	if (unlikely(!(rdes0 & RDES0_LAST_DESCRIPTOR) ||
++		     !(rdes0 & RDES0_FIRST_DESCRIPTOR))) {
+ 		x->rx_length++;
+ 		return discard_frame;
+ 	}
+-- 
+2.43.0

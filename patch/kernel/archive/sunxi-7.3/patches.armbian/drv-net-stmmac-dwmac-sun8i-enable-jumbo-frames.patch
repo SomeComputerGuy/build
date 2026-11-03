@@ -1,0 +1,100 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 3 Nov 2026 02:30:00 +0000
+Subject: [PATCH] net: stmmac: dwmac-sun8i: Enable jumbo frames and limit MTU
+ to one descriptor
+
+The sun8i EMAC advertises a maximum MTU of 3712, but no frame larger
+than the standard 1518 bytes is actually received: on an H616 board
+(Orange Pi Zero2, RTL8211F over RGMII) every ping above 1472 bytes with
+DF set is lost, and the rx_length counter goes up for each one.
+
+There are two independent limits:
+
+1. EMAC_RX_CTL0 bit 29 (JUMBO_FRM_EN) is never set, so the receiver
+   rejects frames longer than 1518 (1522 with a VLAN tag) bytes. The
+   Allwinner BSP driver (sunxi-gmac) sets this bit unconditionally at
+   init. Set it in core_init as well; core_init runs after every DMA
+   soft reset, including the one done by an MTU change.
+
+2. The EMAC has no Synopsys HW feature register, so stmmac uses normal
+   descriptors in chain mode and, without enh_desc, sets max_mtu to
+   SKB_MAX_HEAD(NET_SKB_PAD + NET_IP_ALIGN), which is 3712 with 4K
+   pages. That value is not a hardware limit. The descriptor buffer
+   size field is 11 bits wide (the same in the BSP and the QEMU model),
+   so ndesc_init_rx_desc() caps each RX buffer at 2047 bytes, and
+   ndesc_get_rx_status() discards any frame without the last-descriptor
+   bit, i.e. any frame that needs a second descriptor. On TX,
+   stmmac_xmit() only splits jumbo frames for enh_desc, and
+   norm_set_tx_desc_len_on_chain() masks the length to 11 bits, so a
+   linear frame longer than 2047 bytes would be silently truncated.
+
+Limit max_mtu so that a frame with two VLAN tags and the FCS fits in
+one 2047 byte buffer (MTU 2021). A device tree max-frame-size can still
+lower it further. Frames that are still too large are dropped whole by
+ndesc_get_rx_status() (see the preceding norm_desc patch).
+
+Fixes: 9f93ac8d4085 ("net-next: stmmac: Add dwmac-sun8i")
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
+@@ -7,6 +7,7 @@
+ 
+ #include <linux/clk.h>
+ #include <linux/etherdevice.h>
++#include <linux/if_vlan.h>
+ #include <linux/io.h>
+ 
+ extern int sunxi_get_soc_chipid(unsigned char *chipid);
+@@ -220,12 +221,23 @@
+ 
+ /* Used in RX_CTL0 */
+ #define EMAC_RX_RECEIVER_EN             BIT(31)
++#define EMAC_RX_JUMBO_FRM_EN		BIT(29)
+ #define EMAC_RX_DO_CRC BIT(27)
+ #define EMAC_RX_FLOW_CTL_EN             BIT(16)
+ 
+ /* Used in TX_CTL0 */
+ #define EMAC_TX_TRANSMITTER_EN  BIT(31)
+ 
++/* The buffer size field of the EMAC DMA descriptors is 11 bits wide, and
++ * the stmmac normal descriptor code used for this EMAC only handles frames
++ * that fit in a single RX descriptor and a single TX descriptor buffer.
++ * Bound the MTU so that a frame, including two VLAN tags and the FCS, always
++ * fits in one 2047 byte buffer.
++ */
++#define EMAC_MAX_FRAME_LEN	(BUF_SIZE_2KiB - 1)
++#define EMAC_MAX_MTU		(EMAC_MAX_FRAME_LEN - ETH_HLEN - \
++				 2 * VLAN_HLEN - ETH_FCS_LEN)
++
+ /* Used in EMAC_TX_FLOW_CTL */
+ #define EMAC_TX_FLOW_CTL_EN             BIT(0)
+ 
+@@ -654,6 +666,15 @@
+ 
+ 	v = (8 << EMAC_BURSTLEN_SHIFT); /* burst len */
+ 	writel(v, ioaddr + EMAC_BASIC_CTL1);
++
++	/* Without JUMBO_FRM_EN the receiver flags every frame longer than
++	 * 1518 bytes (1522 with a VLAN tag) as a length error, so any MTU
++	 * above 1500 is unusable. Frames are still bounded by the RX
++	 * descriptor buffer size, see EMAC_MAX_MTU.
++	 */
++	v = readl(ioaddr + EMAC_RX_CTL0);
++	v |= EMAC_RX_JUMBO_FRM_EN;
++	writel(v, ioaddr + EMAC_RX_CTL0);
+ }
+ 
+ static void sun8i_dwmac_set_mac(void __iomem *ioaddr, bool enable)
+@@ -1267,6 +1288,7 @@
+ 	plat_dat->mac_setup = sun8i_dwmac_setup;
+ 	plat_dat->tx_fifo_size = 4096;
+ 	plat_dat->rx_fifo_size = 16384;
++	plat_dat->maxmtu = min(plat_dat->maxmtu, EMAC_MAX_MTU);
+ 
+ 	ret = sun8i_dwmac_set_syscon(&pdev->dev, plat_dat);
+ 	if (ret)
+-- 
+2.43.0
