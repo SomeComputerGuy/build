@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 3 Nov 2026 01:06:18 +0000
+Subject: arm64: dts: allwinner: h616: orangepi-zero2: enable UHS-I timings for
+ the SDIO WiFi
+
+SMHC1 carries the UWE5622 WiFi/BT module over SDIO. Per the Zero2 v1.3
+schematic its I/O rail (VCC-PG, WIFI-IO) is a fixed 1.8V supply from
+BLDO1, which the DT already describes as the 1.8V vqmmc regulator, but
+the port only advertises high-speed timing, so the link runs at
+50MHz SDR (4-bit) although the controller supports the SDIO 3.0
+UHS-I timings at 1.8V.
+
+The vendor BSP device tree for this board enables sd-uhs-sdr50,
+sd-uhs-ddr50 and sd-uhs-sdr104 on this port with max-frequency at
+150MHz and skips the voltage switch because the rail is already 1.8V.
+Do the same here. On a fixed 1.8V rail an SDIO 3.0 card answers with
+S18A cleared, so the core skips CMD11 and selects the UHS timing from
+the CCCR bus speed bits. If the module reports no UHS modes in its
+CCCR, the link stays at high speed as before.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../dts/allwinner/sun50i-h616-orangepi-zero2.dts     | 12 ++++++++++++
+ 1 file changed, 12 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero2.dts b/arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero2.dts
+index 111111111111..222222222222 100644
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero2.dts
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero2.dts
+@@ -37,6 +37,18 @@ &mmc0 {
+ 	vmmc-supply = <&reg_dcdce>;
+ };
+ 
++&mmc1 {
++	/*
++	 * The SDIO I/O rail (VCC-PG/WIFI-IO) is a fixed 1.8V supply, so the
++	 * UWE5622 is always signalled at 1.8V. The vendor BSP runs this
++	 * port with SDR50/DDR50/SDR104 capped at 150MHz.
++	 */
++	max-frequency = <150000000>;
++	sd-uhs-sdr50;
++	sd-uhs-ddr50;
++	sd-uhs-sdr104;
++};
++
+ &r_rsb {
+ 	status = "okay";
+ 
+-- 
+Armbian
