@@ -1,0 +1,39 @@
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Subject: [PATCH] sunxi: dram: h616: DDR3: use JEDEC reset/CKE init delays
+
+The DDR3 init sequence of the uMCTL2 is driven by INIT0.pre_cke_x1024
+(time from RESET# deassertion to CKE high) and INIT1.dram_rstn_x1024
+(RESET# low time). The H616 DDR3 code leaves pre_cke at its reset value
+0x4e (about 220 us at 720 MHz) and programs dram_rstn = 0x42 (about
+188 us). JEDEC (JESD79-3F, 4.6.1) requires RESET# low for at least
+200 us at power-up and at least 500 us from RESET# high to CKE high.
+The A523 DDR3 timings already program much longer values.
+
+Derive both from the DRAM clock: 550 us (10% margin) before CKE and
+200 us of RESET#. This costs about 0.33 ms per controller init, roughly
+3 ms on a normal Orange Pi Zero2 boot (8 inits).
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/arch/arm/mach-sunxi/dram_timings/h616_ddr3_1333.c b/arch/arm/mach-sunxi/dram_timings/h616_ddr3_1333.c
+index 3faf8d5b..44c20187 100644
+--- a/arch/arm/mach-sunxi/dram_timings/h616_ddr3_1333.c
++++ b/arch/arm/mach-sunxi/dram_timings/h616_ddr3_1333.c
+@@ -86,8 +86,15 @@ void mctl_set_timing_params(const struct dram_para *para)
+ 	writel(0xA100002, &mctl_ctl->dramtmg[13]);
+ 	writel(txsr, &mctl_ctl->dramtmg[14]);
+ 
+-	clrbits_le32(&mctl_ctl->init[0], 3 << 30);
+-	writel(0x420000, &mctl_ctl->init[1]);
++	/*
++	 * JEDEC DDR3 power-up/reset sequence: RESET# low for >= 200 us, then
++	 * >= 500 us until CKE goes high. The INIT0.pre_cke_x1024 reset value
++	 * (0x4e) is only about 220 us at 720 MHz, so program both (with 10%
++	 * margin on the CKE delay). Units are 1024 controller clock cycles.
++	 */
++	clrsetbits_le32(&mctl_ctl->init[0], (3 << 30) | 0xfff,
++			DIV_ROUND_UP(ns_to_t(550000), 1024));
++	writel(DIV_ROUND_UP(ns_to_t(200000), 1024) << 16, &mctl_ctl->init[1]);
+ 	writel(5, &mctl_ctl->init[2]);
+ 	writel(0x1f140004, &mctl_ctl->init[3]);
+ 	writel(0x00200000, &mctl_ctl->init[4]);
