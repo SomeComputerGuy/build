@@ -70,6 +70,7 @@ dtb-$(CONFIG_ARCH_SUNXI) += \
 	sun50i-h616-i2c3-ph.dtbo \
 	sun50i-h616-i2c4-pg.dtbo \
 	sun50i-h616-i2c4-ph.dtbo \
+	sun50i-h616-i2s3-ph.dtbo \
 	sun50i-h616-keys.dtbo \
 	sun50i-h616-pwm1-ph3.dtbo \
 	sun50i-h616-pwm1-pi11.dtbo \
@@ -79,6 +80,7 @@ dtb-$(CONFIG_ARCH_SUNXI) += \
 	sun50i-h616-pwm3-pi13.dtbo \
 	sun50i-h616-pwm4-ph1.dtbo \
 	sun50i-h616-pwm4-pi14.dtbo \
+	sun50i-h616-spdif-out.dtbo \
 	sun50i-h616-uart2-pg.dtbo \
 	sun50i-h616-uart2-pg-rts-cts.dtbo \
 	sun50i-h616-uart2-ph.dtbo \
