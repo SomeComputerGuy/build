@@ -1,0 +1,425 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 3 Nov 2026 01:07:02 +0000
+Subject: [PATCH] media: sunxi: sun50i-di300: fix input order, planar formats
+ and limits
+
+Fixes found by comparing the driver with the vendor DI300 code (BSP 5.4
+drivers/char/sunxi-di/drv_div3x) and its only user, libcedarc
+openmax/vdec/src/omx_deinterlace.cpp:
+
+- Input slots are in temporal order, oldest first: the vendor puts the
+  frame before last in in_fb0 (IN_F0), the previous frame in in_fb1
+  (IN_F1) and the newest frame in in_fb2 (IN_F2), and the hardware
+  deinterlaces the middle slot (fields 2 and 3). The driver had IN_F0
+  and IN_F2 swapped, so motion detection compared the fields in the
+  wrong temporal order.
+
+- Planar formats: the chroma planes of YUV420 and YUV422P have half the
+  luma stride. The driver used the luma stride for every plane, both
+  for the field pitches and for the bottom-field offset, so planar
+  chroma was read and written with the wrong layout. Describe each
+  plane with its own offset and stride.
+
+- Add YVU420 (YV12), the planar format the datasheet lists and the
+  vendor userspace uses (Cr plane first).
+
+- Size limits from the H616 datasheet, section 2.5.2: 32x32 to
+  2048x1280 (was 2x2 to 2048x1200). The height is a multiple of 4 so
+  every field has whole 4:2:0 chroma lines, and the luma stride is
+  16-byte aligned so the planar chroma strides stay 8-byte aligned.
+
+- Size the motion flag buffers from the frame (two bits per pixel,
+  lines padded to 32 bytes, as the vendor does) instead of a fixed
+  2048x1200 buffer with a fixed 512-byte pitch. Toggle an index to swap
+  the read and write buffers: swapping only the DMA addresses freed
+  each buffer with the other one's handle after an odd number of runs.
+
+- Copy the source metadata to the second output too, and put its
+  timestamp half a frame interval after the first one, so the
+  field-rate output has monotonic, evenly spaced timestamps.
+
+Assisted-by: Claude:claude-opus-5-5
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../sunxi/sun50i-di300/sun50i-di300.c         | 180 ++++++++++++------
+ .../sunxi/sun50i-di300/sun50i-di300.h         |  20 +-
+ 2 files changed, 127 insertions(+), 73 deletions(-)
+
+diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
+index 7fcf5bd60..4dc81dfbf 100644
+--- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
++++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
+@@ -38,6 +38,7 @@ static u32 deinterlace_formats[] = {
+ 	V4L2_PIX_FMT_NV12,
+ 	V4L2_PIX_FMT_NV21,
+ 	V4L2_PIX_FMT_YUV420,
++	V4L2_PIX_FMT_YVU420,
+ 	V4L2_PIX_FMT_NV16,
+ 	V4L2_PIX_FMT_NV61,
+ 	V4L2_PIX_FMT_YUV422P,
+@@ -70,6 +71,7 @@ static u32 deinterlace_hw_format(u32 pixelformat)
+ {
+ 	switch (pixelformat) {
+ 	case V4L2_PIX_FMT_YUV420:
++	case V4L2_PIX_FMT_YVU420:
+ 		return 0;
+ 	default:
+ 	case V4L2_PIX_FMT_NV12:
+@@ -107,32 +109,51 @@ static bool deinterlace_fmt_is_uv_first(u32 pixelformat)
+ 	}
+ }
+ 
+-/* offsets of the luma, and first and second chroma plane, in bytes */
+-static void deinterlace_plane_offsets(struct v4l2_pix_format *fmt,
+-				      unsigned int offset[3], bool present[3])
++/*
++ * Plane layout of a single-buffer V4L2 format, in the order the hardware
++ * wants it: luma, Cb (or the interleaved chroma plane), Cr. The chroma
++ * planes of the planar formats have half the luma stride; YVU420 stores
++ * Cr before Cb.
++ */
++struct deinterlace_planes {
++	unsigned int	offset[3];
++	unsigned int	pitch[3];
++	bool		present[3];
++};
++
++static void deinterlace_get_planes(const struct v4l2_pix_format *fmt,
++				   struct deinterlace_planes *pl)
+ {
+-	unsigned int luma_size = fmt->bytesperline * fmt->height;
++	unsigned int bpl = fmt->bytesperline;
++	unsigned int luma_size = bpl * fmt->height;
++	unsigned int chroma_size;
++
++	memset(pl, 0, sizeof(*pl));
+ 
+-	offset[0] = 0;
+-	present[0] = true;
+-	present[1] = true;
+-	present[2] = false;
++	pl->present[0] = true;
++	pl->pitch[0] = bpl;
++	pl->present[1] = true;
++	pl->offset[1] = luma_size;
+ 
+ 	switch (fmt->pixelformat) {
+ 	case V4L2_PIX_FMT_YUV420:
+-		offset[1] = luma_size;
+-		offset[2] = luma_size + luma_size / 4;
+-		present[2] = true;
+-		break;
++	case V4L2_PIX_FMT_YVU420:
+ 	case V4L2_PIX_FMT_YUV422P:
+-		offset[1] = luma_size;
+-		offset[2] = luma_size + luma_size / 2;
+-		present[2] = true;
++		chroma_size = fmt->pixelformat == V4L2_PIX_FMT_YUV422P ?
++			      luma_size / 2 : luma_size / 4;
++		pl->present[2] = true;
++		pl->pitch[1] = bpl / 2;
++		pl->pitch[2] = bpl / 2;
++		if (fmt->pixelformat == V4L2_PIX_FMT_YVU420) {
++			pl->offset[2] = luma_size;
++			pl->offset[1] = luma_size + chroma_size;
++		} else {
++			pl->offset[2] = luma_size + chroma_size;
++		}
+ 		break;
+ 	default:
+ 		/* UV-combined formats: no separate third plane */
+-		offset[1] = luma_size;
+-		offset[2] = 0;
++		pl->pitch[1] = bpl;
+ 		break;
+ 	}
+ }
+@@ -141,39 +162,32 @@ static void deinterlace_write_in_addr(struct deinterlace_dev *dev,
+ 				      u32 top_reg, u32 top_hreg,
+ 				      u32 bot_reg, u32 bot_hreg,
+ 				      dma_addr_t addr,
+-				      struct v4l2_pix_format *fmt)
++				      const struct deinterlace_planes *pl)
+ {
+-	unsigned int offset[3];
+-	bool present[3];
+ 	unsigned int i;
+ 
+-	deinterlace_plane_offsets(fmt, offset, present);
+-
+ 	for (i = 0; i < 3; i++)
+ 		deinterlace_write(dev, top_reg + i * 4,
+-				  present[i] ? addr + offset[i] : 0);
++				  pl->present[i] ? addr + pl->offset[i] : 0);
+ 	deinterlace_write(dev, top_hreg, 0);
+ 
++	/* the bottom field starts one line further down in every plane */
+ 	for (i = 0; i < 3; i++)
+ 		deinterlace_write(dev, bot_reg + i * 4,
+-				  present[i] ?
+-				  addr + offset[i] + fmt->bytesperline : 0);
++				  pl->present[i] ?
++				  addr + pl->offset[i] + pl->pitch[i] : 0);
+ 	deinterlace_write(dev, bot_hreg, 0);
+ }
+ 
+ static void deinterlace_write_out_addr(struct deinterlace_dev *dev,
+ 				       u32 reg, u32 hreg, dma_addr_t addr,
+-				       struct v4l2_pix_format *fmt)
++				       const struct deinterlace_planes *pl)
+ {
+-	unsigned int offset[3];
+-	bool present[3];
+ 	unsigned int i;
+ 
+-	deinterlace_plane_offsets(fmt, offset, present);
+-
+ 	for (i = 0; i < 3; i++)
+ 		deinterlace_write(dev, reg + i * 4,
+-				  present[i] ? addr + offset[i] : 0);
++				  pl->present[i] ? addr + pl->offset[i] : 0);
+ 	deinterlace_write(dev, hreg, 0);
+ }
+ 
+@@ -182,6 +196,7 @@ static void deinterlace_device_run(void *priv)
+ 	struct deinterlace_ctx *ctx = priv;
+ 	struct deinterlace_dev *dev = ctx->dev;
+ 	struct vb2_v4l2_buffer *src, *dst0, *dst1;
++	struct deinterlace_planes in_pl, out_pl;
+ 	struct v4l2_m2m_buffer *b;
+ 	dma_addr_t next, curr, prev, out0, out1;
+ 	unsigned int hwfmt = deinterlace_hw_format(ctx->src_fmt.pixelformat);
+@@ -229,6 +244,16 @@ static void deinterlace_device_run(void *priv)
+ 	ctx->dst1 = dst1;
+ 
+ 	v4l2_m2m_buf_copy_metadata(src, dst0);
++	v4l2_m2m_buf_copy_metadata(src, dst1);
++	/*
++	 * The second output is the second field of the same frame: put it
++	 * half a frame interval after the first one, so field-rate output
++	 * keeps monotonic, evenly spaced timestamps.
++	 */
++	if (ctx->prev[0] && src->vb2_buf.timestamp > ctx->prev[0]->vb2_buf.timestamp)
++		dst1->vb2_buf.timestamp +=
++			(src->vb2_buf.timestamp -
++			 ctx->prev[0]->vb2_buf.timestamp) / 2;
+ 
+ 	next = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
+ 	curr = ctx->prev[0] ?
+@@ -263,47 +288,63 @@ static void deinterlace_device_run(void *priv)
+ 	else
+ 		deinterlace_write(dev, DEINTERLACE_FIELD_ORDER, 0);
+ 
++	deinterlace_get_planes(&ctx->src_fmt, &in_pl);
++	deinterlace_get_planes(&ctx->dst_fmt, &out_pl);
++
++	/* input pitches are field pitches: two lines of the frame */
+ 	for (i = 0; i < 3; i++) {
+-		unsigned int in_pitch = ctx->src_fmt.bytesperline * 2;
+-		unsigned int out_pitch = ctx->dst_fmt.bytesperline;
++		unsigned int in_pitch = in_pl.pitch[i] * 2;
+ 
+ 		deinterlace_write(dev, DEINTERLACE_IN_F01_PITCH(i),
+ 				  DEINTERLACE_IN_F01_PITCH_F0(in_pitch) |
+ 				  DEINTERLACE_IN_F01_PITCH_F1(in_pitch));
+ 		deinterlace_write(dev, DEINTERLACE_IN_F2_PITCH(i), in_pitch);
+-		deinterlace_write(dev, DEINTERLACE_OUT_DIT_PITCH(i), out_pitch);
++		deinterlace_write(dev, DEINTERLACE_OUT_DIT_PITCH(i),
++				  out_pl.pitch[i]);
+ 	}
+ 
++	/*
++	 * Input slots are in temporal order, oldest first: the vendor
++	 * userspace (libcedarc omx_deinterlace.cpp, diSetPara()) puts the
++	 * frame before last in in_fb0, the previous frame in in_fb1 and the
++	 * newest frame in in_fb2, and the hardware deinterlaces the middle
++	 * slot (fields 2 and 3).
++	 */
++
+ 	deinterlace_write_in_addr(dev, DEINTERLACE_IN_F0_TOP_ADDR(0),
+ 				  DEINTERLACE_IN_F0_TOP_HADDR,
+ 				  DEINTERLACE_IN_F0_BOT_ADDR(0),
+ 				  DEINTERLACE_IN_F0_BOT_HADDR,
+-				  next, &ctx->src_fmt);
++				  prev, &in_pl);
+ 	deinterlace_write_in_addr(dev, DEINTERLACE_IN_F1_TOP_ADDR(0),
+ 				  DEINTERLACE_IN_F1_TOP_HADDR,
+ 				  DEINTERLACE_IN_F1_BOT_ADDR(0),
+ 				  DEINTERLACE_IN_F1_BOT_HADDR,
+-				  curr, &ctx->src_fmt);
++				  curr, &in_pl);
+ 	deinterlace_write_in_addr(dev, DEINTERLACE_IN_F2_TOP_ADDR(0),
+ 				  DEINTERLACE_IN_F2_TOP_HADDR,
+ 				  DEINTERLACE_IN_F2_BOT_ADDR(0),
+ 				  DEINTERLACE_IN_F2_BOT_HADDR,
+-				  prev, &ctx->src_fmt);
++				  next, &in_pl);
+ 
+ 	out0 = vb2_dma_contig_plane_dma_addr(&dst0->vb2_buf, 0);
+ 	out1 = vb2_dma_contig_plane_dma_addr(&dst1->vb2_buf, 0);
+ 	deinterlace_write_out_addr(dev, DEINTERLACE_OUT_DIT0_ADDR(0),
+-				   DEINTERLACE_OUT_DIT0_HADDR, out0,
+-				   &ctx->dst_fmt);
++				   DEINTERLACE_OUT_DIT0_HADDR, out0, &out_pl);
+ 	deinterlace_write_out_addr(dev, DEINTERLACE_OUT_DIT1_ADDR(0),
+-				   DEINTERLACE_OUT_DIT1_HADDR, out1,
+-				   &ctx->dst_fmt);
++				   DEINTERLACE_OUT_DIT1_HADDR, out1, &out_pl);
+ 
+-	deinterlace_write(dev, DEINTERLACE_FLAG_PITCH, 0x200);
+-	deinterlace_write(dev, DEINTERLACE_IN_FLAG_ADDR, ctx->flag1_buf_dma);
+-	deinterlace_write(dev, DEINTERLACE_OUT_FLAG_ADDR, ctx->flag2_buf_dma);
++	/*
++	 * Motion flags: two bits per pixel, read from the previous run and
++	 * written for the next one, so the two buffers swap roles each run.
++	 */
++	deinterlace_write(dev, DEINTERLACE_FLAG_PITCH, ctx->flag_pitch);
++	deinterlace_write(dev, DEINTERLACE_IN_FLAG_ADDR,
++			  ctx->flag_dma[ctx->flag_idx]);
++	deinterlace_write(dev, DEINTERLACE_OUT_FLAG_ADDR,
++			  ctx->flag_dma[!ctx->flag_idx]);
+ 	deinterlace_write(dev, DEINTERLACE_FLAG_HADDR, 0);
+-	swap(ctx->flag1_buf_dma, ctx->flag2_buf_dma);
++	ctx->flag_idx = !ctx->flag_idx;
+ 
+ 	/*
+ 	 * Restrict the deinterlace and motion-detect blocks to the full
+@@ -526,16 +567,24 @@ static void deinterlace_prepare_format(struct v4l2_pix_format *pix_fmt)
+ 	unsigned int bytesperline;
+ 	unsigned int sizeimage;
+ 
+-	width = clamp(width, DEINTERLACE_MIN_WIDTH, DEINTERLACE_MAX_WIDTH);
+-	height = clamp(height, DEINTERLACE_MIN_HEIGHT, DEINTERLACE_MAX_HEIGHT);
++	/*
++	 * Each field of a 4:2:0 frame needs whole chroma lines, so the
++	 * height is a multiple of 4. A 16-byte luma stride keeps the planar
++	 * chroma strides 8-byte aligned.
++	 */
++	width = clamp(ALIGN(width, 2), DEINTERLACE_MIN_WIDTH,
++		      DEINTERLACE_MAX_WIDTH);
++	height = clamp(ALIGN(height, 4), DEINTERLACE_MIN_HEIGHT,
++		       DEINTERLACE_MAX_HEIGHT);
+ 
+-	bytesperline = ALIGN(width, 2);
++	bytesperline = ALIGN(width, 16);
+ 	sizeimage = bytesperline * height;
+ 
+ 	switch (pix_fmt->pixelformat) {
+ 	case V4L2_PIX_FMT_NV12:
+ 	case V4L2_PIX_FMT_NV21:
+ 	case V4L2_PIX_FMT_YUV420:
++	case V4L2_PIX_FMT_YVU420:
+ 		sizeimage += bytesperline * height / 2;
+ 		break;
+ 	case V4L2_PIX_FMT_NV16:
+@@ -589,7 +638,7 @@ static int deinterlace_enum_framesizes(struct file *file, void *priv,
+ 	fsize->stepwise.max_width = DEINTERLACE_MAX_WIDTH;
+ 	fsize->stepwise.max_height = DEINTERLACE_MAX_HEIGHT;
+ 	fsize->stepwise.step_width = 2;
+-	fsize->stepwise.step_height = 2;
++	fsize->stepwise.step_height = 4;
+ 
+ 	return 0;
+ }
+@@ -845,19 +894,24 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
+ 		ctx->prev[1] = NULL;
+ 		ctx->aborting = 0;
+ 
+-		ctx->flag1_buf = dma_alloc_coherent(dev, DEINTERLACE_FLAG_SIZE,
+-						    &ctx->flag1_buf_dma,
+-						    GFP_KERNEL);
+-		if (!ctx->flag1_buf) {
++		/* two bits per pixel, lines padded to 32 bytes (vendor) */
++		ctx->flag_pitch = ALIGN(ctx->src_fmt.width * 2, 256) / 8;
++		ctx->flag_size = ctx->flag_pitch * ctx->src_fmt.height;
++		ctx->flag_idx = 0;
++
++		ctx->flag_buf[0] = dma_alloc_coherent(dev, ctx->flag_size,
++						      &ctx->flag_dma[0],
++						      GFP_KERNEL);
++		if (!ctx->flag_buf[0]) {
+ 			ret = -ENOMEM;
+ 
+ 			goto err_no_mem1;
+ 		}
+ 
+-		ctx->flag2_buf = dma_alloc_coherent(dev, DEINTERLACE_FLAG_SIZE,
+-						    &ctx->flag2_buf_dma,
+-						    GFP_KERNEL);
+-		if (!ctx->flag2_buf) {
++		ctx->flag_buf[1] = dma_alloc_coherent(dev, ctx->flag_size,
++						      &ctx->flag_dma[1],
++						      GFP_KERNEL);
++		if (!ctx->flag_buf[1]) {
+ 			ret = -ENOMEM;
+ 
+ 			goto err_no_mem2;
+@@ -867,8 +921,8 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
+ 	return 0;
+ 
+ err_no_mem2:
+-	dma_free_coherent(dev, DEINTERLACE_FLAG_SIZE, ctx->flag1_buf,
+-			  ctx->flag1_buf_dma);
++	dma_free_coherent(dev, ctx->flag_size, ctx->flag_buf[0],
++			  ctx->flag_dma[0]);
+ err_no_mem1:
+ 	pm_runtime_put(dev);
+ err_runtime_get:
+@@ -884,10 +938,10 @@ static void deinterlace_stop_streaming(struct vb2_queue *vq)
+ 	if (V4L2_TYPE_IS_OUTPUT(vq->type)) {
+ 		struct device *dev = ctx->dev->dev;
+ 
+-		dma_free_coherent(dev, DEINTERLACE_FLAG_SIZE, ctx->flag1_buf,
+-				  ctx->flag1_buf_dma);
+-		dma_free_coherent(dev, DEINTERLACE_FLAG_SIZE, ctx->flag2_buf,
+-				  ctx->flag2_buf_dma);
++		dma_free_coherent(dev, ctx->flag_size, ctx->flag_buf[0],
++				  ctx->flag_dma[0]);
++		dma_free_coherent(dev, ctx->flag_size, ctx->flag_buf[1],
++				  ctx->flag_dma[1]);
+ 
+ 		pm_runtime_put(dev);
+ 	}
+diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
+index 683db1455..b572fe532 100644
+--- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
++++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
+@@ -220,12 +220,11 @@
+ 
+ #define DEINTERLACE_FMD_STATS_COUNT	10
+ 
+-#define DEINTERLACE_MIN_WIDTH	2U
+-#define DEINTERLACE_MIN_HEIGHT	2U
++/* H616 datasheet 2.5.2: 32x32 to 2048x1280 */
++#define DEINTERLACE_MIN_WIDTH	32U
++#define DEINTERLACE_MIN_HEIGHT	32U
+ #define DEINTERLACE_MAX_WIDTH	2048U
+-#define DEINTERLACE_MAX_HEIGHT	1200U
+-
+-#define DEINTERLACE_FLAG_SIZE	(DEINTERLACE_MAX_WIDTH * DEINTERLACE_MAX_HEIGHT / 4)
++#define DEINTERLACE_MAX_HEIGHT	1280U
+ 
+ struct deinterlace_ctx {
+ 	struct v4l2_fh		fh;
+@@ -234,11 +233,12 @@ struct deinterlace_ctx {
+ 	struct v4l2_pix_format	src_fmt;
+ 	struct v4l2_pix_format	dst_fmt;
+ 
+-	void			*flag1_buf;
+-	dma_addr_t		flag1_buf_dma;
+-
+-	void			*flag2_buf;
+-	dma_addr_t		flag2_buf_dma;
++	/* motion flag buffers, read and written alternately */
++	void			*flag_buf[2];
++	dma_addr_t		flag_dma[2];
++	unsigned int		flag_idx;
++	unsigned int		flag_pitch;
++	size_t			flag_size;
+ 
+ 	/* prev[0]: one frame back, prev[1]: two frames back */
+ 	struct vb2_v4l2_buffer	*prev[2];
+-- 
+2.55.0
+
