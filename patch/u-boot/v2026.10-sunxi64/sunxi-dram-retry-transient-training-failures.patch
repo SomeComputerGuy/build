@@ -1,0 +1,210 @@
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Subject: [PATCH] sunxi: dram: retry transient DRAM training failures
+
+mctl_auto_detect_rank_width() takes the first bus width / rank
+combination whose PHY training succeeds and panics if none does. That
+assumes training of the real geometry never fails. On an Orange Pi Zero2
+(H616, 1 GiB DDR3, 32-bit, single rank) a watchdog reset of a system
+that had been thrashing under OOM for minutes produced:
+
+  DRAM:This DRAM setup is currently not supported.
+  resetting ...
+  U-Boot SPL ...
+  DRAM: 512 MiB
+
+i.e. in the first pass none of the four combinations trained, and in the
+pass after the panic induced reset the 32-bit one still failed while a
+16-bit one trained, so the board ran with half of its RAM until the next
+reboot. In 76 other boots (power-on, reboot, other watchdog resets) the
+board always came up with 1024 MiB.
+
+Make the scan robust against such transient failures:
+- run up to three passes over the combinations and keep the most
+  demanding one that trained in any pass; later passes only try the
+  combinations more demanding than the best one found so far, so a
+  board which trains its real geometry in the first pass pays only the
+  (quickly failing) more demanding attempts twice more,
+- only panic if nothing trained in any pass,
+- the size probe and the final init used to ignore mctl_core_init()'s
+  result; retry them up to three times as well (the outcome on a
+  persistent failure is unchanged).
+
+If any retry was needed the SPL prints "(training retried)" in the DRAM
+line, so the event remains visible.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/arch/arm/include/asm/arch-sunxi/dram_dw_helpers.h b/arch/arm/include/asm/arch-sunxi/dram_dw_helpers.h
+index bc9e0d8..da73c35 100644
+--- a/arch/arm/include/asm/arch-sunxi/dram_dw_helpers.h
++++ b/arch/arm/include/asm/arch-sunxi/dram_dw_helpers.h
+@@ -13,6 +13,8 @@
+ 
+ bool mctl_core_init(const struct dram_para *para,
+ 		    const struct dram_config *config);
++bool mctl_core_init_retry(const struct dram_para *para,
++			  const struct dram_config *config);
+ void mctl_auto_detect_rank_width(const struct dram_para *para,
+ 				 struct dram_config *config);
+ void mctl_auto_detect_dram_size(const struct dram_para *para,
+diff --git a/arch/arm/mach-sunxi/dram_dw_helpers.c b/arch/arm/mach-sunxi/dram_dw_helpers.c
+index d2af2d5..b296f74 100644
+--- a/arch/arm/mach-sunxi/dram_dw_helpers.c
++++ b/arch/arm/mach-sunxi/dram_dw_helpers.c
+@@ -7,48 +7,93 @@
+  */
+ 
+ #include <init.h>
++#include <log.h>
++#include <linux/kernel.h>
+ #include <asm/arch/dram_dw_helpers.h>
+ 
++/*
++ * Bus width / rank combinations, most demanding first. Testing in this
++ * order matters, otherwise HW might not be fully utilized. For example,
++ * half bus width and rank = 1 combination would also work on HW with full
++ * bus width and rank = 2, but only 1/4 RAM would be visible.
++ */
++static const struct {
++	u8 bus_full_width;
++	u8 ranks;
++} mctl_geometries[] = {
++	{ 1, 2 },
++	{ 1, 1 },
++	{ 0, 2 },
++	{ 0, 1 },
++};
++
++/*
++ * PHY training can occasionally fail for a geometry the board really has
++ * (seen on an H616 board after a watchdog reset of a heavily loaded
++ * system: no combination trained, and after the panic induced reset only
++ * the 16-bit one did, leaving half of the RAM unused). Taking
++ * the first combination that trains silently falls back to a narrower
++ * bus or a single rank in that case. Scan more than once and keep
++ * the most demanding combination that trained in any pass. Combinations
++ * the board does not have fail training reliably, so this only costs a few
++ * failing training runs on boards which don't use the full 32-bit, dual
++ * rank configuration.
++ */
++#define MCTL_DETECT_PASSES	3
++
++bool mctl_core_init_retry(const struct dram_para *para,
++			  const struct dram_config *config)
++{
++	int i;
++
++	for (i = 0; i < MCTL_DETECT_PASSES; i++) {
++		if (mctl_core_init(para, config)) {
++			if (i)
++				printf(" (training retried)");
++			return true;
++		}
++	}
++
++	debug("DRAM training failed %d times\n", MCTL_DETECT_PASSES);
++
++	return false;
++}
++
+ void mctl_auto_detect_rank_width(const struct dram_para *para,
+ 				 struct dram_config *config)
+ {
++	unsigned int best = ARRAY_SIZE(mctl_geometries);
++	unsigned int first = best;
++	unsigned int pass, i;
++
+ 	/* this is minimum size that it's supported */
+ 	config->cols = 8;
+ 	config->rows = 13;
+ 
+-	/*
+-	 * Strategy here is to test most demanding combination first and least
+-	 * demanding last, otherwise HW might not be fully utilized. For
+-	 * example, half bus width and rank = 1 combination would also work
+-	 * on HW with full bus width and rank = 2, but only 1/4 RAM would be
+-	 * visible.
+-	 */
++	for (pass = 0; pass < MCTL_DETECT_PASSES && best > 0; pass++) {
++		for (i = 0; i < best; i++) {
++			config->bus_full_width = mctl_geometries[i].bus_full_width;
++			config->ranks = mctl_geometries[i].ranks;
++			debug("testing %d-bit width, rank = %d\n",
++			      config->bus_full_width ? 32 : 16, config->ranks);
++			if (mctl_core_init(para, config)) {
++				if (pass == 0)
++					first = i;
++				best = i;
++				break;
++			}
++		}
++	}
++
++	if (best == ARRAY_SIZE(mctl_geometries))
++		panic("This DRAM setup is currently not supported.\n");
++
++	/* tell the user that the DRAM did not train on the first attempt */
++	if (best != first)
++		printf(" (training retried)");
+ 
+-	debug("testing 32-bit width, rank = 2\n");
+-	config->bus_full_width = 1;
+-	config->ranks = 2;
+-	if (mctl_core_init(para, config))
+-		return;
+-
+-	debug("testing 32-bit width, rank = 1\n");
+-	config->bus_full_width = 1;
+-	config->ranks = 1;
+-	if (mctl_core_init(para, config))
+-		return;
+-
+-	debug("testing 16-bit width, rank = 2\n");
+-	config->bus_full_width = 0;
+-	config->ranks = 2;
+-	if (mctl_core_init(para, config))
+-		return;
+-
+-	debug("testing 16-bit width, rank = 1\n");
+-	config->bus_full_width = 0;
+-	config->ranks = 1;
+-	if (mctl_core_init(para, config))
+-		return;
+-
+-	panic("This DRAM setup is currently not supported.\n");
++	config->bus_full_width = mctl_geometries[best].bus_full_width;
++	config->ranks = mctl_geometries[best].ranks;
+ }
+ 
+ static void mctl_write_pattern(void)
+@@ -93,7 +138,7 @@ void mctl_auto_detect_dram_size(const struct dram_para *para,
+ 	/* max. config for columns, but not rows */
+ 	config->cols = 11;
+ 	config->rows = 13;
+-	mctl_core_init(para, config);
++	mctl_core_init_retry(para, config);
+ 
+ 	/*
+ 	 * Store content so it can be restored later. This is important
+@@ -119,7 +164,7 @@ void mctl_auto_detect_dram_size(const struct dram_para *para,
+ 	/* reconfigure to make sure that all active rows are accessible */
+ 	config->cols = 8;
+ 	config->rows = 17;
+-	mctl_core_init(para, config);
++	mctl_core_init_retry(para, config);
+ 
+ 	/* store data again as it might be moved */
+ 	memcpy(buffer, (u32 *)CFG_SYS_SDRAM_BASE, sizeof(buffer));
+diff --git a/arch/arm/mach-sunxi/dram_sun50i_h616.c b/arch/arm/mach-sunxi/dram_sun50i_h616.c
+index 42a0550..a019dcf 100644
+--- a/arch/arm/mach-sunxi/dram_sun50i_h616.c
++++ b/arch/arm/mach-sunxi/dram_sun50i_h616.c
+@@ -1352,7 +1352,7 @@ unsigned long sunxi_dram_init(void)
+ 	mctl_auto_detect_rank_width(&para, &config);
+ 	mctl_auto_detect_dram_size(&para, &config);
+ 
+-	mctl_core_init(&para, &config);
++	mctl_core_init_retry(&para, &config);
+ 
+ 	size = mctl_calc_size(&config);
+ 
