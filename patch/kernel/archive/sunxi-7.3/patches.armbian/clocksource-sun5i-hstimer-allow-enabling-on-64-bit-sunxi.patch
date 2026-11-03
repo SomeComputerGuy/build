@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 3 Nov 2026 01:03:56 +0000
+Subject: clocksource: sun5i: allow enabling the high-speed timer on 64-bit
+ sunxi
+
+The high-speed timer driver binds "allwinner,sun20i-d1-hstimer", which
+the H616 device tree already uses as the fallback for its
+"allwinner,sun50i-h616-hstimer" node at 0x3005000. The symbol, however,
+only has a prompt under COMPILE_TEST and is selected by the 32-bit
+mach-sunxi Kconfig alone, so arm64 and RISC-V sunxi kernels cannot
+enable it and the node never probes.
+
+Make the prompt visible on ARCH_SUNXI. The driver registers its
+clocksource and clockevent at rating 340, below the arch timer (400 and
+450) and the sun4i timer (350), so enabling it adds a second hardware
+time base without changing which one the kernel uses.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/clocksource/Kconfig | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/clocksource/Kconfig b/drivers/clocksource/Kconfig
+index 111111111111..222222222222 100644
+--- a/drivers/clocksource/Kconfig
++++ b/drivers/clocksource/Kconfig
+@@ -161,12 +161,17 @@ config SUN4I_TIMER
+ 	  Enables support for the Sun4i timer.
+ 
+ config SUN5I_HSTIMER
+-	bool "Sun5i timer driver" if COMPILE_TEST
++	bool "Sun5i timer driver" if COMPILE_TEST || ARCH_SUNXI
+ 	select CLKSRC_MMIO
+ 	depends on COMMON_CLK
+ 	help
+ 	  Enables support the Sun5i timer.
+ 
++	  The 32-bit sunxi platforms select it. On 64-bit (ARM64, RISC-V)
++	  sunxi SoCs such as the H616 and D1 the block registers as an
++	  additional clocksource and clockevent device, rated below the
++	  architected timer.
++
+ config TEGRA_TIMER
+ 	bool "Tegra timer driver" if COMPILE_TEST
+ 	select CLKSRC_MMIO
+-- 
+Armbian
