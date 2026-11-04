@@ -27,7 +27,7 @@ Make the scan robust against such transient failures:
   combinations, so a healthy board pays only for a couple of quickly
   failing attempts (as before),
 - while nothing trained, retry with an exponential backoff (20 ms
-  doubling up to 320 ms, 8 passes, about 1.3 s) before panicking; after
+  doubling up to 320 ms, 12 passes, about 2.5 s) before panicking; after
   a delay was needed, the passes for the more demanding combinations are
   delayed as well,
 - the size probe and the final init used to ignore mctl_core_init()'s
@@ -107,7 +107,7 @@ index d2af2d57..22b127f2 100644
 + *   are the only cost on a healthy board.
 + * - While nothing trained, do not give up after back-to-back attempts:
 + *   retry with an exponential backoff (20 ms doubling up to 320 ms,
-+ *   MCTL_MAX_PASSES passes, about 1.3 s in total) before panicking.
++ *   MCTL_MAX_PASSES passes, about 2.5 s in total) before panicking.
 + *   After such a delay was needed, the passes for the more demanding
 + *   combinations are delayed as well.
 + * - Each mctl_core_init() resets and re-initializes the controller, PHY
@@ -119,7 +119,7 @@ index d2af2d57..22b127f2 100644
 + * visible.
 + */
 +#define MCTL_FAST_PASSES	3
-+#define MCTL_MAX_PASSES		8
++#define MCTL_MAX_PASSES		12
 +#define MCTL_BACKOFF_MS_MIN	20
 +#define MCTL_BACKOFF_MS_MAX	320
 +
