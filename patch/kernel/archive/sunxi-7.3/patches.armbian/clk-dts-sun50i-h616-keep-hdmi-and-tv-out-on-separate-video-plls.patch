@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Wed, 4 Nov 2026 10:00:00 +0000
+Subject: clk: sunxi-ng: h616: Keep HDMI and TV-out on separate video PLLs
+
+tcon-tv0 (HDMI), tcon-tv1 and tve0 (TV encoder) all pick their parent
+from pll-video0/1 and their 4x outputs, and all may re-rate it. The TV
+encoder clock was already pinned to pll-video1, but tcon-tv1 still
+defaulted to pll-video0 (mux reset value), so a TV mode set re-rated the
+PLL behind a running HDMI output, and an HDMI mode set could re-rate it
+behind the TV encoder.
+
+Give each output its own PLL: assign tcon-tv0 to pll-video0 and tcon-tv1
+to pll-video1 from the TCON TOP node, which probes before both TCONs,
+export CLK_PLL_VIDEO0 for that, and mark both TCON TV clocks
+CLK_SET_RATE_NO_REPARENT so that a rate request stays on the DT parent.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+index 67d3f3d..8d0af30 100644
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+@@ -1471,6 +1471,11 @@
+ 					     "tcon-top-tv1";
+ 			resets = <&ccu RST_BUS_TCON_TOP>;
+ 			#clock-cells = <1>;
++			/* separate PLLs: HDMI on pll-video0, TV-out on pll-video1 */
++			assigned-clocks = <&ccu CLK_TCON_TV0>,
++					  <&ccu CLK_TCON_TV1>;
++			assigned-clock-parents = <&ccu CLK_PLL_VIDEO0>,
++						 <&ccu CLK_PLL_VIDEO1>;
+ 
+ 			ports {
+ 				#address-cells = <1>;
+diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
+index c906f22..0403e2d 100644
+--- a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
++++ b/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
+@@ -663,20 +663,28 @@ static SUNXI_CCU_GATE(bus_tcon_lcd0_clk, "bus-tcon-lcd0", "ahb3",
+ 		      0xb7c, BIT(0), 0);
+ static SUNXI_CCU_GATE(bus_tcon_lcd1_clk, "bus-tcon-lcd1", "ahb3",
+ 		      0xb7c, BIT(1), 0);
++/*
++ * HDMI (tcon-tv0) and the TV encoder path (tcon-tv1, tve0) share the same
++ * pll-video0/1 parents. DT puts each output on its own PLL; keep that
++ * parent so that a mode set on one output can never re-rate the PLL that
++ * drives the other.
++ */
+ static SUNXI_CCU_MP_WITH_MUX_GATE(tcon_tv0_clk, "tcon-tv0",
+ 				  tcon_tv_parents, 0xb80,
+ 				  0, 4,		/* M */
+ 				  8, 2,		/* P */
+ 				  24, 3,	/* mux */
+ 				  BIT(31),	/* gate */
+-				  CLK_SET_RATE_PARENT);
++				  CLK_SET_RATE_PARENT |
++				  CLK_SET_RATE_NO_REPARENT);
+ static SUNXI_CCU_MP_WITH_MUX_GATE(tcon_tv1_clk, "tcon-tv1",
+ 				  tcon_tv_parents, 0xb84,
+ 				  0, 4,		/* M */
+ 				  8, 2,		/* P */
+ 				  24, 3,	/* mux */
+ 				  BIT(31),	/* gate */
+-				  CLK_SET_RATE_PARENT);
++				  CLK_SET_RATE_PARENT |
++				  CLK_SET_RATE_NO_REPARENT);
+ 
+ static SUNXI_CCU_GATE(bus_tcon_tv0_clk, "bus-tcon-tv0", "ahb3",
+ 		      0xb9c, BIT(0), 0);
+diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.h b/drivers/clk/sunxi-ng/ccu-sun50i-h616.h
+index 2a11e19..55863e5 100644
+--- a/drivers/clk/sunxi-ng/ccu-sun50i-h616.h
++++ b/drivers/clk/sunxi-ng/ccu-sun50i-h616.h
+@@ -20,7 +20,6 @@
+ #define CLK_PLL_PERIPH1		6
+ #define CLK_PLL_PERIPH1_2X	7
+ #define CLK_PLL_GPU		8
+-#define CLK_PLL_VIDEO0		9
+ #define CLK_PLL_VIDEO0_4X	10
+ #define CLK_PLL_VIDEO1_4X	12
+ #define CLK_PLL_VIDEO2		13
+diff --git a/include/dt-bindings/clock/sun50i-h616-ccu.h b/include/dt-bindings/clock/sun50i-h616-ccu.h
+index 9cc91d5..cb2aed9 100644
+--- a/include/dt-bindings/clock/sun50i-h616-ccu.h
++++ b/include/dt-bindings/clock/sun50i-h616-ccu.h
+@@ -7,6 +7,7 @@
+ #define _DT_BINDINGS_CLK_SUN50I_H616_H_
+ 
+ #define CLK_PLL_PERIPH0		4
++#define CLK_PLL_VIDEO0		9
+ #define CLK_PLL_VIDEO1		11
+ #define CLK_PLL_AUDIO_HS	17
+ #define CLK_PLL_AUDIO_4X	20
+-- 
+Armbian
