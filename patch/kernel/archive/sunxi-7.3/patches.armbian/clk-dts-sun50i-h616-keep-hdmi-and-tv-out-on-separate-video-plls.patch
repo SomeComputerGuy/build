@@ -21,14 +21,18 @@ diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi b/arch/arm64/boot/dt
 index 67d3f3d..8d0af30 100644
 --- a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
 +++ b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
-@@ -1471,6 +1471,11 @@
+@@ -1471,6 +1471,15 @@
  					     "tcon-top-tv1";
  			resets = <&ccu RST_BUS_TCON_TOP>;
  			#clock-cells = <1>;
-+			/* separate PLLs: HDMI on pll-video0, TV-out on pll-video1 */
++			/*
++			 * separate PLLs: HDMI on pll-video0, TV-out (TCON TV1 + TVE0) on
++			 * pll-video1, also when the TV encoder node is disabled
++			 */
 +			assigned-clocks = <&ccu CLK_TCON_TV0>,
-+					  <&ccu CLK_TCON_TV1>;
++					  <&ccu CLK_TCON_TV1>, <&ccu CLK_TVE0>;
 +			assigned-clock-parents = <&ccu CLK_PLL_VIDEO0>,
++						 <&ccu CLK_PLL_VIDEO1>,
 +						 <&ccu CLK_PLL_VIDEO1>;
  
  			ports {
