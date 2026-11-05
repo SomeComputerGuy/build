@@ -17,7 +17,7 @@ Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
 [aiyengar: LibreELEC 0243, rebased onto the regmap-based
  sun8i_vi_layer_update_buffer() (ch_base context); the address
  calculation is unchanged]
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/sun4i/sun8i_vi_layer.c | 20 ++++++++++++++++++--

@@ -22,6 +22,7 @@ Register semantics follow the H616 User Manual V1.0 chapter 7.3 (TV
 Encoder); the configuration values were cross-checked against the
 Allwinner BSP TVE code (de_tve_sun8iw11.c, used for sun50iw9).
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/sun4i/Kconfig     |   9 +

@@ -32,7 +32,7 @@ masks, ranges, the required references of P and B pictures, and zeroed
 reserved fields. The structures have no holes: 16, 64 and 32 bytes, with
 the same layout on 32 and 64-bit ABIs.
 
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  .../userspace-api/media/v4l/biblio.rst        |  20 ++

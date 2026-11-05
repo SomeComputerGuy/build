@@ -18,7 +18,7 @@ Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
  with the low 32 address bits only (no HADDR writes outside AFBC) and
  the IOMMU hands out 32-bit IOVAs anyway (LE's 40-bit mask goes with
  its 0239 IOMMU >4 GiB patch, not carried)]
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/sun4i/sun50i_planes.c | 10 ++++++++++

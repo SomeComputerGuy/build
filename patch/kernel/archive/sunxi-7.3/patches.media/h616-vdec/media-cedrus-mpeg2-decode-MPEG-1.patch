@@ -11,7 +11,7 @@ sequences with V4L2_MPEG2_SEQ_FLAG_MPEG1, and reject the MPEG-1-only
 features (D-pictures, full pel vectors) in MPEG-2 sequences and field
 pictures in MPEG-1 sequences.
 
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
 --- a/drivers/staging/media/sunxi/cedrus/cedrus.h

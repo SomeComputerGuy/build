@@ -14,6 +14,7 @@ board DTS is 810000-990000 uV (Zero2: AXP305 reg_dcdcc, Zero3: AXP313a
 reg_dcdc1), so every OPP target voltage (810-950 mV) and the 990 mV ceiling
 fit inside the regulator constraints.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero.dtsi | 1 +

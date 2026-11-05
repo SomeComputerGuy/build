@@ -21,6 +21,7 @@ Latencies are initial estimates for the TF-A round trip and the residency
 is conservative (the vendor firmware advertises 46/59/3570 us); they are
 to be refined with measurements.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi | 17 +++++++++++++++++

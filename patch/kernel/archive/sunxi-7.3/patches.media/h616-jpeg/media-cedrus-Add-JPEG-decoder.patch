@@ -12,7 +12,7 @@ Link: https://lore.kernel.org/r/20240731164422.206503-3-linkmauve@linkmauve.fr
  MPEG-4 and AVS2 decoders present): CEDRUS_CAPABILITY_JPEG_DEC is BIT(10)
  since BIT(6)..BIT(9) are taken, and the format/codec switch cases are
  placed next to the new codecs. No functional change to the decoder.]
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/staging/media/sunxi/cedrus/Kconfig    |   1 +

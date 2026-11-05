@@ -17,7 +17,7 @@ range, so P-VOPs are left alone.
 Fail such jobs instead of decoding them wrongly. Userspace should
 decode streams that allow B-VOPs (low_delay is 0) in software.
 
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c

@@ -18,7 +18,7 @@ Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
  (DE33: ch * DE33_CH_SIZE + 0x5000 in the planes window; DE3: channel
  base + 0x300 in the mixer regmap) and the registers are written with
  regmap_write(); the RCQ region tables are dropped]
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/sun4i/Makefile      |   1 +

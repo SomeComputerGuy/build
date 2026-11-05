@@ -13,7 +13,7 @@ Link: https://lore.kernel.org/r/20240731164422.206503-2-linkmauve@linkmauve.fr
  writes of every codec (H.265/VP9 use the secondary output for P010), so
  the secondary setup is a separate cedrus_dst_secondary_format_set()
  that only the JPEG decoder calls; it covers all four linear formats.]
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  .../staging/media/sunxi/cedrus/cedrus_hw.c    | 42 +++++++++++++++++++

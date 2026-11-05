@@ -19,6 +19,7 @@ S18A cleared, so the core skips CMD11 and selects the UHS timing from
 the CCCR bus speed bits. If the module reports no UHS modes in its
 CCCR, the link stays at high speed as before.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  .../dts/allwinner/sun50i-h616-orangepi-zero2.dts     | 12 ++++++++++++

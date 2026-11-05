@@ -14,7 +14,7 @@ Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
 [aiyengar: LibreELEC 0218, rebased onto the older DE33 format selection
  carried in patches.drm/0034 (no yuv_support variable): the scaler_mask
  test in sun8i_vi_layer_init_one() is converted in place]
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/sun4i/sun50i_planes.c  |  2 +-

@@ -29,6 +29,7 @@ The firmware still picks the AP bandwidth itself, the widest 20/40/80
 block that holds the primary channel; there is no width field in
 START_AP.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  .../wireless/uwe5622/unisocwifi/cfg80211.c    | 41 +++++++++++++++++++

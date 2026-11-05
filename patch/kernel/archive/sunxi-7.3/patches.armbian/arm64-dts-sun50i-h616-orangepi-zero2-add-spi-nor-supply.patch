@@ -20,6 +20,7 @@ as the PL supply creates a probe-order cycle (pinctrl waits for the
 regulator, the regulator's PMIC waits for the RSB pins) and the PMIC,
 and with it MMC and Ethernet, never probes.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero2.dts | 6 ++++++

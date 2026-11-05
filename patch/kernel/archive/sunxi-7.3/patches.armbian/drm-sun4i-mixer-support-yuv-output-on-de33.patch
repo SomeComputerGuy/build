@@ -24,6 +24,7 @@ harmless and keeps the DE2 path unchanged.
 Coefficients are taken from the Allwinner BSP CSC tables
 (de_csc_table.c, r2y and y2y*2l) in the DE3 register layout.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/sun4i/sun4i_crtc.c     |  10 +++

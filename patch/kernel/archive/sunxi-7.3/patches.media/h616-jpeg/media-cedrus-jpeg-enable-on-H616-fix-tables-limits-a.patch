@@ -30,7 +30,7 @@ Fixes and additions to the JPEG decoder for the H616 (and the others):
   instead of capping at 2048x2048, and program the 16-bit MCU count
   fields. The VLD end address is the last byte of the source buffer.
 
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/staging/media/sunxi/cedrus/cedrus.c   |   4 +-

@@ -17,6 +17,7 @@ Raise the regulator floor to 900 mV. The OPP entries keep their
 clamps the low-frequency requests into [900, 990] mV and devfreq keeps
 scaling the clock.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero2.dts | 2 +-

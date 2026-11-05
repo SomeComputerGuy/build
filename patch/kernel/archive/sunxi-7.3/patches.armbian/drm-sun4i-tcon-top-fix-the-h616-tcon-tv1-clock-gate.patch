@@ -18,7 +18,7 @@ The wrong bit dates back to patches.drm/0041 ("drm/sun4i: Add support
 for H616 TCON TOP"). Let the quirks name the TCON TV1 gate bit and use
 bit 21 on the H616.
 
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/sun4i/sun8i_tcon_top.c | 10 ++++++++++

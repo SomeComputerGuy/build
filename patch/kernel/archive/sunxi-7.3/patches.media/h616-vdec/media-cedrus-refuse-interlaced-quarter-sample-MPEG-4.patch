@@ -17,7 +17,7 @@ sample and progressive quarter sample VOLs are not affected. Field
 direct mode in interlaced B-VOPs is correct: the engine matches the
 reference decoder there, and FFmpeg is the one off.
 
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
 --- a/drivers/staging/media/sunxi/cedrus/cedrus.c

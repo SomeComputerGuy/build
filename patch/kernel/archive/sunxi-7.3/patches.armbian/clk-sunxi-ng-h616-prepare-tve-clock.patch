@@ -11,6 +11,7 @@ CLK_SET_RATE_NO_REPARENT so that a rate request stays on the parent DT
 selected instead of re-rating whichever PLL happens to give an exact
 match first, which would disturb a running HDMI output.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/clk/sunxi-ng/ccu-sun50i-h616.c      | 8 +++++++-

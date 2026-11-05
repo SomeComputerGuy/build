@@ -30,6 +30,7 @@ size is about the same (17.3 MB vs 15.5 MB at 4K).
 
 Native AFBC capture is unchanged.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/staging/media/sunxi/cedrus/cedrus.h   | 55 +++++++++++++------

@@ -18,6 +18,7 @@ its 90 degC CPU target trip). The passive trip has no effect on boards
 without a GPU OPP table, because panfrost then registers no devfreq
 cooling device and the map stays unbound.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi | 18 ++++++++++++++++--

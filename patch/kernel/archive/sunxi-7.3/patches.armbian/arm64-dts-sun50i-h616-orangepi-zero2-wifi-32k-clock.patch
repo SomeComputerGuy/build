@@ -17,6 +17,7 @@ module per the v1.3 schematic and the vendor BSP routes the 32kHz clock
 to the WiFi module through it, so also mux PG10 there. The Zero3 keeps
 PG10 unmuxed until its wiring is confirmed.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  .../arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero.dtsi | 4 ++--

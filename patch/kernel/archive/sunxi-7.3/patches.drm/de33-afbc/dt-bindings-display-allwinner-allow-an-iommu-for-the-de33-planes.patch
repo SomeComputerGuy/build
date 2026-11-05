@@ -8,7 +8,7 @@ The DE33 planes block fetches all layer data through the display engine
 master of the H616 IOMMU, the same master the DE2/DE3 mixers describe
 with their iommus property. Allow it on the planes node too.
 
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  .../bindings/display/allwinner,sun50i-h616-de33-planes.yaml    | 3 +++
