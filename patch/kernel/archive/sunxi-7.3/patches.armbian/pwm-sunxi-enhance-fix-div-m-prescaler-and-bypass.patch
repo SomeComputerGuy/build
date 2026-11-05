@@ -1,0 +1,76 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: pwm: sunxi-enhance: Fix div_m, prescaler range and clock bypass
+
+Three register programming errors against the H616 PWM layout (H616 user
+manual v1.0, 9.9.6):
+
+- The complementary (bound pair) path writes PCCR DIV_M with a field
+  width of PWM_DIV_M_SHIFT (0), so the 4-bit field is never cleared and
+  only ORed; a later smaller div_m keeps the old bits.
+- PCR PRESCAL_K is 8 bits (divide by K+1, K = 0..255), but the search
+  loops allow K = 256, which is masked to 0: periods of about 0.7 s come
+  out 256 times too short.
+- A clock bypass bit set by a very short period request is never cleared
+  when clk_bypass_output is 0, so the output stays a raw clock.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+
+--- a/drivers/pwm/pwm-sunxi-enhance.c
++++ b/drivers/pwm/pwm-sunxi-enhance.c
+@@ -351,6 +351,11 @@
+     {
+         /* if freq between 3M~100M, then select 100M as clock */
+         c = 100000000;
++        if (pc->config[pwm->hwpwm].clk_bypass_output != 1) {
++            temp = sunxi_pwm_readl(chip, reg_offset);
++            temp = SET_BITS(reg_bypass_shift, 1, temp, 0);
++            sunxi_pwm_writel(chip, reg_offset, temp);
++        }
+         /*set clk bypass_output reg to 1 when pwm is used as the internal clock source.*/
+         if (pc->config[pwm->hwpwm].clk_bypass_output == 1) {
+             temp = sunxi_pwm_readl(chip, reg_offset);
+@@ -366,6 +371,11 @@
+     {
+         /* if freq < 3M, then select 24M clock */
+         c = 24000000;
++        if (pc->config[pwm->hwpwm].clk_bypass_output != 1) {
++            temp = sunxi_pwm_readl(chip, reg_offset);
++            temp = SET_BITS(reg_bypass_shift, 1, temp, 0);
++            sunxi_pwm_writel(chip, reg_offset, temp);
++        }
+         /*set clk bypass_output reg to 1 when pwm is used as the internal clock source.*/
+         if (pc->config[pwm->hwpwm].clk_bypass_output == 1) {
+             temp = sunxi_pwm_readl(chip, reg_offset);
+@@ -387,7 +397,7 @@
+     {
+         if (entire_cycles <= 65536)
+             break;
+-        for (prescale = 0; prescale < PRESCALE_MAX + 1; prescale++)
++        for (prescale = 0; prescale < PRESCALE_MAX; prescale++)
+         {
+             entire_cycles = ((unsigned long)c / pre_scal[pre_scal_id][1]) / (prescale + 1);
+             if (entire_cycles <= 65536)
+@@ -556,7 +566,7 @@
+     /* get div_m and prescale,which satisfy: deat_val <= 256, entire <= 65536 */
+     for (pre_scal_id = 0; pre_scal_id < 9; pre_scal_id++)
+     {
+-        for (prescale = 0; prescale < PRESCALE_MAX + 1; prescale++)
++        for (prescale = 0; prescale < PRESCALE_MAX; prescale++)
+         {
+             entire_cycles = ((unsigned long)c / pre_scal[pre_scal_id][1]) / (prescale + 1);
+             clk_temp = clk;
+@@ -589,7 +599,7 @@
+     for (i = 0; i < PWM_BIND_NUM; i++)
+     {
+         reg_shift[i] = PWM_DIV_M_SHIFT;
+-        reg_width[i] = PWM_DIV_M_SHIFT;
++        reg_width[i] = PWM_DIV_M_WIDTH;
+         temp = sunxi_pwm_readl(chip, reg_offset[i]);
+         temp = SET_BITS(reg_shift[i], reg_width[i], temp, div_m);
+         sunxi_pwm_writel(chip, reg_offset[i], temp);
+-- 
+Armbian
