@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 5 Nov 2026 21:30:00 +0000
+Subject: [PATCH] media: cedrus: AVS2: program the vendor's picture order
+ counts
+
+The reference table carries 9-bit picture order counts. The driver wrote
+the unwrapped order counts masked to 9 bits; the vendor library writes
+the values of the AVS2 reference software instead: the 8-bit coding_order
+plus the output delay minus the reorder delay, and the counts stored for
+the earlier pictures lowered by 256 at every coding_order wrap, that is
+the unwrapped count minus 256 times the number of wraps so far.
+
+Every difference the engine evaluates is the same either way, but the
+engine is not indifferent to the absolute values: in test1.avs2 (854x480,
+2096 pictures, GOP 8, davs2 bit-exact on 2024 of them) every one of the
+72 wrong pictures traces back to a picture whose masked count is 0x180.
+The F pictures 896 and 1408 (count 384 after masking) are wrong
+themselves with both references correct, and so are B pictures whose
+backward reference and co-located picture is the I picture 384 or 1920
+(for example 382 and 1916); the errors then propagate. Pictures with the
+same low 8 bits that the vendor would program identically (0x080: 128,
+640, 1152, 1664) are bit-exact, as are the hundreds of other pictures
+whose bit 8 differs from the vendor's value.
+
+Program the vendor's values: derive the base from the coding order, the
+output delay and the reorder delay of the current picture (it is a
+multiple of 256; fall back to the highest multiple of 256 not above the
+count if userspace is inconsistent), and subtract it from every order
+count in the table, including the stored reference lists and the
+background substitution. For this stream the table then holds -23 to 290
+only, as with the vendor library.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/staging/media/sunxi/cedrus/cedrus_avs2.c | 56 ++++++++++++++++---
+ 1 file changed, 46 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c b/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
+@@ -162,15 +162,53 @@
+ }
+ 
+ /*
++ * Base of the picture order counts programmed into the reference table.
++ *
++ * The engine takes 9-bit order counts. The vendor library programs the
++ * values of the AVS2 reference software: the 8-bit coding_order of the
++ * picture plus its output delay minus the reorder delay of the sequence,
++ * with the counts stored for the earlier pictures lowered by 256 at every
++ * coding_order wrap. Those are the unwrapped order counts minus 256 times
++ * the number of wraps so far: every difference the engine needs is the
++ * same, and the current picture normally lies in 0 to 255.
++ *
++ * Programming the unwrapped counts masked to 9 bits is not equivalent. A
++ * picture whose masked count is 0x180 decodes wrongly (test1.avs2,
++ * 854x480: the F pictures 896 and 1408 themselves, and B pictures whose
++ * backward reference is the I picture 384 or 1920), while the vendor's
++ * value for them, 0x080, decodes bit-exact. So subtract the base the
++ * vendor's values imply from every order count of the table.
++ */
++static s32 cedrus_avs2_poc_base(const struct v4l2_ctrl_avs2_sequence *seq,
++				const struct v4l2_ctrl_avs2_picture *pic)
++{
++	s32 tr = pic->decode_order_index;
++
++	if (!(seq->flags & V4L2_AVS2_SEQUENCE_FLAG_LOW_DELAY))
++		tr += (s32)pic->picture_output_delay -
++		      seq->picture_reorder_delay;
++
++	/*
++	 * With consistent header fields the base is a multiple of 256. Fall
++	 * back to the highest multiple not above the current count otherwise,
++	 * which also keeps the current picture in 0 to 255.
++	 */
++	if ((pic->poc - tr) & 0xff)
++		return pic->poc & ~0xff;
++
++	return pic->poc - tr;
++}
++
++/*
+  * Reference picture order counts stored with a picture, as the engine
+  * reads them for the co-located motion vectors: an intra picture refers to
+  * itself, and the two references of a B picture are swapped.
+  */
+ static u64 cedrus_avs2_pack_ref_pocs(u8 picture_type, s32 poc,
+ 				     unsigned int num_ref_pics,
+-				     const s32 *ref_poc)
++				     const s32 *ref_poc, s32 base)
+ {
+-	u16 list[V4L2_AVS2_MAX_REF_PICS] = {};
++	s32 list[V4L2_AVS2_MAX_REF_PICS] = {};
+ 	unsigned int i;
+ 	u64 packed = 0;
+ 
+@@ -179,14 +217,14 @@
+ 
+ 	if (picture_type == V4L2_AVS2_PICTURE_TYPE_I) {
+ 		for (i = 0; i < 4; i++)
+-			list[i] = poc;
++			list[i] = poc - base;
+ 	} else if (picture_type == V4L2_AVS2_PICTURE_TYPE_B &&
+ 		   num_ref_pics >= 2) {
+-		list[0] = ref_poc[1];
+-		list[1] = ref_poc[0];
++		list[0] = ref_poc[1] - base;
++		list[1] = ref_poc[0] - base;
+ 	} else {
+ 		for (i = 0; i < num_ref_pics; i++)
+-			list[i] = ref_poc[i];
++			list[i] = ref_poc[i] - base;
+ 	}
+ 
+ 	for (i = 0; i < V4L2_AVS2_MAX_REF_PICS; i++)
+@@ -212,6 +250,7 @@
+ 	 */
+ 	bool afbc = cedrus_recon_is_afbc(ctx);
+ 	dma_addr_t cur_luma, cur_chroma;
++	s32 base = cedrus_avs2_poc_base(seq, pic);
+ 	u32 bottom = 0;
+ 	unsigned int num_refs, i;
+ 	u64 packed;
+@@ -236,7 +275,7 @@
+ 		struct vb2_buffer *buf = vb2_find_buffer(vq, ref->timestamp);
+ 		struct cedrus_buffer *cbuf;
+ 		dma_addr_t luma, chroma;
+-		u32 poc;
++		s32 poc;
+ 
+ 		cur_ref_poc[i] = ref->poc;
+ 
+@@ -260,6 +299,7 @@
+ 			poc = is_top ? pic->poc - 1 : pic->poc;
+ 		else
+ 			poc = ref->poc;
++		poc -= base;
+ 
+ 		tbl->pic[i][0] = cpu_to_le32(VE_DEC_AVS2_PIC_ADDR(luma));
+ 		tbl->pic[i][1] = cpu_to_le32((poc & 0x1ff) | bottom);
+@@ -267,7 +307,7 @@
+ 
+ 		packed = cedrus_avs2_pack_ref_pocs(ref->picture_type, ref->poc,
+ 						   ref->num_ref_pics,
+-						   ref->ref_poc);
++						   ref->ref_poc, base);
+ 		if (i == 0) {
+ 			tbl->pic[0][3] = cpu_to_le32(lower_32_bits(packed));
+ 			tbl->pic[1][3] = cpu_to_le32(upper_32_bits(packed));
+@@ -289,11 +329,11 @@
+ 	cur_chroma = afbc ? cur_luma :
+ 		     cedrus_dst_frame_addr(ctx, &run->dst->vb2_buf, 1);
+ 	tbl->pic[i][0] = cpu_to_le32(VE_DEC_AVS2_PIC_ADDR(cur_luma));
+-	tbl->pic[i][1] = cpu_to_le32((pic->poc & 0x1ff) | bottom);
++	tbl->pic[i][1] = cpu_to_le32(((pic->poc - base) & 0x1ff) | bottom);
+ 	tbl->pic[i][2] = cpu_to_le32(VE_DEC_AVS2_PIC_ADDR(cur_chroma));
+ 
+ 	packed = cedrus_avs2_pack_ref_pocs(pic->picture_type, pic->poc,
+-					   num_refs, cur_ref_poc);
++					   num_refs, cur_ref_poc, base);
+ 	tbl->ref_poc[6][0] = cpu_to_le32(lower_32_bits(packed));
+ 	tbl->ref_poc[6][1] = cpu_to_le32(upper_32_bits(packed));
+ }
+-- 
+2.47.0
