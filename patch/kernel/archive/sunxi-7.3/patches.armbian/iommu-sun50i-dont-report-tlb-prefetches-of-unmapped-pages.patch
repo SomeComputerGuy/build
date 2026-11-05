@@ -1,0 +1,151 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 5 Nov 2026 23:00:00 +0000
+Subject: iommu: sun50i: Don't report TLB prefetches of unmapped pages as
+ page faults
+
+With a display scanning out, the driver reports
+
+  sun50i-iommu 30f0000.iommu: Page fault for 0x00000000fff00000 (master -1, dir rd)
+
+once when fbcon takes over the framebuffer (1.5 s after boot, the first
+scanout frame) and again, vsync-spaced, after TLB flushes while a video
+decode frees its buffers (every unmap flushes the whole TLB and PTW cache
+in this driver). No device accesses that address: with the IOVA allocator
+handing out addresses from the top down and size-aligned, the 3 MiB
+fbcon framebuffer of a 1024x768 mode is the first allocation and lands at
+0xffc00000-0xffefffff, and the top 1 MiB of the IOVA space above it is
+never mapped. 0xfff00000 is the page after the framebuffer's end.
+
+The walk that fails is the TLB prefetcher's: for the page after the one
+the master is reading. The H616 user manual (3.12.6.50, 3.12.6.51) gives
+the L1/L2 page table interrupt registers a bit 31 next to the per-master
+bits 0-6 for walks that no master started, and Allwinner's sunxi-iommu
+driver treats a page table interrupt with bit 31 set as a prefetch of an
+unmapped page ("It's OK to prefetch an invalid pagetable") and does not
+report it. This driver masks the register to the master bits, gets no
+bit, and reports ilog2(0) = -1 as the master.
+
+Return early for a page table interrupt with the prefetch bit set and no
+master bit: no master read anything, nothing is stalled, so there is
+nothing to report, reset or zap. Print such walks with dev_dbg so they
+can be counted when needed. For real page table faults, name the level
+(L1/L2) and print the raw interrupt register together with the master,
+so a fault that the hardware does not attribute is still diagnosable.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+
+--- a/drivers/iommu/sun50i-iommu.c
++++ b/drivers/iommu/sun50i-iommu.c
+@@ -80,6 +80,15 @@
+ #define IOMMU_INT_ERR_DATA_REG(i)	(0x150 + (i) * 4)
+ #define IOMMU_L1PG_INT_REG		0x0180
+ #define IOMMU_L2PG_INT_REG		0x0184
++/*
++ * Besides one bit per master, the L1/L2 page table interrupt registers
++ * have a bit for a page table walk that no master started: the TLB
++ * prefetcher's walk for the page after the one being accessed (H616 user
++ * manual 3.12.6.50 and 3.12.6.51, bit 31, "debug mode"; the vendor's
++ * sunxi-iommu treats a page table fault with this bit as a prefetch of an
++ * unmapped page and does not report it).
++ */
++#define IOMMU_PG_INT_PREFETCH			BIT(31)
+ 
+ #define IOMMU_INT_INVALID_L2PG			BIT(17)
+ #define IOMMU_INT_INVALID_L1PG			BIT(16)
+@@ -909,11 +918,14 @@
+ };
+ 
+ static void sun50i_iommu_report_fault(struct sun50i_iommu *iommu,
+-				      unsigned master, phys_addr_t iova,
+-				      unsigned prot)
+-{
+-	dev_err_ratelimited(iommu->dev, "Page fault for %pad (master %d, dir %s)\n",
+-		&iova, master, (prot == IOMMU_FAULT_WRITE) ? "wr" : "rd");
++				      int master, phys_addr_t iova,
++				      unsigned prot, const char *level,
++				      u32 status)
++{
++	dev_err_ratelimited(iommu->dev,
++			    "Page fault for %pad (master %d, dir %s, %s, status %#x)\n",
++			    &iova, master, (prot == IOMMU_FAULT_WRITE) ? "wr" : "rd",
++			    level, status);
+ 
+ 	if (iommu->domain)
+ 		report_iommu_fault(iommu->domain, iommu->dev, iova, prot);
+@@ -925,24 +937,41 @@
+ 
+ static phys_addr_t sun50i_iommu_handle_pt_irq(struct sun50i_iommu *iommu,
+ 					      unsigned addr_reg,
+-					      unsigned blame_reg)
++					      unsigned blame_reg,
++					      const char *level)
+ {
+ 	phys_addr_t iova;
+-	unsigned master;
++	int master = -1;
+ 	u32 blame;
+ 
+ 	assert_spin_locked(&iommu->iommu_lock);
+ 
+ 	iova = iommu_read(iommu, addr_reg);
+ 	blame = iommu_read(iommu, blame_reg);
+-	master = ilog2(blame & IOMMU_INT_MASTER_MASK);
++
++	/*
++	 * A walk the TLB prefetcher started for the page after the one a
++	 * master is reading fails whenever that next page is not mapped,
++	 * e.g. for the display engine scanning out a framebuffer that ends
++	 * at an unmapped IOVA. No master accessed the page and nothing is
++	 * stalled or cached, so there is nothing to report, reset or zap.
++	 */
++	if ((blame & IOMMU_PG_INT_PREFETCH) && !(blame & IOMMU_INT_MASTER_MASK)) {
++		dev_dbg_ratelimited(iommu->dev, "%s page table prefetch of unmapped %pad\n",
++				    level, &iova);
++		return iova;
++	}
++
++	if (blame & IOMMU_INT_MASTER_MASK)
++		master = ilog2(blame & IOMMU_INT_MASTER_MASK);
+ 
+ 	/*
+ 	 * If the address is not in the page table, we can't get what
+ 	 * operation triggered the fault. Assume it's a read
+ 	 * operation.
+ 	 */
+-	sun50i_iommu_report_fault(iommu, master, iova, IOMMU_FAULT_READ);
++	sun50i_iommu_report_fault(iommu, master, iova, IOMMU_FAULT_READ, level,
++				  blame);
+ 
+ 	return iova;
+ }
+@@ -992,12 +1021,7 @@
+ 		break;
+ 	}
+ 
+-	/*
+-	 * If the address is not in the page table, we can't get what
+-	 * operation triggered the fault. Assume it's a read
+-	 * operation.
+-	 */
+-	sun50i_iommu_report_fault(iommu, master, iova, dir);
++	sun50i_iommu_report_fault(iommu, master, iova, dir, "permission", blame);
+ 
+ 	return iova;
+ }
+@@ -1022,11 +1046,11 @@
+ 	if (status & IOMMU_INT_INVALID_L2PG)
+ 		sun50i_iommu_handle_pt_irq(iommu,
+ 					    IOMMU_INT_ERR_ADDR_L2_REG,
+-					    IOMMU_L2PG_INT_REG);
++					    IOMMU_L2PG_INT_REG, "L2 page table");
+ 	else if (status & IOMMU_INT_INVALID_L1PG)
+ 		sun50i_iommu_handle_pt_irq(iommu,
+ 					   IOMMU_INT_ERR_ADDR_L1_REG,
+-					   IOMMU_L1PG_INT_REG);
++					   IOMMU_L1PG_INT_REG, "L1 page table");
+ 	else
+ 		sun50i_iommu_handle_perm_irq(iommu);
+ 
