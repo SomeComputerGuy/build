@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: arm64: dts: allwinner: h616: Cover the codec RAMP register
+
+The codec node maps 0x31c bytes, but the driver uses AC_RAMP_REG at
+offset 0x31c (H616 user manual v1.0, 8.4.6.56 at 0x31c;
+the regmap max_register is 0x31c). The access works only because ioremap
+rounds up to a page. Make the region 0x320 bytes.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+@@ -1171,7 +1171,7 @@
+ 		codec: codec@5096000 {
+ 			#sound-dai-cells = <0>;
+ 			compatible = "allwinner,sun50i-h616-codec";
+-			reg = <0x05096000 0x31c>;
++			reg = <0x05096000 0x320>;
+ 			interrupts = <GIC_SPI 58 IRQ_TYPE_LEVEL_HIGH>;
+ 			clocks = <&ccu CLK_BUS_AUDIO_CODEC>,
+ 				 <&ccu CLK_AUDIO_CODEC_1X>;
+-- 
+Armbian
