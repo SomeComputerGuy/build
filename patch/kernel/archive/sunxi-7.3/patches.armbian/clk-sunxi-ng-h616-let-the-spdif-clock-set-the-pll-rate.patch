@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: clk: sunxi-ng: h616: Let the S/PDIF clock set the audio PLL rate
+
+sun4i-spdif asks for 22.5792 or 24.576 MHz on the OWA module clock (H616
+user manual v1.0, 8.3: Fs = PLL_AUDIO / ((TX_RATIO + 1) * 128)). The
+spdif clock has no CLK_SET_RATE_PARENT, so the rate can only be met if the
+codec or the audio hub has already retuned pll-audio to the right
+family. Otherwise the power-of-two divider rounds down and the request
+"succeeds" at a wrong rate (about 12.3 MHz from the reset PLL value,
+i.e. 48 kHz content played at about 24 kHz). Propagate the rate to the
+PLL, as the codec clocks already do.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+
+--- a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
++++ b/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
+@@ -518,7 +518,7 @@
+ 		.hw.init	= CLK_HW_INIT_PARENTS("spdif",
+ 						      audio_parents,
+ 						      &ccu_div_ops,
+-						      0),
++						      CLK_SET_RATE_PARENT),
+ 	},
+ };
+ 
+-- 
+Armbian
