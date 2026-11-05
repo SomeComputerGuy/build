@@ -21,6 +21,7 @@ Zero3, with the same PHY and layout, already does upstream, and as the
 vendor BSP does (rx-delay = 0, PHY strap delay). The TX delay stays at
 700 ps.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero2.dts | 3 +--

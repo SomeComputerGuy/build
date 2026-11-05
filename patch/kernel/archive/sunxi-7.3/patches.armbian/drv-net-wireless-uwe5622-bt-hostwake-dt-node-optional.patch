@@ -30,6 +30,7 @@ would be needed; the >= 7.1 code path looks the GPIO up with
 fwnode_gpiod_get_index(..., "bt_hostwake", ...), i.e. a -gpios suffix.
 
 Upstream: to be submitted to https://github.com/armbian/uwe5622
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/net/wireless/uwe5622/unisocwcn/platform/wcn_boot.c | 26 ++++++++++++++++++++------

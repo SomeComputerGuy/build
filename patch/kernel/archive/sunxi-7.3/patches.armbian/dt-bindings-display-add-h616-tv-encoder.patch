@@ -9,6 +9,7 @@ register block with its own bus clock and reset, and the encoder has a
 module clock of its own. Describe both register ranges, the three
 clocks, the two resets and the SID calibration cell.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  .../allwinner,sun50i-h616-tv-encoder.yaml     | 103 ++++++++++++++++++

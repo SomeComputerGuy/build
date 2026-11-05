@@ -18,6 +18,7 @@ real errors in dmesg:
 Move the first two to wl_debug (still printed with sprdwl_debug_level
 raised) and the ini path to pr_info.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
 --- a/drivers/net/wireless/uwe5622/unisocwifi/cmdevt.c

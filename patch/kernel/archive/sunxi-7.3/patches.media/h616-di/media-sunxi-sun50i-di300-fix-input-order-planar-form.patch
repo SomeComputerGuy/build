@@ -39,7 +39,7 @@ openmax/vdec/src/omx_deinterlace.cpp:
   timestamp half a frame interval after the first one, so the
   field-rate output has monotonic, evenly spaced timestamps.
 
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  .../sunxi/sun50i-di300/sun50i-di300.c         | 180 ++++++++++++------

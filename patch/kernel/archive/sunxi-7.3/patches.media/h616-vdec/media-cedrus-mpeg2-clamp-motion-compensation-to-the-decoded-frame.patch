@@ -22,7 +22,7 @@ profile streams are all 480 or 576 lines and did not show it.
 Take the boundary from the sequence header: the width and the height
 rounded up to the macroblock rows, halved for field pictures.
 
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c

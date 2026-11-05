@@ -14,7 +14,7 @@ Fixes: c50519e6db4d ("drm/sun4i: Add basic support for DE3")
 Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
 [aiyengar: LibreELEC 0222, include hunk rebased onto megous' display
  pipeline takeover patch (sun4i_tcon.h include); no code change]
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/sun4i/sun8i_csc.c   | 32 +++++++++++++++++++++--------

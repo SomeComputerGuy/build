@@ -25,7 +25,7 @@ the offset of the first slice.
 The controls take the CID range at the stateless codec base + 900 and
 the control types 0x02c0 to 0x02c3.
 
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  .../userspace-api/media/v4l/biblio.rst        |  10 +

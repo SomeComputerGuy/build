@@ -21,6 +21,7 @@ Exposing the curve parameters (thresholds, slopes and time constants)
 needs the offset terms to be recomputed together with them and is left
 for later.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  sound/soc/sunxi/sun4i-codec.c | 84 +++++++++++++++++++++++++++++++++++

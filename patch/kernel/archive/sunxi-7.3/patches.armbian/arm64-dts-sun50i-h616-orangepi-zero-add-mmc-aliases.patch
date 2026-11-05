@@ -16,6 +16,7 @@ Pin the numbering with aliases, as other H616/H618 boards (Tanix TX6s,
 Mellow Fly C5, WalnutPi) already do: mmc0 = SD, mmc1 = SDIO WiFi. mmc2
 (eMMC) is not wired on either board.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero.dtsi | 2 ++

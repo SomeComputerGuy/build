@@ -14,7 +14,7 @@ Taken from the planes node of LibreELEC's "arm64: dts: allwinner: h616:
 Add display writeback" (Jernej Skrabec); the writeback node of that
 patch is not carried.
 
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi | 1 +

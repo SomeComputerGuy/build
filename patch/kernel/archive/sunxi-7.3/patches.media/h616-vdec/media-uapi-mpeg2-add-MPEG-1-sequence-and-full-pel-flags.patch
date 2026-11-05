@@ -19,7 +19,7 @@ and never had a way to send D-pictures, which only MPEG-1 streams have,
 so nothing changes for them. Drivers without an MPEG-1 mode have to
 reject the flag.
 
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
 --- a/include/uapi/linux/v4l2-controls.h

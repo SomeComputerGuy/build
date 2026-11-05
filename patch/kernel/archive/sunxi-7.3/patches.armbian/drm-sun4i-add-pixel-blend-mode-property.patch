@@ -39,6 +39,7 @@ the blender scales only the alpha, not the colour, by the plane alpha
 (the hardware has no stage to do that for already pre-multiplied data).
 Opaque plane alpha, the common case, is exact.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/sun4i/sun8i_mixer.c    | 17 ++++++++++++++++-

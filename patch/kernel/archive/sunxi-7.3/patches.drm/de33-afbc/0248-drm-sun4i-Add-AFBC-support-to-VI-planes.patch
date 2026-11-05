@@ -18,7 +18,7 @@ Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
  before the format/modifier selection, and the vi_layer hunks are
  rebased onto the older (yuv_support-less) DE33 format selection
  carried here]
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/sun4i/sun8i_ui_layer.c  |  2 +-

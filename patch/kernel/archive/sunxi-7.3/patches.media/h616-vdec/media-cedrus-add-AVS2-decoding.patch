@@ -36,7 +36,7 @@ rejected for now.
 
 The decoder is not enabled on any variant yet.
 
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/staging/media/sunxi/cedrus/Makefile   |   2 +-

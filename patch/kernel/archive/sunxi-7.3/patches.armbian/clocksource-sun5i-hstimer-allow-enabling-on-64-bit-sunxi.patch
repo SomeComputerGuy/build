@@ -16,6 +16,7 @@ clocksource and clockevent at rating 340, below the arch timer (400 and
 450) and the sun4i timer (350), so enabling it adds a second hardware
 time base without changing which one the kernel uses.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/clocksource/Kconfig | 7 ++++++-

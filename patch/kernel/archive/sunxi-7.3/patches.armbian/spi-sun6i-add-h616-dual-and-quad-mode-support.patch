@@ -16,6 +16,7 @@ dual and quad mode bits, matched on the existing
 1-1-2 and 1-1-4 reads where the board wires the extra data lines.
 The DT binding already lists this compatible.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/spi/spi-sun6i.c | 7 +++++++

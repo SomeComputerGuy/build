@@ -21,6 +21,7 @@ in rx_length.
 This shows up on dwmac-sun8i (normal descriptors, 2047 byte buffers)
 once the MAC is set to accept frames longer than 1518 bytes.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
 diff --git a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c b/drivers/net/ethernet/stmicro/stmmac/norm_desc.c

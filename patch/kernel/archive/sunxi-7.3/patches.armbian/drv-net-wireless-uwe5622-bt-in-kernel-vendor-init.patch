@@ -48,6 +48,7 @@ copy; it is not part of the tree Armbian injects.)
 Upstream: to be submitted to https://github.com/armbian/uwe5622 (git-am
 copy: harness/research/uwe5622-upstream/0004-*.patch). Applies on top of
 the f88cd0d pin.
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/net/wireless/uwe5622/tty-sdio/Kconfig   |  13 ++

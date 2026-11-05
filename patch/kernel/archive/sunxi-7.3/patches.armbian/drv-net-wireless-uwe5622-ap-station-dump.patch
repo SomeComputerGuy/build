@@ -18,6 +18,7 @@ the associated AP through the existing get_station path.
 Also log the empty ACL list that hostapd sets on every AP start at debug
 level, not error level.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  .../wireless/uwe5622/unisocwifi/cfg80211.c    | 78 ++++++++++++++++++-

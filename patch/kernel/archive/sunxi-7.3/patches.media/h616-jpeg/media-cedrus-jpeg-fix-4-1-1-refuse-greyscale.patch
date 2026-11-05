@@ -22,7 +22,7 @@ pre-filled with a marker byte):
   trigger-write and MCU-size variant tried. Refuse it, so userspace can
   fall back to software.
 
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/staging/media/sunxi/cedrus/cedrus.h   |   8 +

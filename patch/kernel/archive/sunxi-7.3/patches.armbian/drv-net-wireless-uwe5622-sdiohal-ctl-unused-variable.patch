@@ -14,6 +14,7 @@ unconditionally. Move the declaration under the same guard as its use.
 No functional change.
 
 Upstream: to be submitted to https://github.com/armbian/uwe5622
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/net/wireless/uwe5622/unisocwcn/sdio/sdiohal_ctl.c | 4 +++-

@@ -23,7 +23,7 @@ decoding time (1080p60 Xvid, B + qpel + GMC: 6.41 s against 6.45 s for
 Do it for H.263 and Sorenson Spark too, which run in the same engine
 through the same setup.
 
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
 diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c

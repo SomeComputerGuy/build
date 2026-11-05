@@ -24,6 +24,7 @@ The command blocks, and the connection event runs in the event path.
 With this change the board answered ARP after a fresh association with a
 preset address, after two AP restarts, and after rtcwake -m mem.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  .../wireless/uwe5622/unisocwifi/cfg80211.c    | 42 +++++++++++++++++++

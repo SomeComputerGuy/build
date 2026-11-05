@@ -13,7 +13,7 @@ chroma upsampling path is available.
 Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
 [aiyengar: LibreELEC 0231, the sun8i_vi_layer.c hunk is rebased onto the
  older DE33 format selection (only the TODO comment is dropped)]
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/sun4i/sun50i_planes.c  | 13 ++++++++-----

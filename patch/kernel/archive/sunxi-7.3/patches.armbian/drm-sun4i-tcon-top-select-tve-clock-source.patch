@@ -13,6 +13,7 @@ Add a helper to flip the source bit in TCON_TV_SETUP and call it from
 the R40-style TCON TV mux setup, selecting the TVE whenever the attached
 encoder is a TV DAC and the CCU clock otherwise.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/sun4i/sun4i_tcon.c     | 12 ++++++++

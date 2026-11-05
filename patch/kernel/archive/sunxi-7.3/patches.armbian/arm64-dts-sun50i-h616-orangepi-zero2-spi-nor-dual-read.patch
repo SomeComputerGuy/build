@@ -15,6 +15,7 @@ the plain 0x03 READ it uses today.
 The transmit side stays single-bit: page program over two lines is not
 offered by the flash.
 
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero2.dts | 2 ++

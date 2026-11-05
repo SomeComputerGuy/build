@@ -14,7 +14,7 @@ A planar source with a semi-planar capture format (YUV420 to NV12)
 never completed: the engine stayed busy. Only allow a semi-planar
 capture format that equals the source format.
 
-Assisted-by: Claude:claude-opus-5-5
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  .../sunxi/sun50i-di300/sun50i-di300.c         | 28 +++++++++++--------
