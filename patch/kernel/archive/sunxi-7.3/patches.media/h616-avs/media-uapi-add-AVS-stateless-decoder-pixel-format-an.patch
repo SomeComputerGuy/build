@@ -459,7 +459,7 @@ index ae0be373c..916b02e32 100644
  	void *p = ptr.p + idx * ctrl->elem_size;
  
  	if (ctrl->p_def.p_const)
-@@ -272,6 +273,16 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
+@@ -272,6 +273,19 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
  		memset(p_avs2_weight_quant->matrix_8x8, 64,
  		       sizeof(p_avs2_weight_quant->matrix_8x8));
  		break;
@@ -470,6 +470,9 @@ index ae0be373c..916b02e32 100644
 +		p_avs_sequence->profile_id = V4L2_AVS_PROFILE_JIZHUN;
 +		p_avs_sequence->chroma_format = 1;
 +		p_avs_sequence->sample_precision = 1;
++		/* QCIF, the smallest standard picture size */
++		p_avs_sequence->horizontal_size = 176;
++		p_avs_sequence->vertical_size = 144;
 +		p_avs_sequence->flags =
 +			V4L2_AVS_SEQUENCE_FLAG_PROGRESSIVE_SEQUENCE;
 +		break;
