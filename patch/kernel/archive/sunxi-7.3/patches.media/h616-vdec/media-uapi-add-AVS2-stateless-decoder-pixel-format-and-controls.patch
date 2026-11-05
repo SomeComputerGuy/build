@@ -48,9 +48,9 @@ v6: documentation only, no change to the controls or their layout. Shared
  drivers/media/v4l2-core/v4l2-ctrls-defs.c     |  16 +
  drivers/media/v4l2-core/v4l2-ioctl.c          |   1 +
  include/media/v4l2-ctrls.h                    |   8 +
- include/uapi/linux/v4l2-controls.h            | 236 +++++++++++
+ include/uapi/linux/v4l2-controls.h            | 237 +++++++++++
  include/uapi/linux/videodev2.h                |   6 +
- 12 files changed, 888 insertions(+)
+ 12 files changed, 889 insertions(+)
 
 diff --git a/Documentation/userspace-api/media/v4l/biblio.rst b/Documentation/userspace-api/media/v4l/biblio.rst
 index 0510aee5b..1dcfc7d38 100644
@@ -858,7 +858,7 @@ diff --git a/include/uapi/linux/v4l2-controls.h b/include/uapi/linux/v4l2-contro
 index 032076c3f..f6fb23036 100644
 --- a/include/uapi/linux/v4l2-controls.h
 +++ b/include/uapi/linux/v4l2-controls.h
-@@ -4294,6 +4294,242 @@ struct v4l2_ctrl_h263_slice_params {
+@@ -4294,6 +4294,243 @@ struct v4l2_ctrl_h263_slice_params {
  	__u8	reserved;
  };
  
@@ -1058,7 +1058,8 @@ index 032076c3f..f6fb23036 100644
 + *
 + * @matrix_4x4: 4x4 matrix in raster scan order (entry i * 4 + j is row i,
 + *	column j); drivers convert it to the hardware order.
-+ * @matrix_8x8: 8x8 matrix in raster scan order (entry i * 8 + j).
++ * @matrix_8x8: 8x8 matrix in raster scan order (entry i * 8 + j is row i,
++ *	column j).
 + */
 +struct v4l2_ctrl_avs2_weight_quant {
 +	__u8	matrix_4x4[16];
