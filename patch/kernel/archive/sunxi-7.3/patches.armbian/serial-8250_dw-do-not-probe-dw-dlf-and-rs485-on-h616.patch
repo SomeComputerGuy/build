@@ -1,0 +1,185 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: serial: 8250_dw: Do not probe the DW DLF and RS-485 registers on the H616
+
+The H616 UART is a DW-derived 16550 whose extended registers differ from
+the Synopsys layout (H616 user manual v1.0, 9.2.6.18-20): 0xb0/0xb4 are the
+DBG_DLL/DBG_DLH debug divisor latches and 0xc0 is UART_485_CTL. The DW
+probes in dw8250_setup_port() therefore succeed on registers that are not
+DE_EN/RE_EN/DLF:
+
+- RE_EN (0xb4) reads back 1, so hw_rs485_support is set and TIOCSRS485
+  programs DW TCR/DE_EN/RE_EN instead of using the software-RTS em485
+  path; RS-485 reports success but does nothing (on this IP RS-485 is
+  MCR[7:6] = 2 plus UART_485_CTL).
+- DLF (0xc0) reads back 0xf, so dlf_size = 4 and the fractional divisor
+  code truncates the integer divisor and writes the fraction into
+  UART_485_CTL. At 24 MHz, 153600 baud gets divisor 9 (+8.5 %) instead of
+  10 (-2.3 %).
+
+Add a quirk that skips both probes, selected by a new
+"allwinner,sun50i-h616-uart" compatible (also used by the pending H616
+UART FIFO series), and use it for the six H616 UARTs.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+@@ -896,7 +896,8 @@
+ 		};
+ 
+ 		uart0: serial@5000000 {
+-			compatible = "snps,dw-apb-uart";
++			compatible = "allwinner,sun50i-h616-uart",
++				     "snps,dw-apb-uart";
+ 			reg = <0x05000000 0x400>;
+ 			interrupts = <GIC_SPI 0 IRQ_TYPE_LEVEL_HIGH>;
+ 			reg-shift = <2>;
+@@ -909,7 +910,8 @@
+ 		};
+ 
+ 		uart1: serial@5000400 {
+-			compatible = "snps,dw-apb-uart";
++			compatible = "allwinner,sun50i-h616-uart",
++				     "snps,dw-apb-uart";
+ 			reg = <0x05000400 0x400>;
+ 			interrupts = <GIC_SPI 1 IRQ_TYPE_LEVEL_HIGH>;
+ 			reg-shift = <2>;
+@@ -922,7 +924,8 @@
+ 		};
+ 
+ 		uart2: serial@5000800 {
+-			compatible = "snps,dw-apb-uart";
++			compatible = "allwinner,sun50i-h616-uart",
++				     "snps,dw-apb-uart";
+ 			reg = <0x05000800 0x400>;
+ 			interrupts = <GIC_SPI 2 IRQ_TYPE_LEVEL_HIGH>;
+ 			reg-shift = <2>;
+@@ -935,7 +938,8 @@
+ 		};
+ 
+ 		uart3: serial@5000c00 {
+-			compatible = "snps,dw-apb-uart";
++			compatible = "allwinner,sun50i-h616-uart",
++				     "snps,dw-apb-uart";
+ 			reg = <0x05000c00 0x400>;
+ 			interrupts = <GIC_SPI 3 IRQ_TYPE_LEVEL_HIGH>;
+ 			reg-shift = <2>;
+@@ -948,7 +952,8 @@
+ 		};
+ 
+ 		uart4: serial@5001000 {
+-			compatible = "snps,dw-apb-uart";
++			compatible = "allwinner,sun50i-h616-uart",
++				     "snps,dw-apb-uart";
+ 			reg = <0x05001000 0x400>;
+ 			interrupts = <GIC_SPI 4 IRQ_TYPE_LEVEL_HIGH>;
+ 			reg-shift = <2>;
+@@ -961,7 +966,8 @@
+ 		};
+ 
+ 		uart5: serial@5001400 {
+-			compatible = "snps,dw-apb-uart";
++			compatible = "allwinner,sun50i-h616-uart",
++				     "snps,dw-apb-uart";
+ 			reg = <0x05001400 0x400>;
+ 			interrupts = <GIC_SPI 5 IRQ_TYPE_LEVEL_HIGH>;
+ 			reg-shift = <2>;
+--- a/Documentation/devicetree/bindings/serial/snps-dw-apb-uart.yaml
++++ b/Documentation/devicetree/bindings/serial/snps-dw-apb-uart.yaml
+@@ -51,6 +51,7 @@
+           - const: renesas,rzn1-uart
+       - items:
+           - enum:
++              - allwinner,sun50i-h616-uart
+               - anlogic,dr1v90-uart
+               - brcm,bcm11351-dw-apb-uart
+               - brcm,bcm21664-dw-apb-uart
+--- a/drivers/tty/serial/8250/8250_dw.c
++++ b/drivers/tty/serial/8250/8250_dw.c
+@@ -51,6 +51,7 @@
+ #define DW_UART_QUIRK_APMC0D08		BIT(4)
+ #define DW_UART_QUIRK_CPR_VALUE		BIT(5)
+ #define DW_UART_QUIRK_IER_KICK		BIT(6)
++#define DW_UART_QUIRK_NO_DW_EXT_REGS	BIT(7)
+ 
+ /*
+  * Number of consecutive IIR_NO_INT interrupts required to trigger interrupt
+@@ -600,6 +601,8 @@
+ 		data->data.dma.prepare_tx_dma = dw8250_prepare_tx_dma;
+ 		data->data.dma.prepare_rx_dma = dw8250_prepare_rx_dma;
+ 	}
++	if (quirks & DW_UART_QUIRK_NO_DW_EXT_REGS)
++		data->data.no_dw_ext_regs = true;
+ 	if (quirks & DW_UART_QUIRK_APMC0D08) {
+ 		p->iotype = UPIO_MEM32;
+ 		p->regshift = 2;
+@@ -888,7 +891,19 @@
+ 	.quirks = DW_UART_QUIRK_CPR_VALUE,
+ };
+ 
++/*
++ * Allwinner H616 (and siblings): 0xc0 is UART_485_CTL and 0xb0/0xb4 are
++ * DBG_DLL/DBG_DLH (H616 UM 9.2.5), so the DW DLF and RE_EN probes read back
++ * non-zero and select a truncating "fractional" divisor and a DW RS-485 path
++ * that this IP does not have (RS-485 is MCR[7:6] = 2 here).
++ */
++static const struct dw8250_platform_data dw8250_sun50i_h616_data = {
++	.usr_reg = DW_UART_USR,
++	.quirks = DW_UART_QUIRK_NO_DW_EXT_REGS,
++};
++
+ static const struct of_device_id dw8250_of_match[] = {
++	{ .compatible = "allwinner,sun50i-h616-uart", .data = &dw8250_sun50i_h616_data },
+ 	{ .compatible = "snps,dw-apb-uart", .data = &dw8250_dw_apb },
+ 	{ .compatible = "cavium,octeon-3860-uart", .data = &dw8250_octeon_3860_data },
+ 	{ .compatible = "marvell,armada-38x-uart", .data = &dw8250_armada_38x_data },
+--- a/drivers/tty/serial/8250/8250_dwlib.c
++++ b/drivers/tty/serial/8250/8250_dwlib.c
+@@ -196,7 +196,7 @@
+ 	struct uart_8250_port *up = up_to_u8250p(p);
+ 	u32 reg, old_dlf;
+ 
+-	pd->hw_rs485_support = dw8250_detect_rs485_hw(p);
++	pd->hw_rs485_support = !pd->no_dw_ext_regs && dw8250_detect_rs485_hw(p);
+ 	if (pd->hw_rs485_support) {
+ 		p->rs485_config = dw8250_rs485_config;
+ 		up->lsr_save_mask = LSR_SAVE_FLAGS | DW_UART_LSR_ADDR_RCVD;
+@@ -209,6 +209,9 @@
+ 	}
+ 	up->capabilities |= UART_CAP_NOTEMT;
+ 
++	if (pd->no_dw_ext_regs)
++		goto skip_dlf;
++
+ 	/* Preserve value written by firmware or bootloader  */
+ 	old_dlf = dw8250_readl_ext(p, DW_UART_DLF);
+ 	dw8250_writel_ext(p, DW_UART_DLF, ~0U);
+@@ -221,6 +224,8 @@
+ 		p->set_divisor = dw8250_set_divisor;
+ 	}
+ 
++skip_dlf:
++
+ 	reg = dw8250_readl_ext(p, DW_UART_UCV);
+ 	if (reg)
+ 		dev_dbg(p->dev, "Designware UART version %c.%c%c\n",
+--- a/drivers/tty/serial/8250/8250_dwlib.h
++++ b/drivers/tty/serial/8250/8250_dwlib.h
+@@ -87,6 +87,11 @@
+ 	/* Hardware configuration */
+ 	u32			cpr_value;
+ 	u8			dlf_size;
++	/*
++	 * Offsets 0xb0..0xc8 are vendor registers (e.g. Allwinner DBG_DLL/DLH,
++	 * RS485_CTL), not DE_EN/RE_EN/DLF: skip the DLF and RS-485 probes.
++	 */
++	bool			no_dw_ext_regs;
+ 
+ 	/* RS485 variables */
+ 	bool			hw_rs485_support;
+-- 
+Armbian
