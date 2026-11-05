@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Tharit Tangkijwanichakul <tharitt97@gmail.com>
+Date: Tue, 11 Aug 2026 17:04:14 +0000
+Subject: [PATCH 6/6] media: v4l2-ctrls: default HEVC SPS chroma format to
+ 4:2:0
+
+The default value of a compound control is zero initialized when no
+explicit default is provided. For V4L2_CTRL_TYPE_HEVC_SPS this results
+in chroma_format_idc being set to 0, which represents monochrome video.
+
+Most stateless HEVC decoders do not support monochrome video. In
+particular, the VDPU38x variant of rkvdec fails v4l2-compliance in two
+tests related to V4L2_CID_STATELESS_HEVC_SPS.  The Control ioctls test
+reads the control with GET_EXT_CTRLS and writes the same value
+back; TRY_EXT_CTRLS then returns -EINVAL because the VDPU38x
+rkvdec_hevc_validate_sps() rejects sps->chroma_format_idc == 0.
+
+    v4l2-compliance 1.33.0-5491, 64 bits, 64-bit time_t
+    v4l2-compliance SHA: b32589c51481 2026-07-16 08:51:38
+    Control ioctls:
+        fail: v4l2-test-controls.cpp(942):
+	try_ext_ctrls returned an error (22)
+      test VIDIOC_G/S/TRY_EXT_CTRLS: FAIL
+    Buffer ioctls:
+        fail: v4l2-test-buffers.cpp(3102): node->streamon(q.g_type())
+        fail: v4l2-test-buffers.cpp(3157): testBlockingDQBuf(node, m2m_q)
+      test blocking wait: FAIL
+
+Set the common HEVC SPS compound control default to
+chroma_format_idc = 1, corresponding to 4:2:0.
+
+Fixes: c9a59dc2acc7 ("media: rkvdec: Add HEVC support for the VDPU381 variant")
+Signed-off-by: Tharit Tangkijwanichakul <tharitt97@gmail.com>
+Link: https://patch.msgid.link/20260811170414.644-1-tharitt97@gmail.com
+[ Arun: context adapted to our VC-1/MPEG-4/H.263/AVS2/AVS stateless controls in std_init_compound() ]
+---
+Origin: Orange Pi 5 mainline project, ~/orangepi5/patches/linux/1407-*.patch
+(SomeComputerGuy/orangepi5-mainline, snapshot be26e39), backported to Armbian sunxi-7.3.
+Tharit Tangkijwanichakul's patch (on lore, see Link), carried by the Orange Pi 5 project. It is in
+linux-next: next-20261030 has the identical std_init_compound() hunk (checked by diffing v7.3 against
+next-20261030; the commit id could not be resolved from the shallow tree). Drop this patch when the
+sunxi kernel moves to a release that contains it. Rebased:
+only the std_init_compound() context differs (our stateless VC-1/MPEG-4/H.263/AVS2/AVS controls).
+cedrus rejects chroma_format_idc != 1 like rkvdec VDPU38x, so this fixes the same v4l2-compliance
+failure on cedrus.
+
+ drivers/media/v4l2-core/v4l2-ctrls-core.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls-core.c b/drivers/media/v4l2-core/v4l2-ctrls-core.c
+index 49b0411fd..8249786d5 100644
+--- a/drivers/media/v4l2-core/v4l2-ctrls-core.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls-core.c
+@@ -138,6 +138,7 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
+ 	struct v4l2_ctrl_fwht_params *p_fwht_params;
+ 	struct v4l2_ctrl_h264_scaling_matrix *p_h264_scaling_matrix;
+ 	struct v4l2_ctrl_av1_sequence *p_av1_sequence;
++	struct v4l2_ctrl_hevc_sps *p_hevc_sps;
+ 	struct v4l2_ctrl_vc1_sequence *p_vc1_sequence;
+ 	struct v4l2_ctrl_mpeg4_vol *p_mpeg4_vol;
+ 	struct v4l2_ctrl_mpeg4_vop *p_mpeg4_vop;
+@@ -302,6 +303,12 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
+ 		 */
+ 		memset(p_h264_scaling_matrix, 16, sizeof(*p_h264_scaling_matrix));
+ 		break;
++	case V4L2_CTRL_TYPE_HEVC_SPS:
++		p_hevc_sps = p;
++
++		/* 4:2:0 */
++		p_hevc_sps->chroma_format_idc = 1;
++		break;
+ 	}
+ }
+ 
