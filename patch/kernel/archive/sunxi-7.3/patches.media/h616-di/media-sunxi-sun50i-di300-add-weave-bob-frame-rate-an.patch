@@ -11,18 +11,29 @@ di_dev_apply_fixed_para()) and the temporal noise reduction (TNR)
 block, so that every DI feature in the H616 datasheet (section 2.5.2)
 can be used:
 
-- V4L2_CID_DEINTERLACING_MODE (driver menu):
-  - Motion Adaptive, Field Rate: the existing mode, two outputs per
+- V4L2_CID_DEINTERLACING_MODE (driver menu; applications match the
+  item names, which are the same in other deinterlacers):
+  0 Motion Adaptive, Field Rate: the existing mode, two outputs per
     input frame (vendor "60 Hz" mode);
-  - Motion Adaptive, Frame Rate: one output per input frame, from IN_F1
+  1 Motion Adaptive, Frame Rate: one output per input frame, from IN_F1
     and IN_F2 (vendor "30 Hz" mode), written to DIT output 1;
-  - Bob: spatial interpolation of one field, no motion detection;
-  - Weave: both fields of the frame put back together unchanged;
-  - Noise Reduction Only: TNR on progressive input, output from the
-    TNR write channel (only offered when FUNC_VSN reports TNR).
-  The mode decides the buffer handling, so it is grabbed while
-  streaming. The single-frame modes keep no source history; the
-  frame-rate and TNR modes keep one frame, the field-rate mode two.
+  2 Bob, Frame Rate: spatial interpolation of one field, no motion
+    detection;
+  3 Weave: both fields of the frame put back together unchanged;
+  4 Noise Reduction Only: TNR on progressive input, output from the
+    TNR write channel (only offered when FUNC_VSN reports TNR);
+  5 Bob, Field Rate: both fields interpolated, two outputs per input
+    frame, with the field-rate routing of item 0 and all inputs on the
+    newest frame (as on the first job of item 0).
+  Frame rate outputs one CAPTURE buffer per OUTPUT buffer, field rate
+  two, the second timestamped half a frame period after the first.
+  The number of CAPTURE buffers per job must not change while either
+  queue streams, so a change of rate, or to or from item 4, returns
+  -EBUSY then. A change of method at the same rate is accepted; the
+  next job starts the new method from the state of a new stream (no
+  source history, motion flags or TNR references of the old one). The
+  motion-adaptive modes keep one (frame rate, TNR-only) or two (field
+  rate) source frames; bob and weave none.
 
 - Temporal noise reduction (V4L2_CID_SUNXI_DI300_TNR_MODE: off, fixed,
   adaptive; TNR_STRENGTH for the fixed strength, vendor default 0x3a;
@@ -50,21 +61,32 @@ can be used:
   video-on-film areas (vendor video_exist), bit 3 also weaves chroma.
   Values 0-3 keep their meaning.
 
-- Progressive (V4L2_FIELD_NONE) input is accepted, for the TNR-only
-  mode.
+- Progressive (V4L2_FIELD_NONE) input is accepted. It is passed
+  through (weave, one output per input) in every mode but TNR-only,
+  which filters it.
+
+- The driver-private controls (the FMD ones and the new TNR ones) get a
+  reserved range, V4L2_CID_USER_SUNXI_DI300_BASE at
+  V4L2_CID_USER_BASE + 0x1260 (16 controls; 0x1240 and 0x1250 are taken
+  in newer kernels), and a uAPI header, include/uapi/linux/sunxi-di300.h.
+  They were at V4L2_CID_USER_BASE + 0x1100, inside the range reserved
+  for the MIPI CCS driver.
 
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- .../sunxi/sun50i-di300/sun50i-di300.c         | 774 ++++++++++++++----
- .../sunxi/sun50i-di300/sun50i-di300.h         |  88 ++
- 2 files changed, 724 insertions(+), 138 deletions(-)
+ .../sunxi/sun50i-di300/sun50i-di300.c         | 890 +++++++++++++++---
+ .../sunxi/sun50i-di300/sun50i-di300.h         | 101 ++
+ include/uapi/linux/sunxi-di300.h              |  62 ++
+ include/uapi/linux/v4l2-controls.h            |   7 +
+ 4 files changed, 908 insertions(+), 152 deletions(-)
+ create mode 100644 include/uapi/linux/sunxi-di300.h
 
 diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
-index 4dc81dfbf..54a2364fb 100644
+index 4dc81dfbf..e2611a415 100644
 --- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
 +++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
-@@ -21,6 +21,7 @@
+@@ -21,12 +21,14 @@
  #include <linux/clk.h>
  #include <linux/interrupt.h>
  #include <linux/io.h>
@@ -72,7 +94,14 @@ index 4dc81dfbf..54a2364fb 100644
  #include <linux/minmax.h>
  #include <linux/module.h>
  #include <linux/of.h>
-@@ -191,21 +192,108 @@ static void deinterlace_write_out_addr(struct deinterlace_dev *dev,
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/reset.h>
++#include <linux/sunxi-di300.h>
+ 
+ #include <media/v4l2-device.h>
+ #include <media/v4l2-ioctl.h>
+@@ -191,21 +193,166 @@ static void deinterlace_write_out_addr(struct deinterlace_dev *dev,
  	deinterlace_write(dev, hreg, 0);
  }
  
@@ -116,7 +145,61 @@ index 4dc81dfbf..54a2364fb 100644
 +
 +static unsigned int deinterlace_mode_outputs(unsigned int mode)
 +{
-+	return mode == DEINTERLACE_MODE_MOTION_FIELD ? 2 : 1;
++	return mode == DEINTERLACE_MODE_MOTION_FIELD ||
++	       mode == DEINTERLACE_MODE_BOB_FIELD ? 2 : 1;
++}
++
++/*
++ * Menu items that can replace each other while streaming: the ones with
++ * the same output rate. TNR-only has its own output channel and needs a
++ * planar capture format (checked at STREAMON).
++ */
++static unsigned int deinterlace_mode_class(unsigned int mode)
++{
++	return mode == DEINTERLACE_MODE_TNR ? 0 : deinterlace_mode_outputs(mode);
++}
++
++/*
++ * The mode a job runs in. Progressive (V4L2_FIELD_NONE) input is passed
++ * through whatever the deinterlacing method (weave of a progressive
++ * frame is a copy), except in the TNR-only mode, which is made for it.
++ * The field order is part of the OUTPUT format, fixed while streaming.
++ */
++static unsigned int deinterlace_job_mode(struct deinterlace_ctx *ctx)
++{
++	unsigned int mode = READ_ONCE(ctx->ctrl_mode);
++
++	if (ctx->src_fmt.field == V4L2_FIELD_NONE &&
++	    mode != DEINTERLACE_MODE_TNR)
++		return DEINTERLACE_MODE_WEAVE;
++
++	return mode;
++}
++
++/*
++ * The method changed while streaming (at the same output rate): start
++ * the new one from the state of a new stream, without the history,
++ * motion flags or filtered references of the old one. Called from
++ * device_run(), so no job of this context is running.
++ */
++static void deinterlace_mode_reset(struct deinterlace_ctx *ctx)
++{
++	unsigned int i;
++
++	for (i = 2; i-- > 0;) {
++		if (ctx->prev[i])
++			v4l2_m2m_buf_done(ctx->prev[i], VB2_BUF_STATE_DONE);
++		ctx->prev[i] = NULL;
++	}
++
++	memset(ctx->flag_buf[0], 0, ctx->flag_size);
++	memset(ctx->flag_buf[1], 0, ctx->flag_size);
++	ctx->flag_idx = 0;
++	ctx->vof_sel = 0;
++
++	ctx->tnr_hist[0] = -1;
++	ctx->tnr_hist[1] = -1;
++	ctx->tnr_gain = ctx->tnr_gain_max;
 +}
 +
 +static void deinterlace_write_pitches(struct deinterlace_dev *dev,
@@ -169,12 +252,16 @@ index 4dc81dfbf..54a2364fb 100644
 +	unsigned int dst_hw = deinterlace_hw_format(ctx->dst_fmt.pixelformat);
 +	unsigned int tnr_hw = deinterlace_hw_format(ctx->tnr_fmt.pixelformat);
 +	unsigned int f0_hw, f1_hw, i, reg, dma, func;
-+	unsigned int mode = ctx->mode;
++	unsigned int mode = deinterlace_job_mode(ctx);
 +	bool motion, tnr_ref;
  
  	src = v4l2_m2m_next_src_buf(ctx->fh.m2m_ctx);
  
 -	ctx->fmd_active = dev->has_fmd && ctx->fmd_enabled;
++	if (mode != ctx->mode)
++		deinterlace_mode_reset(ctx);
++	ctx->mode = mode;
++
 +	ctx->fmd_active = dev->has_fmd && ctx->fmd_enabled &&
 +			  mode == DEINTERLACE_MODE_MOTION_FIELD;
 +	ctx->tnr_active = dev->has_tnr && ctx->tnr_mode != DEINTERLACE_TNR_OFF &&
@@ -187,7 +274,7 @@ index 4dc81dfbf..54a2364fb 100644
  
  	/*
  	 * Apply this job's field-weave decision, if userspace attached a
-@@ -222,19 +310,16 @@ static void deinterlace_device_run(void *priv)
+@@ -222,19 +369,16 @@ static void deinterlace_device_run(void *priv)
  	}
  
  	/*
@@ -211,7 +298,7 @@ index 4dc81dfbf..54a2364fb 100644
  		} else if (!dst1) {
  			dst1 = &b->vb;
  			break;
-@@ -244,95 +329,190 @@ static void deinterlace_device_run(void *priv)
+@@ -244,95 +388,210 @@ static void deinterlace_device_run(void *priv)
  	ctx->dst1 = dst1;
  
  	v4l2_m2m_buf_copy_metadata(src, dst0);
@@ -233,12 +320,12 @@ index 4dc81dfbf..54a2364fb 100644
 +		 * field-rate output keeps monotonic, evenly spaced
 +		 * timestamps.
 +		 */
-+		if (ctx->prev[0] &&
-+		    src->vb2_buf.timestamp > ctx->prev[0]->vb2_buf.timestamp)
++		if (ctx->prev_ts_valid && src->vb2_buf.timestamp > ctx->prev_ts)
 +			dst1->vb2_buf.timestamp +=
-+				(src->vb2_buf.timestamp -
-+				 ctx->prev[0]->vb2_buf.timestamp) / 2;
++				(src->vb2_buf.timestamp - ctx->prev_ts) / 2;
 +	}
++	ctx->prev_ts = src->vb2_buf.timestamp;
++	ctx->prev_ts_valid = true;
  
 -	next = vb2_dma_contig_plane_dma_addr(&src->vb2_buf, 0);
 -	curr = ctx->prev[0] ?
@@ -260,8 +347,8 @@ index 4dc81dfbf..54a2364fb 100644
 +	 * userspace (libcedarc omx_deinterlace.cpp, diSetPara()) puts the
 +	 * frame before last in IN_F0, the previous frame in IN_F1 and the
 +	 * newest frame in IN_F2. The DIT deinterlaces IN_F1 (fields 2 and
-+	 * 3) and the TNR filters IN_F2 against IN_F1. The single-frame
-+	 * modes (bob, weave) read IN_F1 only.
++	 * 3) and the TNR filters IN_F2 against IN_F1. Bob and weave use
++	 * the newest frame only.
 +	 *
 +	 * With TNR on, the filtered copies of the previous frames, kept in
 +	 * driver buffers, replace the original frames as references, as
@@ -276,7 +363,8 @@ index 4dc81dfbf..54a2364fb 100644
 +	f0_hw = src_hw;
 +
 +	switch (mode) {
-+	case DEINTERLACE_MODE_BOB:
++	case DEINTERLACE_MODE_BOB_FRAME:
++	case DEINTERLACE_MODE_BOB_FIELD:
 +	case DEINTERLACE_MODE_WEAVE:
 +		f1 = f2;
 +		f0 = f2;
@@ -343,7 +431,9 @@ index 4dc81dfbf..54a2364fb 100644
 -
 -	deinterlace_get_planes(&ctx->src_fmt, &in_pl);
 -	deinterlace_get_planes(&ctx->dst_fmt, &out_pl);
--
++	deinterlace_write(dev, DEINTERLACE_FIELD_ORDER,
++			  ctx->first_field ? DEINTERLACE_FIELD_ORDER_BFF : 0);
+ 
 -	/* input pitches are field pitches: two lines of the frame */
 -	for (i = 0; i < 3; i++) {
 -		unsigned int in_pitch = in_pl.pitch[i] * 2;
@@ -355,9 +445,7 @@ index 4dc81dfbf..54a2364fb 100644
 -		deinterlace_write(dev, DEINTERLACE_OUT_DIT_PITCH(i),
 -				  out_pl.pitch[i]);
 -	}
-+	deinterlace_write(dev, DEINTERLACE_FIELD_ORDER,
-+			  ctx->first_field ? DEINTERLACE_FIELD_ORDER_BFF : 0);
- 
+-
 -	/*
 -	 * Input slots are in temporal order, oldest first: the vendor
 -	 * userspace (libcedarc omx_deinterlace.cpp, diSetPara()) puts the
@@ -426,7 +514,26 @@ index 4dc81dfbf..54a2364fb 100644
 +					   DEINTERLACE_OUT_DIT1_HADDR, out0,
 +					   &dst_pl);
 +		break;
-+	case DEINTERLACE_MODE_BOB:
++	case DEINTERLACE_MODE_BOB_FIELD:
++		/*
++		 * The field-rate routing with all three inputs on the newest
++		 * frame and no motion detection, as on the first job of a
++		 * motion-adaptive field-rate stream. DIT output 0 then has the
++		 * second field of the frame and DIT output 1 the first one
++		 * (seen on the H616 for TFF and BFF), so dst0 goes to output 1.
++		 */
++		dma |= DEINTERLACE_DMA_CTL_DI | DEINTERLACE_DMA_CTL_P |
++		       DEINTERLACE_DMA_CTL_C | DEINTERLACE_DMA_CTL_W0 |
++		       DEINTERLACE_DMA_CTL_W1;
++		func |= DEINTERLACE_FUNC_EN_DIT;
++		deinterlace_write_out_addr(dev, DEINTERLACE_OUT_DIT0_ADDR(0),
++					   DEINTERLACE_OUT_DIT0_HADDR, out1,
++					   &dst_pl);
++		deinterlace_write_out_addr(dev, DEINTERLACE_OUT_DIT1_ADDR(0),
++					   DEINTERLACE_OUT_DIT1_HADDR, out0,
++					   &dst_pl);
++		break;
++	case DEINTERLACE_MODE_BOB_FRAME:
 +	case DEINTERLACE_MODE_WEAVE:
 +		dma |= DEINTERLACE_DMA_CTL_P | DEINTERLACE_DMA_CTL_W1;
 +		func |= DEINTERLACE_FUNC_EN_DIT;
@@ -466,7 +573,7 @@ index 4dc81dfbf..54a2364fb 100644
  
  	/*
  	 * Motion flags: two bits per pixel, read from the previous run and
-@@ -344,20 +524,23 @@ static void deinterlace_device_run(void *priv)
+@@ -344,20 +603,23 @@ static void deinterlace_device_run(void *priv)
  	deinterlace_write(dev, DEINTERLACE_OUT_FLAG_ADDR,
  			  ctx->flag_dma[!ctx->flag_idx]);
  	deinterlace_write(dev, DEINTERLACE_FLAG_HADDR, 0);
@@ -495,7 +602,7 @@ index 4dc81dfbf..54a2364fb 100644
  
  	if (ctx->fmd_active) {
  		reg = (ctx->src_fmt.width - 1) << 16;
-@@ -368,56 +551,97 @@ static void deinterlace_device_run(void *priv)
+@@ -368,56 +630,98 @@ static void deinterlace_device_run(void *priv)
  		/*
  		 * Row thresholds scale with frame area relative to the
  		 * vendor's 720x480 reference, verbatim from
@@ -558,7 +665,8 @@ index 4dc81dfbf..54a2364fb 100644
 +			break;
 +		}
 +		fallthrough;
-+	case DEINTERLACE_MODE_BOB:
++	case DEINTERLACE_MODE_BOB_FRAME:
++	case DEINTERLACE_MODE_BOB_FIELD:
 +		/* motion adaptive without motion: spatial interpolation */
  		reg |= DEINTERLACE_DIT_SETTING_MODE_LUMA |
 -		       DEINTERLACE_DIT_SETTING_MOTION_BLEND_LUMA |
@@ -621,17 +729,17 @@ index 4dc81dfbf..54a2364fb 100644
  
  	deinterlace_set_bits(dev, DEINTERLACE_INT_CTL,
  			     DEINTERLACE_INT_CTL_FINISH_EN);
-@@ -429,7 +653,8 @@ static int deinterlace_job_ready(void *priv)
+@@ -429,7 +733,8 @@ static int deinterlace_job_ready(void *priv)
  	struct deinterlace_ctx *ctx = priv;
  
  	return v4l2_m2m_num_src_bufs_ready(ctx->fh.m2m_ctx) >= 1 &&
 -	       v4l2_m2m_num_dst_bufs_ready(ctx->fh.m2m_ctx) >= 2;
 +	       v4l2_m2m_num_dst_bufs_ready(ctx->fh.m2m_ctx) >=
-+	       deinterlace_mode_outputs(ctx->mode);
++	       deinterlace_mode_outputs(deinterlace_job_mode(ctx));
  }
  
  static void deinterlace_job_abort(void *priv)
-@@ -439,13 +664,44 @@ static void deinterlace_job_abort(void *priv)
+@@ -439,13 +744,44 @@ static void deinterlace_job_abort(void *priv)
  	ctx->aborting = 1;
  }
  
@@ -678,7 +786,7 @@ index 4dc81dfbf..54a2364fb 100644
  
  	ctx = v4l2_m2m_get_curr_priv(dev->m2m_dev);
  	if (!ctx) {
-@@ -485,18 +741,39 @@ static irqreturn_t deinterlace_irq(int irq, void *data)
+@@ -485,18 +821,39 @@ static irqreturn_t deinterlace_irq(int irq, void *data)
  		dev->fmd_stats[9] = deinterlace_read(dev, DEINTERLACE_FMD_FIELD_HIST1);
  	}
  
@@ -726,7 +834,7 @@ index 4dc81dfbf..54a2364fb 100644
  
  	v4l2_m2m_job_finish(ctx->dev->m2m_dev, ctx->fh.m2m_ctx);
  
-@@ -508,6 +785,7 @@ static void deinterlace_init(struct deinterlace_dev *dev)
+@@ -508,6 +865,7 @@ static void deinterlace_init(struct deinterlace_dev *dev)
  	u32 vsn = deinterlace_read(dev, DEINTERLACE_FUNC_VSN);
  
  	dev->has_fmd = DEINTERLACE_FUNC_VSN_FMD_EXIST(vsn) != 0;
@@ -734,7 +842,7 @@ index 4dc81dfbf..54a2364fb 100644
  
  	deinterlace_write(dev, DEINTERLACE_MD_PARA, DEINTERLACE_MD_PARA_DEFAULT);
  
-@@ -542,6 +820,28 @@ static void deinterlace_init(struct deinterlace_dev *dev)
+@@ -542,6 +900,28 @@ static void deinterlace_init(struct deinterlace_dev *dev)
  				  DEINTERLACE_FMD_BLK_TH_DEFAULT);
  		deinterlace_write(dev, DEINTERLACE_FMD_GLB, 0);
  	}
@@ -763,7 +871,7 @@ index 4dc81dfbf..54a2364fb 100644
  }
  
  static inline struct deinterlace_ctx *deinterlace_file2ctx(struct file *file)
-@@ -671,7 +971,19 @@ static int deinterlace_try_fmt_vid_cap(struct file *file, void *priv,
+@@ -671,7 +1051,19 @@ static int deinterlace_try_fmt_vid_cap(struct file *file, void *priv,
  	if (!deinterlace_check_format(ctx->src_fmt.pixelformat))
  		return -EINVAL;
  
@@ -784,7 +892,7 @@ index 4dc81dfbf..54a2364fb 100644
  	f->fmt.pix.field = V4L2_FIELD_NONE;
  	f->fmt.pix.width = ctx->src_fmt.width;
  	f->fmt.pix.height = ctx->src_fmt.height;
-@@ -687,9 +999,11 @@ static int deinterlace_try_fmt_vid_out(struct file *file, void *priv,
+@@ -687,9 +1079,11 @@ static int deinterlace_try_fmt_vid_out(struct file *file, void *priv,
  	if (!deinterlace_check_format(f->fmt.pix.pixelformat))
  		f->fmt.pix.pixelformat = deinterlace_formats[0];
  
@@ -797,7 +905,7 @@ index 4dc81dfbf..54a2364fb 100644
  		f->fmt.pix.field = V4L2_FIELD_INTERLACED;
  
  	deinterlace_prepare_format(&f->fmt.pix);
-@@ -873,6 +1187,57 @@ static void deinterlace_queue_cleanup(struct vb2_queue *vq, u32 state)
+@@ -873,6 +1267,62 @@ static void deinterlace_queue_cleanup(struct vb2_queue *vq, u32 state)
  	}
  }
  
@@ -833,9 +941,14 @@ index 4dc81dfbf..54a2364fb 100644
 +	ctx->tnr_hist[1] = -1;
 +	ctx->tnr_gain = ctx->tnr_gain_max;
 +
++	/*
++	 * The method can change while streaming, so this is done for every
++	 * deinterlacing method, also those that do not use TNR. Progressive
++	 * input is passed through.
++	 */
 +	if (!ctx->dev->has_tnr || ctx->tnr_mode == DEINTERLACE_TNR_OFF ||
 +	    ctx->mode == DEINTERLACE_MODE_TNR ||
-+	    deinterlace_mode_history(ctx->mode) == 0)
++	    ctx->src_fmt.field == V4L2_FIELD_NONE)
 +		return 0;
 +
 +	for (i = 0; i < DEINTERLACE_TNR_BUFS; i++) {
@@ -855,11 +968,13 @@ index 4dc81dfbf..54a2364fb 100644
  static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
  {
  	struct deinterlace_ctx *ctx = vb2_get_drv_priv(vq);
-@@ -893,6 +1258,20 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
+@@ -893,6 +1343,22 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
  		ctx->prev[0] = NULL;
  		ctx->prev[1] = NULL;
  		ctx->aborting = 0;
 +		ctx->vof_sel = 0;
++		ctx->prev_ts_valid = false;
++		ctx->mode = deinterlace_job_mode(ctx);
 +
 +		if (ctx->mode == DEINTERLACE_MODE_TNR &&
 +		    (!ctx->dev->has_tnr ||
@@ -876,18 +991,17 @@ index 4dc81dfbf..54a2364fb 100644
  
  		/* two bits per pixel, lines padded to 32 bytes (vendor) */
  		ctx->flag_pitch = ALIGN(ctx->src_fmt.width * 2, 256) / 8;
-@@ -916,6 +1295,10 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
+@@ -916,6 +1382,9 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
  
  			goto err_no_mem2;
  		}
 +
-+		/* the mode decides the buffer handling: no change mid-stream */
-+		v4l2_ctrl_grab(ctx->mode_ctrl, true);
++		/* TNR on or off decides the driver buffers */
 +		v4l2_ctrl_grab(ctx->tnr_ctrl, true);
  	}
  
  	return 0;
-@@ -924,6 +1307,8 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
+@@ -924,6 +1393,8 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
  	dma_free_coherent(dev, ctx->flag_size, ctx->flag_buf[0],
  			  ctx->flag_dma[0]);
  err_no_mem1:
@@ -896,41 +1010,62 @@ index 4dc81dfbf..54a2364fb 100644
  	pm_runtime_put(dev);
  err_runtime_get:
  	deinterlace_queue_cleanup(vq, VB2_BUF_STATE_QUEUED);
-@@ -942,6 +1327,9 @@ static void deinterlace_stop_streaming(struct vb2_queue *vq)
+@@ -942,6 +1413,8 @@ static void deinterlace_stop_streaming(struct vb2_queue *vq)
  				  ctx->flag_dma[0]);
  		dma_free_coherent(dev, ctx->flag_size, ctx->flag_buf[1],
  				  ctx->flag_dma[1]);
 +		deinterlace_tnr_free(ctx);
-+		v4l2_ctrl_grab(ctx->mode_ctrl, false);
 +		v4l2_ctrl_grab(ctx->tnr_ctrl, false);
  
  		pm_runtime_put(dev);
  	}
-@@ -1015,6 +1403,49 @@ static int deinterlace_queue_init(void *priv, struct vb2_queue *src_vq,
-  */
- #define V4L2_CID_SUNXI_DI300_FMD_ENABLE	(V4L2_CID_USER_BASE + 0x1101)
+@@ -998,22 +1471,58 @@ static int deinterlace_queue_init(void *priv, struct vb2_queue *src_vq,
+ 	return 0;
+ }
  
+-/* driver-private, order: FID12, FID23, FOD_FID30/32/10/12, FRD02/13, FIELD_HIST0/1 */
+-#define V4L2_CID_SUNXI_DI300_FMD_STATS	(V4L2_CID_USER_BASE + 0x1100)
+-
+ /*
+- * Plain enable switch rather than something tied to the Request API:
+- * FMD's per-job stats aren't associated with any per-job *input*, so
+- * there is nothing to bind atomically to a specific job the way
+- * stateless codec controls are. A request bound to the job that
+- * produced a value would also be the wrong tool here regardless: this
+- * driver retains OUTPUT buffers as temporal reference for up to two
+- * further jobs, so a request on one wouldn't reach
+- * MEDIA_REQUEST_STATE_COMPLETE until released that much later. Set
++ * The driver-private controls are in include/uapi/linux/sunxi-di300.h.
++ *
++ * V4L2_CID_SUNXI_DI300_FMD_ENABLE is a plain enable switch rather than
++ * something tied to the Request API: FMD's per-job stats aren't
++ * associated with any per-job *input*, so there is nothing to bind
++ * atomically to a specific job the way stateless codec controls are. A
++ * request bound to the job that produced a value would also be the wrong
++ * tool here regardless: this driver retains OUTPUT buffers as temporal
++ * reference for up to two further jobs, so a request on one wouldn't
++ * reach MEDIA_REQUEST_STATE_COMPLETE until released that much later. Set
+  * once at stream start; the stats control is read with a plain
+  * VIDIOC_G_EXT_CTRLS, no request needed for that either.
+  */
+-#define V4L2_CID_SUNXI_DI300_FMD_ENABLE	(V4L2_CID_USER_BASE + 0x1101)
++
 +/*
 + * Deinterlacing method (standard V4L2_CID_DEINTERLACING_MODE, driver
-+ * menu). The vendor driver's modes: motion adaptive with both fields
-+ * output ("60 Hz"), motion adaptive with one frame out per frame in
-+ * ("30 Hz"), bob, weave, and TNR only (progressive input).
++ * menu; applications match the item names, not the indices). The vendor
++ * driver's modes: motion adaptive with both fields output ("60 Hz"),
++ * motion adaptive with one frame out per frame in ("30 Hz"), bob,
++ * weave, and TNR only (progressive input); and bob at field rate.
 + */
 +static const char * const deinterlace_mode_menu[] = {
 +	[DEINTERLACE_MODE_MOTION_FIELD]	= "Motion Adaptive, Field Rate",
 +	[DEINTERLACE_MODE_MOTION_FRAME]	= "Motion Adaptive, Frame Rate",
-+	[DEINTERLACE_MODE_BOB]		= "Bob",
++	[DEINTERLACE_MODE_BOB_FRAME]	= "Bob, Frame Rate",
 +	[DEINTERLACE_MODE_WEAVE]	= "Weave",
 +	[DEINTERLACE_MODE_TNR]		= "Noise Reduction Only",
++	[DEINTERLACE_MODE_BOB_FIELD]	= "Bob, Field Rate",
 +	NULL,
 +};
-+
-+/* temporal noise reduction: off, fixed strength, adaptive strength */
-+#define V4L2_CID_SUNXI_DI300_TNR_MODE	(V4L2_CID_USER_BASE + 0x1103)
-+/* fixed strength, 0-255, vendor default 0x3a */
-+#define V4L2_CID_SUNXI_DI300_TNR_STRENGTH (V4L2_CID_USER_BASE + 0x1104)
-+/* adaptive strength bounds: the vendor's high/middle/low levels */
-+#define V4L2_CID_SUNXI_DI300_TNR_LEVEL	(V4L2_CID_USER_BASE + 0x1105)
 +
 +static const char * const deinterlace_tnr_mode_menu[] = {
 +	"Off",
@@ -952,16 +1087,27 @@ index 4dc81dfbf..54a2364fb 100644
 +	{ 28, 48 },	/* middle */
 +	{ 16, 38 },	/* low */
 +};
-+
+ 
  static int deinterlace_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
  {
- 	struct deinterlace_ctx *ctx =
-@@ -1041,6 +1472,19 @@ static int deinterlace_s_ctrl(struct v4l2_ctrl *ctrl)
+@@ -1041,6 +1550,31 @@ static int deinterlace_s_ctrl(struct v4l2_ctrl *ctrl)
  	case V4L2_CID_SUNXI_DI300_FMD_ENABLE:
  		ctx->fmd_enabled = ctrl->val;
  		break;
 +	case V4L2_CID_DEINTERLACING_MODE:
-+		ctx->mode = ctrl->val;
++		/*
++		 * The output rate sets how many CAPTURE buffers a job takes,
++		 * which job_ready() and device_run() must agree on, so it is
++		 * fixed while streaming, as is TNR-only. The method can change
++		 * at the same rate; device_run() then restarts it from a clean
++		 * state. Ioctls are serialised by dev->dev_mutex.
++		 */
++		if (deinterlace_mode_class(ctrl->val) !=
++		    deinterlace_mode_class(ctx->ctrl_mode) &&
++		    (vb2_is_streaming(v4l2_m2m_get_src_vq(ctx->fh.m2m_ctx)) ||
++		     vb2_is_streaming(v4l2_m2m_get_dst_vq(ctx->fh.m2m_ctx))))
++			return -EBUSY;
++		WRITE_ONCE(ctx->ctrl_mode, ctrl->val);
 +		break;
 +	case V4L2_CID_SUNXI_DI300_TNR_MODE:
 +		ctx->tnr_mode = ctrl->val;
@@ -976,7 +1122,7 @@ index 4dc81dfbf..54a2364fb 100644
  	default:
  		return -EINVAL;
  	}
-@@ -1066,6 +1510,37 @@ static const struct v4l2_ctrl_config deinterlace_fmd_stats_ctrl = {
+@@ -1066,6 +1600,37 @@ static const struct v4l2_ctrl_config deinterlace_fmd_stats_ctrl = {
  	.dims	= { DEINTERLACE_FMD_STATS_COUNT },
  };
  
@@ -1014,25 +1160,27 @@ index 4dc81dfbf..54a2364fb 100644
  static const struct v4l2_ctrl_config deinterlace_fmd_enable_ctrl = {
  	.ops	= &deinterlace_ctrl_ops,
  	.id	= V4L2_CID_SUNXI_DI300_FMD_ENABLE,
-@@ -1079,22 +1554,25 @@ static const struct v4l2_ctrl_config deinterlace_fmd_enable_ctrl = {
+@@ -1078,23 +1643,25 @@ static const struct v4l2_ctrl_config deinterlace_fmd_enable_ctrl = {
+ };
  
  /*
-  * Per-job field-weave decision: [0] for the job's first output
+- * Per-job field-weave decision: [0] for the job's first output
 - * (dst0), [1] for its second (dst1). 0-2 select a weave phase for
 - * that output (direct field combine instead of motion-adaptive
 - * blend); 3 disables weave for that output, falling back to whatever
 - * DIT_SETTING already configures. Bound to a request the way
 - * stateless codec controls are -- see the comment on ctx->weave_ctrl.
-+ * (dst0), [1] for its second (dst1). Bits 1:0 = 0-2 select a weave
-+ * phase for that output (direct field combine instead of
-+ * motion-adaptive blend); 3 disables weave for that output, falling
-+ * back to whatever DIT_SETTING already configures. With weave on,
++ * V4L2_CID_SUNXI_DI300_FMD_WEAVE, per-job field-weave decision: [0]
++ * for the job's first output (dst0), [1] for its second (dst1). Bits
++ * 1:0 = 0-2 select a weave phase for that output (direct field combine
++ * instead of motion-adaptive blend); 3 disables weave for that output,
++ * falling back to whatever DIT_SETTING already configures. With weave on,
 + * bit 2 keeps the video blend for video-on-film areas (vendor
 + * video_exist) and bit 3 weaves chroma too (the vendor never does
 + * this). Bound to a request the way stateless codec controls are --
 + * see the comment on ctx->weave_ctrl.
   */
- #define V4L2_CID_SUNXI_DI300_FMD_WEAVE	(V4L2_CID_USER_BASE + 0x1102)
+-#define V4L2_CID_SUNXI_DI300_FMD_WEAVE	(V4L2_CID_USER_BASE + 0x1102)
  #define DEINTERLACE_FMD_WEAVE_COUNT	2
 -#define DEINTERLACE_FMD_WEAVE_DISABLED	3
  
@@ -1047,7 +1195,7 @@ index 4dc81dfbf..54a2364fb 100644
  	.step	= 1,
  	.def	= DEINTERLACE_FMD_WEAVE_DISABLED,
  	.dims	= { DEINTERLACE_FMD_WEAVE_COUNT },
-@@ -1130,21 +1608,41 @@ static int deinterlace_open(struct file *file)
+@@ -1130,21 +1697,40 @@ static int deinterlace_open(struct file *file)
  	v4l2_fh_init(&ctx->fh, video_devdata(file));
  	ctx->dev = dev;
  
@@ -1056,13 +1204,12 @@ index 4dc81dfbf..54a2364fb 100644
 +	ctx->tnr_gain_max = deinterlace_tnr_gain_bounds[0][1];
 +
 +	v4l2_ctrl_handler_init(&ctx->hdl, 7);
-+	ctx->mode_ctrl =
-+		v4l2_ctrl_new_std_menu_items(&ctx->hdl, &deinterlace_ctrl_ops,
-+					     V4L2_CID_DEINTERLACING_MODE,
-+					     dev->has_tnr ? DEINTERLACE_MODE_TNR :
-+					     DEINTERLACE_MODE_WEAVE, 0,
-+					     DEINTERLACE_MODE_MOTION_FIELD,
-+					     deinterlace_mode_menu);
++	v4l2_ctrl_new_std_menu_items(&ctx->hdl, &deinterlace_ctrl_ops,
++				     V4L2_CID_DEINTERLACING_MODE,
++				     DEINTERLACE_MODE_BOB_FIELD,
++				     dev->has_tnr ? 0 : BIT(DEINTERLACE_MODE_TNR),
++				     DEINTERLACE_MODE_MOTION_FIELD,
++				     deinterlace_mode_menu);
 +	if (dev->has_tnr) {
 +		ctx->tnr_ctrl = v4l2_ctrl_new_custom(&ctx->hdl,
 +						     &deinterlace_tnr_mode_ctrl,
@@ -1098,7 +1245,7 @@ index 4dc81dfbf..54a2364fb 100644
  	ctx->fh.m2m_ctx = v4l2_m2m_ctx_init(dev->m2m_dev, ctx,
  					    &deinterlace_queue_init);
 diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
-index b572fe532..0925f99db 100644
+index b572fe532..6e199738d 100644
 --- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
 +++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
 @@ -26,6 +26,7 @@
@@ -1154,7 +1301,7 @@ index b572fe532..0925f99db 100644
  #define DEINTERLACE_DIT_INTER_PARA_FIELD_WEAVE_PHASE_F1(v)	(((v) & 3) << 4)
  #define DEINTERLACE_DIT_INTER_PARA_FIELD_WEAVE_F2	BIT(16)
  #define DEINTERLACE_DIT_INTER_PARA_FIELD_WEAVE_PHASE_F2(v)	(((v) & 3) << 20)
-@@ -214,12 +225,67 @@
+@@ -214,12 +225,72 @@
  #define DEINTERLACE_FMD_FIELD_HIST1		0x220
  
  #define DEINTERLACE_FMD_GLB			0x224
@@ -1203,12 +1350,17 @@ index b572fe532..0925f99db 100644
 +#define DEINTERLACE_FMD_WEAVE_VIDEO		BIT(2)
 +#define DEINTERLACE_FMD_WEAVE_CHROMA		BIT(3)
 +
++/*
++ * V4L2_CID_DEINTERLACING_MODE menu items. Frame rate outputs one CAPTURE
++ * buffer per OUTPUT buffer, field rate two (e.g. 50i to 50p).
++ */
 +enum deinterlace_mode {
 +	DEINTERLACE_MODE_MOTION_FIELD,
 +	DEINTERLACE_MODE_MOTION_FRAME,
-+	DEINTERLACE_MODE_BOB,
++	DEINTERLACE_MODE_BOB_FRAME,
 +	DEINTERLACE_MODE_WEAVE,
 +	DEINTERLACE_MODE_TNR,
++	DEINTERLACE_MODE_BOB_FIELD,
 +};
 +
 +enum deinterlace_tnr_mode {
@@ -1222,13 +1374,21 @@ index b572fe532..0925f99db 100644
  /* H616 datasheet 2.5.2: 32x32 to 2048x1280 */
  #define DEINTERLACE_MIN_WIDTH	32U
  #define DEINTERLACE_MIN_HEIGHT	32U
-@@ -233,6 +299,27 @@ struct deinterlace_ctx {
+@@ -233,6 +304,35 @@ struct deinterlace_ctx {
  	struct v4l2_pix_format	src_fmt;
  	struct v4l2_pix_format	dst_fmt;
  
-+	/* enum deinterlace_mode, fixed while streaming */
++	/* V4L2_CID_DEINTERLACING_MODE value, enum deinterlace_mode */
++	unsigned int		ctrl_mode;
++	/*
++	 * enum deinterlace_mode of the running or last job, after the
++	 * progressive pass-through (deinterlace_job_mode())
++	 */
 +	unsigned int		mode;
-+	struct v4l2_ctrl	*mode_ctrl;
++
++	/* source timestamp of the last job, for the field-rate output */
++	u64			prev_ts;
++	bool			prev_ts_valid;
 +
 +	/* temporal noise reduction */
 +	unsigned int		tnr_mode;
@@ -1250,7 +1410,7 @@ index b572fe532..0925f99db 100644
  	/* motion flag buffers, read and written alternately */
  	void			*flag_buf[2];
  	dma_addr_t		flag_dma[2];
-@@ -297,6 +384,7 @@ struct deinterlace_dev {
+@@ -297,6 +397,7 @@ struct deinterlace_dev {
  
  	/* set once at probe from DEINTERLACE_FUNC_VSN, never changes */
  	bool			has_fmd;
@@ -1258,6 +1418,92 @@ index b572fe532..0925f99db 100644
  
  	/*
  	 * Raw FMD counters latched at the last completed job, if any.
+diff --git a/include/uapi/linux/sunxi-di300.h b/include/uapi/linux/sunxi-di300.h
+new file mode 100644
+index 000000000..f7105ad2f
+--- /dev/null
++++ b/include/uapi/linux/sunxi-di300.h
+@@ -0,0 +1,62 @@
++/* SPDX-License-Identifier: ((GPL-2.0+ WITH Linux-syscall-note) OR MIT) */
++/*
++ * Allwinner DI300 deinterlacer (sun50i-di300) controls
++ *
++ * The deinterlacing method is the standard V4L2_CID_DEINTERLACING_MODE
++ * with a driver-defined menu; match its items by name.
++ */
++
++#ifndef _UAPI_LINUX_SUNXI_DI300_H
++#define _UAPI_LINUX_SUNXI_DI300_H
++
++#include <linux/v4l2-controls.h>
++
++/*
++ * V4L2_CID_SUNXI_DI300_FMD_STATS - film mode detection statistics
++ *
++ * Read-only, volatile array of 10 u32, latched at the end of the last
++ * completed job of the device: FID12, FID23, FOD_FID30, FOD_FID32,
++ * FOD_FID10, FOD_FID12, FRD02, FRD13 (30-bit counters), FIELD_HIST0,
++ * FIELD_HIST1.
++ */
++#define V4L2_CID_SUNXI_DI300_FMD_STATS		(V4L2_CID_USER_SUNXI_DI300_BASE + 0)
++
++/*
++ * V4L2_CID_SUNXI_DI300_FMD_ENABLE - run film mode detection
++ *
++ * Boolean. Computes the FMD statistics in the "Motion Adaptive, Field
++ * Rate" mode.
++ */
++#define V4L2_CID_SUNXI_DI300_FMD_ENABLE		(V4L2_CID_USER_SUNXI_DI300_BASE + 1)
++
++/*
++ * V4L2_CID_SUNXI_DI300_FMD_WEAVE - per-job field weave
++ *
++ * Array of 2 u32, usually set in the request of an OUTPUT buffer: [0]
++ * for the job's first CAPTURE buffer, [1] for its second. Bits 1:0 = 0-2
++ * weave the fields at that phase instead of the motion-adaptive blend,
++ * 3 = no weave (default). With weave on, bit 2 keeps the video blend in
++ * video-on-film areas and bit 3 also weaves chroma. Used with FMD_ENABLE.
++ */
++#define V4L2_CID_SUNXI_DI300_FMD_WEAVE		(V4L2_CID_USER_SUNXI_DI300_BASE + 2)
++
++/*
++ * V4L2_CID_SUNXI_DI300_TNR_MODE - temporal noise reduction
++ *
++ * Menu: 0 off, 1 fixed strength, 2 adaptive strength. Applied in the
++ * motion-adaptive and TNR-only modes with a planar capture format. Fixed
++ * while streaming.
++ */
++#define V4L2_CID_SUNXI_DI300_TNR_MODE		(V4L2_CID_USER_SUNXI_DI300_BASE + 3)
++
++/* V4L2_CID_SUNXI_DI300_TNR_STRENGTH - fixed TNR strength, 0-255 (0x3a) */
++#define V4L2_CID_SUNXI_DI300_TNR_STRENGTH	(V4L2_CID_USER_SUNXI_DI300_BASE + 4)
++
++/*
++ * V4L2_CID_SUNXI_DI300_TNR_LEVEL - adaptive TNR strength bounds
++ *
++ * Menu: 0 high, 1 middle, 2 low.
++ */
++#define V4L2_CID_SUNXI_DI300_TNR_LEVEL		(V4L2_CID_USER_SUNXI_DI300_BASE + 5)
++
++#endif /* _UAPI_LINUX_SUNXI_DI300_H */
+diff --git a/include/uapi/linux/v4l2-controls.h b/include/uapi/linux/v4l2-controls.h
+index 1268fd412..f3a012727 100644
+--- a/include/uapi/linux/v4l2-controls.h
++++ b/include/uapi/linux/v4l2-controls.h
+@@ -234,6 +234,13 @@ enum v4l2_colorfx {
+  */
+ #define V4L2_CID_USER_MALI_C55_BASE		(V4L2_CID_USER_BASE + 0x1230)
+ 
++/*
++ * The base for the Allwinner DI300 deinterlacer driver controls.
++ * See linux/sunxi-di300.h for the list of controls.
++ * We reserve 16 controls for this driver.
++ */
++#define V4L2_CID_USER_SUNXI_DI300_BASE		(V4L2_CID_USER_BASE + 0x1260)
++
+ /* MPEG-class control IDs */
+ /* The MPEG controls are applicable to all codec controls
+  * and the 'MPEG' part of the define is historical */
 -- 
 2.55.0
 
