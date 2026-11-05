@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: spi: sun6i: Program the sample mode on the H616
+
+The H616 SPI_TCR has the SDM (bit 13) and SDC (bit 11) sample-mode bits
+(H616 user manual v1.0, 9.3.6.2): normal sampling up to 24 MHz, half-cycle
+delayed sampling up to 40 MHz and one-cycle delayed sampling from
+80 MHz. The driver programs them only for controllers without a clock
+control register, so the H616 always samples in the reset mode (delayed
+by half a cycle, no SDC). Apply the same table on the H616 using the
+effective bus clock. The Zero2 SPI NOR at 40 MHz keeps its current mode.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+
+--- a/drivers/spi/spi-sun6i.c
++++ b/drivers/spi/spi-sun6i.c
+@@ -93,6 +93,8 @@
+ struct sun6i_spi_cfg {
+ 	unsigned long		fifo_depth;
+ 	bool			has_clk_ctl;
++	/* TCR SDM/SDC sample-mode bits exist and must follow the bus clock */
++	bool			has_sample_mode;
+ 	u32			mode_bits;
+ };
+ 
+@@ -407,6 +409,9 @@
+ 	} else {
+ 		clk_set_rate(sspi->mclk, tfr->speed_hz);
+ 		tfr->effective_speed_hz = clk_get_rate(sspi->mclk);
++	}
++
++	if (!sspi->cfg->has_clk_ctl || sspi->cfg->has_sample_mode) {
+ 
+ 		/*
+ 		 * Configure work mode.
+@@ -781,6 +786,7 @@
+ static const struct sun6i_spi_cfg sun50i_h616_spi_cfg = {
+ 	.fifo_depth	= SUN8I_FIFO_DEPTH,
+ 	.has_clk_ctl	= true,
++	.has_sample_mode = true,
+ 	.mode_bits	= SPI_RX_DUAL | SPI_TX_DUAL | SPI_RX_QUAD | SPI_TX_QUAD,
+ };
+ 
+-- 
+Armbian
