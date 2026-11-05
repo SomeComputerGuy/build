@@ -21,10 +21,10 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 17 insertions(+), 11 deletions(-)
 
 diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
-index 10fc5edd3..5ed86fea2 100644
+index 9190c630c..01b9c275e 100644
 --- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
 +++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
-@@ -99,11 +99,12 @@ static bool deinterlace_fmt_is_uv_combined(u32 pixelformat)
+@@ -100,11 +100,12 @@ static bool deinterlace_fmt_is_uv_combined(u32 pixelformat)
  	}
  }
  
@@ -40,7 +40,7 @@ index 10fc5edd3..5ed86fea2 100644
  		return true;
  	default:
  		return false;
-@@ -415,11 +416,13 @@ static void deinterlace_device_run(void *priv)
+@@ -475,11 +476,13 @@ static void deinterlace_device_run(void *priv)
  	reg = DEINTERLACE_FMT_IN0(f0_hw) | DEINTERLACE_FMT_IN1(f1_hw) |
  	      DEINTERLACE_FMT_IN2(src_hw) | DEINTERLACE_FMT_DIT(dst_hw) |
  	      DEINTERLACE_FMT_TNR(tnr_hw);
@@ -59,7 +59,7 @@ index 10fc5edd3..5ed86fea2 100644
  		reg |= DEINTERLACE_FMT_UVSEQ;
  	deinterlace_write(dev, DEINTERLACE_FMT, reg);
  
-@@ -1029,9 +1032,12 @@ static int deinterlace_try_fmt_vid_cap(struct file *file, void *priv,
+@@ -1109,9 +1112,12 @@ static int deinterlace_try_fmt_vid_cap(struct file *file, void *priv,
  	    deinterlace_fmt_is_422(f->fmt.pix.pixelformat) !=
  	    deinterlace_fmt_is_422(ctx->src_fmt.pixelformat))
  		f->fmt.pix.pixelformat = ctx->src_fmt.pixelformat;
