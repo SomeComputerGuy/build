@@ -1,0 +1,79 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 5 Nov 2026 20:20:00 +0000
+Subject: [PATCH] media: cedrus: jpeg: quiet the refusal of undecodable images
+
+The JPEG decoder parses the image itself and refuses what the engine
+cannot decode (greyscale, non-interleaved scans, 16-bit tables, images
+larger than the capture format) or what does not parse at all. Each
+refusal wrote two error lines to the kernel log, "unsupported JPEG: ..."
+or "failed to parse JPEG header: -22" and "Failed to setup decoding
+job: -22". The image comes from userspace, which gets its buffer back
+with V4L2_BUF_FLAG_ERROR: a damaged MJPEG stream, or a stateful client
+feeding the stateless decoder, flooded the log at the frame rate (30
+pairs in half a second from GStreamer's v4l2jpegdec on this board).
+
+Make the JPEG refusals debug messages and rate-limit the generic setup
+failure message, which stays an error for the codecs whose parameters
+come from validated controls.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/staging/media/sunxi/cedrus/cedrus_dec.c  |  4 ++--
+ drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c | 15 +++++++++------
+ 2 files changed, 11 insertions(+), 8 deletions(-)
+
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+@@ -217,8 +217,8 @@
+ 
+ 	error = ctx->current_codec->setup(ctx, &run);
+ 	if (error)
+-		v4l2_err(&ctx->dev->v4l2_dev,
+-			 "Failed to setup decoding job: %d\n", error);
++		dev_err_ratelimited(dev->dev,
++				    "Failed to setup decoding job: %d\n", error);
+ 
+ 	/* Complete request(s) controls if needed. */
+ 
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_jpeg.c
+@@ -223,9 +223,13 @@
+ 	return tables[index].start;
+ }
+ 
++/*
++ * The image comes from userspace, which gets the buffer back with the error
++ * flag: a refused image is a debug message, not a kernel log line per frame.
++ */
+ static int cedrus_jpeg_fail(struct cedrus_ctx *ctx, const char *what)
+ {
+-	v4l2_err(&ctx->dev->v4l2_dev, "unsupported JPEG: %s\n", what);
++	dev_dbg(ctx->dev->dev, "unsupported JPEG: %s\n", what);
+ 	return -EINVAL;
+ }
+ 
+@@ -276,8 +280,7 @@
+ 
+ 	ret = v4l2_jpeg_parse_header(src_vaddr, size, &header);
+ 	if (ret < 0) {
+-		v4l2_err(&dev->v4l2_dev,
+-			 "failed to parse JPEG header: %d\n", ret);
++		dev_dbg(dev->dev, "failed to parse JPEG header: %d\n", ret);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -359,9 +362,9 @@
+ 	 * buffer, and its MCU-padded width the line stride.
+ 	 */
+ 	if (width > dst_fmt->width || height > dst_fmt->height) {
+-		v4l2_err(&dev->v4l2_dev,
+-			 "JPEG of %ux%u does not fit the %ux%u capture format\n",
+-			 width, height, dst_fmt->width, dst_fmt->height);
++		dev_dbg(dev->dev,
++			"JPEG of %ux%u does not fit the %ux%u capture format\n",
++			width, height, dst_fmt->width, dst_fmt->height);
+ 		return -EINVAL;
+ 	}
+ 
