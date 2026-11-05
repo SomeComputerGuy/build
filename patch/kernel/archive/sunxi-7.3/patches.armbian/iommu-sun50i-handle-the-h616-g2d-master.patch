@@ -1,0 +1,172 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 5 Nov 2026 12:00:00 +0000
+Subject: iommu: sun50i: Handle the seventh (G2D) master of the H616 IOMMU
+
+The H616 IOMMU has seven master ports (H616 user manual v1.0, 3.12.3,
+table 3-8: 0 DE, 1 DI, 2 VE_R, 3 VE, 4-5 reserved, 6 G2D), and every
+per-master field (TLB flush, prefetch, interrupt enable/status,
+reset, permission registers) resets to 0x7f. The driver shares the
+H6 settings, which hard-code masters 0-5: the micro TLB of master 6
+is never flushed, its permission faults are not enabled or handled,
+TLB prefetch is off for it, and the ACI "none/read/write" permission
+entries for master 6 are left at their reset values. With the bypass
+register cleared, master 6 is translated through the page table anyway.
+
+Add a mask of the implemented masters to the variant and give the H616
+its own variant with master 6. The H6 and A523 keep masters 0-5.
+Nothing uses master 6 yet (no G2D driver), so this changes no current
+behaviour; it is needed before a G2D node gets `iommus = <&iommu 6>`.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+
+--- a/drivers/iommu/sun50i-iommu.c
++++ b/drivers/iommu/sun50i-iommu.c
+@@ -55,7 +55,7 @@
+ #define IOMMU_TLB_FLUSH_REG		0x080
+ #define IOMMU_TLB_FLUSH_PTW_CACHE		BIT(17)
+ #define IOMMU_TLB_FLUSH_MACRO_TLB		BIT(16)
+-#define IOMMU_TLB_FLUSH_MICRO_TLB(i)		(BIT(i) & GENMASK(5, 0))
++#define IOMMU_TLB_FLUSH_MICRO_TLB(i)		BIT(i)
+ 
+ #define IOMMU_TLB_IVLD_ADDR_REG		0x090
+ #define IOMMU_TLB_IVLD_ADDR_MASK_REG	0x094
+@@ -84,15 +84,10 @@
+ #define IOMMU_INT_INVALID_L2PG			BIT(17)
+ #define IOMMU_INT_INVALID_L1PG			BIT(16)
+ #define IOMMU_INT_MASTER_PERMISSION(m)		BIT(m)
+-#define IOMMU_INT_MASTER_MASK			(IOMMU_INT_MASTER_PERMISSION(0) | \
+-						 IOMMU_INT_MASTER_PERMISSION(1) | \
+-						 IOMMU_INT_MASTER_PERMISSION(2) | \
+-						 IOMMU_INT_MASTER_PERMISSION(3) | \
+-						 IOMMU_INT_MASTER_PERMISSION(4) | \
+-						 IOMMU_INT_MASTER_PERMISSION(5))
+-#define IOMMU_INT_MASK				(IOMMU_INT_INVALID_L1PG | \
+-						 IOMMU_INT_INVALID_L2PG | \
+-						 IOMMU_INT_MASTER_MASK)
++/* Masters 0-5 on the H6; the H616 adds master 6 (G2D) */
++#define IOMMU_INT_MASTER_MASK			GENMASK(6, 0)
++#define IOMMU_INT_PT_MASK			(IOMMU_INT_INVALID_L1PG | \
++						 IOMMU_INT_INVALID_L2PG)
+ 
+ #define PT_ENTRY_SIZE			sizeof(u32)
+ 
+@@ -106,6 +101,7 @@
+ 
+ struct sun50i_iommu_variant {
+ 	u32 tlb_prefetch;
++	u32 masters;	/* mask of the implemented masters */
+ };
+ 
+ struct sun50i_iommu {
+@@ -398,12 +394,7 @@
+ 		    IOMMU_TLB_FLUSH_REG,
+ 		    IOMMU_TLB_FLUSH_PTW_CACHE |
+ 		    IOMMU_TLB_FLUSH_MACRO_TLB |
+-		    IOMMU_TLB_FLUSH_MICRO_TLB(5) |
+-		    IOMMU_TLB_FLUSH_MICRO_TLB(4) |
+-		    IOMMU_TLB_FLUSH_MICRO_TLB(3) |
+-		    IOMMU_TLB_FLUSH_MICRO_TLB(2) |
+-		    IOMMU_TLB_FLUSH_MICRO_TLB(1) |
+-		    IOMMU_TLB_FLUSH_MICRO_TLB(0));
++		    iommu->variant->masters);
+ 
+ 	ret = readl_poll_timeout_atomic(iommu->base + IOMMU_TLB_FLUSH_REG,
+ 					reg, !reg,
+@@ -481,7 +472,8 @@
+ 	iommu_write(iommu, IOMMU_TLB_PREFETCH_REG,
+ 		    iommu->variant->tlb_prefetch);
+ 	iommu_write(iommu, IOMMU_BYPASS_REG, 0);
+-	iommu_write(iommu, IOMMU_INT_ENABLE_REG, IOMMU_INT_MASK);
++	iommu_write(iommu, IOMMU_INT_ENABLE_REG,
++		    IOMMU_INT_PT_MASK | iommu->variant->masters);
+ 	iommu_write(iommu, IOMMU_DM_AUT_CTRL_REG(SUN50I_IOMMU_ACI_NONE),
+ 		    IOMMU_DM_AUT_CTRL_RD_UNAVAIL(SUN50I_IOMMU_ACI_NONE, 0) |
+ 		    IOMMU_DM_AUT_CTRL_WR_UNAVAIL(SUN50I_IOMMU_ACI_NONE, 0) |
+@@ -494,7 +486,9 @@
+ 		    IOMMU_DM_AUT_CTRL_RD_UNAVAIL(SUN50I_IOMMU_ACI_NONE, 4) |
+ 		    IOMMU_DM_AUT_CTRL_WR_UNAVAIL(SUN50I_IOMMU_ACI_NONE, 4) |
+ 		    IOMMU_DM_AUT_CTRL_RD_UNAVAIL(SUN50I_IOMMU_ACI_NONE, 5) |
+-		    IOMMU_DM_AUT_CTRL_WR_UNAVAIL(SUN50I_IOMMU_ACI_NONE, 5));
++		    IOMMU_DM_AUT_CTRL_WR_UNAVAIL(SUN50I_IOMMU_ACI_NONE, 5) |
++		    IOMMU_DM_AUT_CTRL_RD_UNAVAIL(SUN50I_IOMMU_ACI_NONE, 6) |
++		    IOMMU_DM_AUT_CTRL_WR_UNAVAIL(SUN50I_IOMMU_ACI_NONE, 6));
+ 
+ 	iommu_write(iommu, IOMMU_DM_AUT_CTRL_REG(SUN50I_IOMMU_ACI_RD),
+ 		    IOMMU_DM_AUT_CTRL_WR_UNAVAIL(SUN50I_IOMMU_ACI_RD, 0) |
+@@ -502,7 +496,8 @@
+ 		    IOMMU_DM_AUT_CTRL_WR_UNAVAIL(SUN50I_IOMMU_ACI_RD, 2) |
+ 		    IOMMU_DM_AUT_CTRL_WR_UNAVAIL(SUN50I_IOMMU_ACI_RD, 3) |
+ 		    IOMMU_DM_AUT_CTRL_WR_UNAVAIL(SUN50I_IOMMU_ACI_RD, 4) |
+-		    IOMMU_DM_AUT_CTRL_WR_UNAVAIL(SUN50I_IOMMU_ACI_RD, 5));
++		    IOMMU_DM_AUT_CTRL_WR_UNAVAIL(SUN50I_IOMMU_ACI_RD, 5) |
++		    IOMMU_DM_AUT_CTRL_WR_UNAVAIL(SUN50I_IOMMU_ACI_RD, 6));
+ 
+ 	iommu_write(iommu, IOMMU_DM_AUT_CTRL_REG(SUN50I_IOMMU_ACI_WR),
+ 		    IOMMU_DM_AUT_CTRL_RD_UNAVAIL(SUN50I_IOMMU_ACI_WR, 0) |
+@@ -510,7 +505,8 @@
+ 		    IOMMU_DM_AUT_CTRL_RD_UNAVAIL(SUN50I_IOMMU_ACI_WR, 2) |
+ 		    IOMMU_DM_AUT_CTRL_RD_UNAVAIL(SUN50I_IOMMU_ACI_WR, 3) |
+ 		    IOMMU_DM_AUT_CTRL_RD_UNAVAIL(SUN50I_IOMMU_ACI_WR, 4) |
+-		    IOMMU_DM_AUT_CTRL_RD_UNAVAIL(SUN50I_IOMMU_ACI_WR, 5));
++		    IOMMU_DM_AUT_CTRL_RD_UNAVAIL(SUN50I_IOMMU_ACI_WR, 5) |
++		    IOMMU_DM_AUT_CTRL_RD_UNAVAIL(SUN50I_IOMMU_ACI_WR, 6));
+ 
+ 	ret = sun50i_iommu_flush_all_tlb(iommu);
+ 	if (ret) {
+@@ -1015,7 +1011,7 @@
+ 	spin_lock(&iommu->iommu_lock);
+ 
+ 	status = iommu_read(iommu, IOMMU_INT_STA_REG);
+-	if (!(status & IOMMU_INT_MASK)) {
++	if (!(status & (IOMMU_INT_PT_MASK | iommu->variant->masters))) {
+ 		spin_unlock(&iommu->iommu_lock);
+ 		return IRQ_NONE;
+ 	}
+@@ -1047,7 +1043,7 @@
+ 	for (m = 0; m < ARRAY_SIZE(iommu->sibling_masters); m++)
+ 		if (faulted & BIT(m))
+ 			resets |= iommu->sibling_masters[m];
+-	resets &= IOMMU_INT_MASTER_MASK;
++	resets &= iommu->variant->masters;
+ 
+ 	iommu_write(iommu, IOMMU_RESET_REG, ~resets);
+ 	iommu_write(iommu, IOMMU_RESET_REG, IOMMU_RESET_RELEASE_ALL);
+@@ -1139,6 +1135,19 @@
+ 			IOMMU_TLB_PREFETCH_MASTER_ENABLE(3) |
+ 			IOMMU_TLB_PREFETCH_MASTER_ENABLE(4) |
+ 			IOMMU_TLB_PREFETCH_MASTER_ENABLE(5),
++	.masters = GENMASK(5, 0),
++};
++
++/* The H616 IOMMU has a seventh master, G2D (UM 3.12.2, table 3-8). */
++static const struct sun50i_iommu_variant sun50i_h616_variant = {
++	.tlb_prefetch = IOMMU_TLB_PREFETCH_MASTER_ENABLE(0) |
++			IOMMU_TLB_PREFETCH_MASTER_ENABLE(1) |
++			IOMMU_TLB_PREFETCH_MASTER_ENABLE(2) |
++			IOMMU_TLB_PREFETCH_MASTER_ENABLE(3) |
++			IOMMU_TLB_PREFETCH_MASTER_ENABLE(4) |
++			IOMMU_TLB_PREFETCH_MASTER_ENABLE(5) |
++			IOMMU_TLB_PREFETCH_MASTER_ENABLE(6),
++	.masters = GENMASK(6, 0),
+ };
+ 
+ /*
+@@ -1157,11 +1166,12 @@
+ 			IOMMU_TLB_PREFETCH_MASTER_ENABLE(4) |
+ 			IOMMU_TLB_PREFETCH_MASTER_ENABLE(5) |
+ 			IOMMU_TLB_PREFETCH_ONLY_VALID,
++	.masters = GENMASK(5, 0),
+ };
+ 
+ static const struct of_device_id sun50i_iommu_dt[] = {
+ 	{ .compatible = "allwinner,sun50i-h6-iommu", .data = &sun50i_h6_variant },
+-	{ .compatible = "allwinner,sun50i-h616-iommu", .data = &sun50i_h6_variant },
++	{ .compatible = "allwinner,sun50i-h616-iommu", .data = &sun50i_h616_variant },
+ 	{ .compatible = "allwinner,sun55i-a523-iommu", .data = &sun55i_a523_variant },
+ 	{ /* sentinel */ },
+ };
+-- 
+Armbian
