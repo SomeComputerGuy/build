@@ -27,10 +27,10 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  2 files changed, 75 insertions(+), 10 deletions(-)
 
 diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
-index e2611a415..9190c630c 100644
+index 98e7f4e11..4b8e58aef 100644
 --- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
 +++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
-@@ -587,8 +587,13 @@ static void deinterlace_device_run(void *priv)
+@@ -590,8 +590,13 @@ static void deinterlace_device_run(void *priv)
  		}
  	}
  
@@ -46,7 +46,7 @@ index e2611a415..9190c630c 100644
  		dma |= DEINTERLACE_DMA_CTL_FR | DEINTERLACE_DMA_CTL_FW;
  		func |= DEINTERLACE_FUNC_EN_MD;
  	}
-@@ -725,6 +730,8 @@ static void deinterlace_device_run(void *priv)
+@@ -728,6 +733,8 @@ static void deinterlace_device_run(void *priv)
  
  	deinterlace_set_bits(dev, DEINTERLACE_INT_CTL,
  			     DEINTERLACE_INT_CTL_FINISH_EN);
@@ -55,7 +55,7 @@ index e2611a415..9190c630c 100644
  	deinterlace_set_bits(dev, DEINTERLACE_START, DEINTERLACE_START_EN);
  }
  
-@@ -775,13 +782,15 @@ static void deinterlace_tnr_adapt(struct deinterlace_ctx *ctx)
+@@ -778,13 +785,15 @@ static void deinterlace_tnr_adapt(struct deinterlace_ctx *ctx)
  	ctx->tnr_gain = clamp(gain, ctx->tnr_gain_min, ctx->tnr_gain_max);
  }
  
@@ -74,7 +74,7 @@ index e2611a415..9190c630c 100644
  
  	ctx = v4l2_m2m_get_curr_priv(dev->m2m_dev);
  	if (!ctx) {
-@@ -798,9 +807,51 @@ static irqreturn_t deinterlace_irq(int irq, void *data)
+@@ -801,9 +810,51 @@ static irqreturn_t deinterlace_irq(int irq, void *data)
  	deinterlace_set_bits(dev, DEINTERLACE_STATUS, DEINTERLACE_STATUS_FINISH);
  	deinterlace_clr_bits(dev, DEINTERLACE_START, DEINTERLACE_START_EN);
  
@@ -128,7 +128,7 @@ index e2611a415..9190c630c 100644
  		dev->fmd_stats[0] = deinterlace_read(dev, DEINTERLACE_FMD_FID12) &
  				    DEINTERLACE_FMD_HIST_CNT_MASK;
  		dev->fmd_stats[1] = deinterlace_read(dev, DEINTERLACE_FMD_FID23) &
-@@ -821,7 +872,7 @@ static irqreturn_t deinterlace_irq(int irq, void *data)
+@@ -824,7 +875,7 @@ static irqreturn_t deinterlace_irq(int irq, void *data)
  		dev->fmd_stats[9] = deinterlace_read(dev, DEINTERLACE_FMD_FIELD_HIST1);
  	}
  
@@ -137,7 +137,7 @@ index e2611a415..9190c630c 100644
  		if (ctx->tnr_mode == DEINTERLACE_TNR_ADAPTIVE)
  			deinterlace_tnr_adapt(ctx);
  		if (ctx->mode != DEINTERLACE_MODE_TNR) {
-@@ -856,8 +907,6 @@ static irqreturn_t deinterlace_irq(int irq, void *data)
+@@ -862,8 +913,6 @@ static irqreturn_t deinterlace_irq(int irq, void *data)
  		v4l2_m2m_buf_done(src, state);
  
  	v4l2_m2m_job_finish(ctx->dev->m2m_dev, ctx->fh.m2m_ctx);
@@ -146,7 +146,7 @@ index e2611a415..9190c630c 100644
  }
  
  static void deinterlace_init(struct deinterlace_dev *dev)
-@@ -1192,6 +1241,13 @@ static int deinterlace_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
+@@ -1198,6 +1247,13 @@ static int deinterlace_queue_setup(struct vb2_queue *vq, unsigned int *nbuffers,
  			return -EINVAL;
  	} else {
  		sizes[0] = pix_fmt->sizeimage;
@@ -160,7 +160,7 @@ index e2611a415..9190c630c 100644
  		*nplanes = 1;
  	}
  
-@@ -1854,6 +1910,8 @@ static int deinterlace_probe(struct platform_device *pdev)
+@@ -1869,6 +1925,8 @@ static int deinterlace_probe(struct platform_device *pdev)
  	if (irq <= 0)
  		return irq;
  
@@ -169,7 +169,7 @@ index e2611a415..9190c630c 100644
  	ret = devm_request_irq(dev->dev, irq, deinterlace_irq,
  			       0, dev_name(dev->dev), dev);
  	if (ret) {
-@@ -1986,6 +2044,8 @@ static void deinterlace_remove(struct platform_device *pdev)
+@@ -2001,6 +2059,8 @@ static void deinterlace_remove(struct platform_device *pdev)
  {
  	struct deinterlace_dev *dev = platform_get_drvdata(pdev);
  
@@ -179,10 +179,10 @@ index e2611a415..9190c630c 100644
  		media_device_unregister(&dev->mdev);
  		v4l2_m2m_unregister_media_controller(dev->m2m_dev);
 diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
-index 6e199738d..2e2753a1f 100644
+index 0d94ed5e8..06d3ba8eb 100644
 --- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
 +++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.h
-@@ -407,6 +407,11 @@ struct deinterlace_dev {
+@@ -411,6 +411,11 @@ struct deinterlace_dev {
  	 * that happened to submit that job.
  	 */
  	u32			fmd_stats[DEINTERLACE_FMD_STATS_COUNT];
