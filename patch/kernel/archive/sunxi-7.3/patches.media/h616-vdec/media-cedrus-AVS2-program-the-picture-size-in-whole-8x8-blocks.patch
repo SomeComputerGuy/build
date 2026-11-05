@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 5 Nov 2026 14:20:00 +0000
+Subject: [PATCH] media: cedrus: AVS2: program the picture size in whole 8x8
+ blocks
+
+The VE decodes AVS2 in 8x8 minimum coding units and expects the picture
+size register to hold the size rounded up to whole units: the vendor
+library writes iEncWidth/iEncHeight, (horizontal_size + 7) & ~7 and
+(vertical_size + 7) & ~7, there. With the raw size, an 854x480 stream
+(width not a multiple of 8) stalls the VE from the first picture and
+every job ends in "frame processing timed out".
+
+Round the size up to 8 as the vendor does. The capture buffers are
+already aligned to at least 16.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/staging/media/sunxi/cedrus/cedrus_avs2.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c b/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
+@@ -433,8 +433,14 @@
+ 		reg |= VE_DEC_AVS2_SEQ_HDR_BCBR;
+ 	cedrus_write(dev, VE_DEC_AVS2_SEQ_HDR, reg);
+ 
+-	reg = VE_DEC_AVS2_PIC_SIZE_WIDTH(seq->horizontal_size) |
+-	      VE_DEC_AVS2_PIC_SIZE_HEIGHT(seq->vertical_size);
++	/*
++	 * The picture size in whole 8x8 minimum coding units, as the vendor
++	 * library programs it (its iEncWidth/iEncHeight). An unaligned size,
++	 * such as the 854 pixel width of 480p AVS2, stalls the VE until the
++	 * watchdog fires.
++	 */
++	reg = VE_DEC_AVS2_PIC_SIZE_WIDTH(ALIGN(seq->horizontal_size, 8)) |
++	      VE_DEC_AVS2_PIC_SIZE_HEIGHT(ALIGN(seq->vertical_size, 8));
+ 	cedrus_write(dev, VE_DEC_AVS2_PIC_SIZE, reg);
+ 
+ 	/* Picture header. */
+-- 
+2.47.0
