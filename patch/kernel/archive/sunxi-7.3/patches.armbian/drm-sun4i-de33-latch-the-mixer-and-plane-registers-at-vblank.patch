@@ -1,0 +1,818 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 6 Nov 2026 00:30:00 +0000
+Subject: drm/sun4i: de33: Latch the mixer and plane registers at vblank
+
+The H616 DE33 is driven over plain MMIO: the blender and the plane
+registers (overlay, scaler, CSC, AFBC decompressor) are written from the
+atomic commit worker, through regmaps, at whatever point of the frame it
+happens to run. Unlike DE2/DE3 there is no GLB_DBUFF: those engines
+double-buffer every register and swap the set at the next vblank when the
+driver sets the bit at the end of its commit. sun8i_mixer_commit() skips
+that write for DE33, and the hardware's own mechanism, the RCQ DMA of the
+register configuration queue (RCQ_CTL at top + 0x10, the same block the
+A523 backend uses), is not used on this path.
+
+So a DE33 register update is live the moment it is written. The DE33 AFBC
+work measured where the commits land with afbc-kms-play on a forced
+3840x2160@60 HDMI mode (no sink): a mean of 1.50 ms after the previous
+vblank for a 4K XR24 pattern, with every one of 1499 commits inside the
+active video (the blanking is 0.667 ms), and 6.1 ms mean for AFBC
+playback. A page flip programmed at scan line ~1000 changes the fetch
+address for the rest of that frame: the top of the frame is the old
+buffer and the bottom the new one. A plane enable or disable programmed
+there flashes the background colour for part of a frame. The sun55iw3
+(A523) backend in this tree saw exactly that on hardware when it armed its
+RCQ load from atomic_flush, and moved the arm into the vblank interrupt.
+
+The vendor driver does the same for this engine. Its AHB path (RTMX_USE_RCQ
+off) writes the dirty register blocks from the vsync interrupt
+(sync_event_proc -> disp_sync_all -> disp_al_manager_sync ->
+de_rtmx_update_reg_ahb), and its RCQ path issues the RCQ load from the
+vsync interrupt as well (disp_mgr_protect_reg_for_rcq).
+
+Do that here. Add a register shadow (sun50i_shadow.c): the DE33 mixer and
+planes regmaps become bus-less regmaps whose writes land in a staging copy
+(4 KiB pages, allocated for the register pages actually used). At the end
+of the mixer's atomic flush, sun8i_mixer_commit() snapshots the staged
+registers of this display (the blender block and the channels mapped to
+it; the planes device is shared by both mixers) into a latch copy and takes
+a vblank reference, so the TCON vblank interrupt stays enabled also for
+commits without a page-flip event (legacy cursor updates). The TCON vblank
+interrupt then writes the latched registers out through the engine's
+vblank_quirk, while the beam is in the leading vertical blanking, and
+drops the reference. The snapshot gives the same frame boundary as
+GLB_DBUFF: a commit that starts before the previous one's vblank is not
+mixed into it. While the CRTC is off, drm_crtc_vblank_get() fails and the
+registers are written at once: nothing scans out, and the planes of a
+modeset are programmed before the CRTC is enabled.
+
+Read-only diagnostics come as module parameters
+(/sys/module/sun8i_mixer/parameters/de33_latch_*): flush count, flushes
+written with the CRTC off, flushes where the interrupt found the beam in
+the active video (late), the TCON line at the flush (min/max) against the
+first active line of the mode, the biggest flush in registers and ns, and
+commits that coalesced. A frame-coherent update needs late == 0 and
+line_max < line_active. The TCON TV line counter is taken to be zeroed at
+the start of the vertical sync, as measured on the sun55iw3 TCON TV; a
+flush that the interrupt services late is still written immediately
+(counted), which is what happens on every commit today.
+
+The DE2/DE3, A523 RCQ and TVE paths are unchanged: the shadow is only
+created for a DE33 mixer without uses_rcq, and only the "display" and
+"planes" regmaps go through it; the "top" block (RT_EN, size, clock) stays
+plain MMIO and is written at mode set with the CRTC off.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff -ruN a/drivers/gpu/drm/sun4i/Makefile b/drivers/gpu/drm/sun4i/Makefile
+--- a/drivers/gpu/drm/sun4i/Makefile
++++ b/drivers/gpu/drm/sun4i/Makefile
+@@ -18,6 +18,7 @@
+ sun8i-drm-hdmi-y		+= sun8i_hdmi_phy_clk.o
+ 
+ sun8i-mixer-y			+= sun50i_afbc.o
++sun8i-mixer-y			+= sun50i_shadow.o
+ sun8i-mixer-y			+= sun8i_mixer.o sun8i_ui_layer.o \
+ 				   sun8i_vi_layer.o sun8i_ui_scaler.o \
+ 				   sun8i_vi_scaler.o sun8i_csc.o \
+diff -ruN a/drivers/gpu/drm/sun4i/sun50i_planes.c b/drivers/gpu/drm/sun4i/sun50i_planes.c
+--- a/drivers/gpu/drm/sun4i/sun50i_planes.c
++++ b/drivers/gpu/drm/sun4i/sun50i_planes.c
+@@ -14,6 +14,7 @@
+ #include <linux/regmap.h>
+ 
+ #include "sun50i_planes.h"
++#include "sun50i_shadow.h"
+ #include "sun8i_ui_layer.h"
+ #include "sun8i_vi_layer.h"
+ 
+@@ -119,6 +120,50 @@
+ }
+ EXPORT_SYMBOL(sun50i_planes_setup);
+ 
++/*
++ * The plane registers are not double-buffered by the hardware, so they are
++ * written through a shadow (sun50i_shadow.h). The mixer of display @mixer
++ * commits the channels mapped to it at the end of its atomic flush and
++ * writes them out from its vblank interrupt, while the beam is in the
++ * vertical blanking. Each channel owns the DE33_CH_SIZE window at
++ * channel * DE33_CH_SIZE (CSC, overlay, scaler, decompressor).
++ */
++static unsigned int sun50i_planes_for_each_channel(struct device *dev,
++						   unsigned int mixer,
++						   unsigned int (*fn)(struct sun50i_shadow *,
++								      unsigned int,
++								      unsigned int))
++{
++	struct sun50i_planes *planes = dev_get_drvdata(dev);
++	const struct default_map *map;
++	unsigned int i, n = 0;
++
++	if (!planes || mixer >= MAX_DISP)
++		return 0;
++
++	map = &planes->quirks->def_map[mixer];
++	for (i = 0; i < map->num_ch; i++) {
++		unsigned int start = map->map[i] * DE33_CH_SIZE;
++
++		n += fn(planes->shadow, start, start + DE33_CH_SIZE);
++	}
++
++	return n;
++}
++
++unsigned int sun50i_planes_commit(struct device *dev, unsigned int mixer)
++{
++	return sun50i_planes_for_each_channel(dev, mixer, sun50i_shadow_commit);
++}
++EXPORT_SYMBOL(sun50i_planes_commit);
++
++/* Runs from the TCON vblank interrupt. */
++unsigned int sun50i_planes_flush(struct device *dev, unsigned int mixer)
++{
++	return sun50i_planes_for_each_channel(dev, mixer, sun50i_shadow_flush);
++}
++EXPORT_SYMBOL(sun50i_planes_flush);
++
+ static void sun50i_planes_init_mapping(struct sun50i_planes *planes)
+ {
+ 	const struct sun50i_planes_quirks *quirks = planes->quirks;
+@@ -151,18 +196,11 @@
+ 	}
+ }
+ 
+-static const struct regmap_config sun50i_planes_regmap_config = {
+-	.name		= "planes",
+-	.reg_bits	= 32,
+-	.val_bits	= 32,
+-	.reg_stride	= 4,
+-	.max_register	= 0x17fffc,
+-};
+-
+ static int sun50i_planes_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+ 	struct sun50i_planes *planes;
++	struct resource *res;
+ 	void __iomem *regs;
+ 	int ret;
+ 
+@@ -188,13 +226,15 @@
+ 		return dev_err_probe(dev, PTR_ERR(planes->mapping),
+ 				     "Unable to get mapping\n");
+ 
+-	regs = devm_platform_ioremap_resource(pdev, 0);
++	regs = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
+ 	if (IS_ERR(regs))
+ 		return PTR_ERR(regs);
+ 
+-	planes->regs = devm_regmap_init_mmio(dev, regs, &sun50i_planes_regmap_config);
+-	if (IS_ERR(planes->regs))
+-		return PTR_ERR(planes->regs);
++	planes->shadow = sun50i_shadow_create(dev, regs, resource_size(res),
++					      "planes");
++	if (IS_ERR(planes->shadow))
++		return PTR_ERR(planes->shadow);
++	planes->regs = sun50i_shadow_regmap(planes->shadow);
+ 
+ 	dev_set_drvdata(dev, planes);
+ 
+diff -ruN a/drivers/gpu/drm/sun4i/sun50i_planes.h b/drivers/gpu/drm/sun4i/sun50i_planes.h
+--- a/drivers/gpu/drm/sun4i/sun50i_planes.h
++++ b/drivers/gpu/drm/sun4i/sun50i_planes.h
+@@ -16,6 +16,7 @@
+ 
+ struct regmap;
+ struct drm_device;
++struct sun50i_shadow;
+ 
+ struct default_map {
+ 	unsigned int map[MAX_CHANNELS];
+@@ -28,6 +29,7 @@
+ };
+ 
+ struct sun50i_planes {
++	struct sun50i_shadow			*shadow;
+ 	struct regmap				*regs;
+ 	struct regmap				*mapping;
+ 	const struct sun50i_planes_quirks	*quirks;
+@@ -36,5 +38,7 @@
+ struct drm_plane **
+ sun50i_planes_setup(struct device *dev, struct drm_device *drm,
+ 		    unsigned int mixer);
++unsigned int sun50i_planes_commit(struct device *dev, unsigned int mixer);
++unsigned int sun50i_planes_flush(struct device *dev, unsigned int mixer);
+ 
+ #endif /* _SUN50I_PLANES_H_ */
+diff -ruN a/drivers/gpu/drm/sun4i/sun50i_shadow.c b/drivers/gpu/drm/sun4i/sun50i_shadow.c
+--- a/drivers/gpu/drm/sun4i/sun50i_shadow.c
++++ b/drivers/gpu/drm/sun4i/sun50i_shadow.c
+@@ -0,0 +1,275 @@
++// SPDX-License-Identifier: GPL-2.0+
++/*
++ * Register shadow with a commit/flush split, see sun50i_shadow.h.
++ *
++ * Pages of 1024 registers (4 KiB) are allocated the first time a register
++ * in them is written, so a sparse register space costs only the pages the
++ * driver uses. reg_write runs in process context under the regmap mutex;
++ * commit and flush take the shadow spinlock and may run from a hard IRQ.
++ */
++
++#include <linux/bitmap.h>
++#include <linux/device.h>
++#include <linux/io.h>
++#include <linux/regmap.h>
++#include <linux/slab.h>
++#include <linux/spinlock.h>
++
++#include "sun50i_shadow.h"
++
++#define SHADOW_PAGE_WORDS	1024
++#define SHADOW_PAGE_SHIFT	10
++#define SHADOW_PAGE_BYTES	(SHADOW_PAGE_WORDS * 4)
++
++struct sun50i_shadow_page {
++	u32		stage[SHADOW_PAGE_WORDS];	/* driver writes */
++	u32		latch[SHADOW_PAGE_WORDS];	/* committed values */
++	DECLARE_BITMAP(stage_dirty, SHADOW_PAGE_WORDS);
++	DECLARE_BITMAP(latch_dirty, SHADOW_PAGE_WORDS);
++};
++
++struct sun50i_shadow {
++	struct device			*dev;
++	void __iomem			*base;
++	unsigned int			npages;
++	struct regmap			*map;
++	spinlock_t			lock;
++	struct sun50i_shadow_page	**pages;
++	unsigned long			*stage_pages;	/* pages with staged words */
++	unsigned long			*latch_pages;	/* pages with latched words */
++};
++
++static struct sun50i_shadow_page *
++sun50i_shadow_get_page(struct sun50i_shadow *shadow, unsigned int p)
++{
++	struct sun50i_shadow_page *page, *old;
++	unsigned long flags;
++
++	page = READ_ONCE(shadow->pages[p]);
++	if (page)
++		return page;
++
++	page = kzalloc(sizeof(*page), GFP_KERNEL);
++	if (!page)
++		return NULL;
++
++	spin_lock_irqsave(&shadow->lock, flags);
++	old = shadow->pages[p];
++	if (!old)
++		shadow->pages[p] = page;
++	spin_unlock_irqrestore(&shadow->lock, flags);
++
++	if (old) {
++		kfree(page);
++		page = old;
++	}
++
++	return page;
++}
++
++static int sun50i_shadow_reg_write(void *context, unsigned int reg,
++				   unsigned int val)
++{
++	struct sun50i_shadow *shadow = context;
++	unsigned int word = reg >> 2, p = word >> SHADOW_PAGE_SHIFT;
++	unsigned int w = word & (SHADOW_PAGE_WORDS - 1);
++	struct sun50i_shadow_page *page;
++	unsigned long flags;
++
++	if (p >= shadow->npages)
++		return -EINVAL;
++
++	page = sun50i_shadow_get_page(shadow, p);
++	if (!page)
++		return -ENOMEM;
++
++	spin_lock_irqsave(&shadow->lock, flags);
++	page->stage[w] = val;
++	__set_bit(w, page->stage_dirty);
++	__set_bit(p, shadow->stage_pages);
++	spin_unlock_irqrestore(&shadow->lock, flags);
++
++	return 0;
++}
++
++static int sun50i_shadow_reg_read(void *context, unsigned int reg,
++				  unsigned int *val)
++{
++	struct sun50i_shadow *shadow = context;
++	unsigned int word = reg >> 2, p = word >> SHADOW_PAGE_SHIFT;
++	unsigned int w = word & (SHADOW_PAGE_WORDS - 1);
++	struct sun50i_shadow_page *page;
++	unsigned long flags;
++
++	if (p >= shadow->npages)
++		return -EINVAL;
++
++	page = READ_ONCE(shadow->pages[p]);
++	if (!page) {
++		*val = 0;
++		return 0;
++	}
++
++	spin_lock_irqsave(&shadow->lock, flags);
++	*val = page->stage[w];
++	spin_unlock_irqrestore(&shadow->lock, flags);
++
++	return 0;
++}
++
++static void sun50i_shadow_range(struct sun50i_shadow *shadow,
++				unsigned int start, unsigned int end,
++				unsigned int *first, unsigned int *last)
++{
++	*first = start / SHADOW_PAGE_BYTES;
++	if (end == SUN50I_SHADOW_ALL || end / SHADOW_PAGE_BYTES > shadow->npages)
++		*last = shadow->npages;
++	else
++		*last = DIV_ROUND_UP(end, SHADOW_PAGE_BYTES);
++}
++
++/**
++ * sun50i_shadow_commit - snapshot the staged registers of a range
++ * @shadow: the shadow
++ * @start: first register offset of the range (page aligned)
++ * @end: end of the range (exclusive, page aligned) or SUN50I_SHADOW_ALL
++ *
++ * Everything written since the previous commit of the range becomes the
++ * state the next flush applies. Writes after this call stay staged for the
++ * following commit, so a flush never applies a half-written update.
++ *
++ * Returns: the number of registers latched.
++ */
++unsigned int sun50i_shadow_commit(struct sun50i_shadow *shadow,
++				  unsigned int start, unsigned int end)
++{
++	unsigned int first, last, p, w, n = 0;
++	unsigned long flags;
++
++	sun50i_shadow_range(shadow, start, end, &first, &last);
++
++	spin_lock_irqsave(&shadow->lock, flags);
++	for_each_set_bit_from(first, shadow->stage_pages, last) {
++		struct sun50i_shadow_page *page = shadow->pages[first];
++
++		p = first;
++		for_each_set_bit(w, page->stage_dirty, SHADOW_PAGE_WORDS) {
++			page->latch[w] = page->stage[w];
++			__set_bit(w, page->latch_dirty);
++			n++;
++		}
++		bitmap_zero(page->stage_dirty, SHADOW_PAGE_WORDS);
++		__clear_bit(p, shadow->stage_pages);
++		__set_bit(p, shadow->latch_pages);
++	}
++	spin_unlock_irqrestore(&shadow->lock, flags);
++
++	return n;
++}
++
++/**
++ * sun50i_shadow_flush - write the latched registers of a range to the hardware
++ * @shadow: the shadow
++ * @start: first register offset of the range (page aligned)
++ * @end: end of the range (exclusive, page aligned) or SUN50I_SHADOW_ALL
++ *
++ * May be called from a hard IRQ. The caller decides when: the point of the
++ * shadow is to issue this inside the vertical blanking.
++ *
++ * Returns: the number of registers written.
++ */
++unsigned int sun50i_shadow_flush(struct sun50i_shadow *shadow,
++				 unsigned int start, unsigned int end)
++{
++	unsigned int first, last, p, w, n = 0;
++	unsigned long flags;
++
++	sun50i_shadow_range(shadow, start, end, &first, &last);
++
++	spin_lock_irqsave(&shadow->lock, flags);
++	for_each_set_bit_from(first, shadow->latch_pages, last) {
++		struct sun50i_shadow_page *page = shadow->pages[first];
++		void __iomem *base;
++
++		p = first;
++		base = shadow->base + ((size_t)p << (SHADOW_PAGE_SHIFT + 2));
++		for_each_set_bit(w, page->latch_dirty, SHADOW_PAGE_WORDS) {
++			writel_relaxed(page->latch[w], base + (w << 2));
++			n++;
++		}
++		bitmap_zero(page->latch_dirty, SHADOW_PAGE_WORDS);
++		__clear_bit(p, shadow->latch_pages);
++	}
++	/* order the posted register writes before whatever follows */
++	wmb();
++	spin_unlock_irqrestore(&shadow->lock, flags);
++
++	return n;
++}
++
++static void sun50i_shadow_release(void *data)
++{
++	struct sun50i_shadow *shadow = data;
++	unsigned int p;
++
++	for (p = 0; p < shadow->npages; p++)
++		kfree(shadow->pages[p]);
++}
++
++/**
++ * sun50i_shadow_create - set up a shadow in front of a register block
++ * @dev: owning device (devres)
++ * @base: ioremapped register block
++ * @size: size of the block in bytes
++ * @name: regmap name (debugfs)
++ *
++ * Returns: the shadow, or an ERR_PTR.
++ */
++struct sun50i_shadow *sun50i_shadow_create(struct device *dev,
++					   void __iomem *base,
++					   resource_size_t size,
++					   const char *name)
++{
++	struct regmap_config config = {
++		.name		= name,
++		.reg_bits	= 32,
++		.val_bits	= 32,
++		.reg_stride	= 4,
++		.reg_read	= sun50i_shadow_reg_read,
++		.reg_write	= sun50i_shadow_reg_write,
++	};
++	struct sun50i_shadow *shadow;
++	int ret;
++
++	shadow = devm_kzalloc(dev, sizeof(*shadow), GFP_KERNEL);
++	if (!shadow)
++		return ERR_PTR(-ENOMEM);
++
++	shadow->dev = dev;
++	shadow->base = base;
++	shadow->npages = DIV_ROUND_UP(size, SHADOW_PAGE_BYTES);
++	spin_lock_init(&shadow->lock);
++
++	shadow->pages = devm_kcalloc(dev, shadow->npages, sizeof(*shadow->pages),
++				     GFP_KERNEL);
++	shadow->stage_pages = devm_bitmap_zalloc(dev, shadow->npages, GFP_KERNEL);
++	shadow->latch_pages = devm_bitmap_zalloc(dev, shadow->npages, GFP_KERNEL);
++	if (!shadow->pages || !shadow->stage_pages || !shadow->latch_pages)
++		return ERR_PTR(-ENOMEM);
++
++	ret = devm_add_action_or_reset(dev, sun50i_shadow_release, shadow);
++	if (ret)
++		return ERR_PTR(ret);
++
++	config.max_register = shadow->npages * SHADOW_PAGE_BYTES - 4;
++	shadow->map = devm_regmap_init(dev, NULL, shadow, &config);
++	if (IS_ERR(shadow->map))
++		return ERR_CAST(shadow->map);
++
++	return shadow;
++}
++
++struct regmap *sun50i_shadow_regmap(struct sun50i_shadow *shadow)
++{
++	return shadow->map;
++}
+diff -ruN a/drivers/gpu/drm/sun4i/sun50i_shadow.h b/drivers/gpu/drm/sun4i/sun50i_shadow.h
+--- a/drivers/gpu/drm/sun4i/sun50i_shadow.h
++++ b/drivers/gpu/drm/sun4i/sun50i_shadow.h
+@@ -0,0 +1,37 @@
++/* SPDX-License-Identifier: GPL-2.0+ */
++/*
++ * Register shadow for display engines whose registers are not
++ * double-buffered by hardware (the H616 DE33 driven over plain MMIO).
++ *
++ * Driver writes go through a regmap into a staging copy. A commit snapshots
++ * the staged words of a register range into the latch copy, and a flush,
++ * issued from the vblank interrupt while the beam is in the vertical
++ * blanking, writes the latched words to the hardware. This gives the
++ * frame-coherent register update that the DE2/DE3 GLB_DBUFF bit provides in
++ * hardware.
++ */
++
++#ifndef _SUN50I_SHADOW_H_
++#define _SUN50I_SHADOW_H_
++
++#include <linux/types.h>
++
++struct device;
++struct regmap;
++struct sun50i_shadow;
++
++/* register range in bytes, [start, end); end = SUN50I_SHADOW_ALL for everything */
++#define SUN50I_SHADOW_ALL	(~0u)
++
++struct sun50i_shadow *sun50i_shadow_create(struct device *dev,
++					   void __iomem *base,
++					   resource_size_t size,
++					   const char *name);
++struct regmap *sun50i_shadow_regmap(struct sun50i_shadow *shadow);
++
++unsigned int sun50i_shadow_commit(struct sun50i_shadow *shadow,
++				  unsigned int start, unsigned int end);
++unsigned int sun50i_shadow_flush(struct sun50i_shadow *shadow,
++				 unsigned int start, unsigned int end);
++
++#endif /* _SUN50I_SHADOW_H_ */
+diff -ruN a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -9,6 +9,7 @@
+ 
+ #include <linux/component.h>
+ #include <linux/delay.h>
++#include <linux/ktime.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -26,9 +27,11 @@
+ #include <drm/drm_gem_dma_helper.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_probe_helper.h>
++#include <drm/drm_vblank.h>
+ 
+ #include "sun4i_drv.h"
+ #include "sun50i_planes.h"
++#include "sun50i_shadow.h"
+ #include "sun4i_tcon.h"
+ #include "sun8i_csc.h"
+ #include "sun8i_mixer.h"
+@@ -269,6 +272,159 @@
+ 	return -EINVAL;
+ }
+ 
++/*
++ * H616 DE33 over plain MMIO: the blender and plane registers are not
++ * double-buffered (there is no GLB_DBUFF; the hardware way is the RCQ DMA,
++ * which is not used here). A register written from the commit worker takes
++ * effect at whatever scan line the beam is on, so a page flip tears at that
++ * line and a pipe enable flashes the background colour. Instead, every write
++ * goes to a shadow (sun50i_shadow.h); sun8i_mixer_commit() snapshots the
++ * frame's registers and keeps the vblank interrupt on, and the TCON vblank
++ * interrupt writes the snapshot out through vblank_quirk, while the beam is
++ * in the leading vertical blanking. This is what the vendor driver's AHB path
++ * does (sync_event_proc -> de_rtmx_update_reg_ahb in its vsync interrupt)
++ * and what DE2/DE3 do in hardware with GLB_DBUFF. While the CRTC is off
++ * nothing scans out and there is no vblank, so the writes go out at once.
++ *
++ * The counters are read-only diagnostics: a frame-coherent update needs
++ * de33_latch_flushes_late == 0 and de33_latch_line_max < de33_latch_line_active.
++ */
++static unsigned int de33_latch_commits;
++static unsigned int de33_latch_coalesced;	/* commits before the previous one flushed */
++static unsigned int de33_latch_flushes;
++static unsigned int de33_latch_flushes_sync;	/* written at once, CRTC off */
++static unsigned int de33_latch_flushes_late;	/* vblank IRQ found the beam in active video */
++static unsigned int de33_latch_words_max;	/* most registers written by one flush */
++static unsigned int de33_latch_ns_max;		/* longest flush */
++static int de33_latch_line_min = -1;		/* TCON line at flush, min/max */
++static int de33_latch_line_max = -1;
++static int de33_latch_line_active = -1;		/* first active TCON line of the mode */
++module_param(de33_latch_commits, uint, 0444);
++module_param(de33_latch_coalesced, uint, 0444);
++module_param(de33_latch_flushes, uint, 0444);
++module_param(de33_latch_flushes_sync, uint, 0444);
++module_param(de33_latch_flushes_late, uint, 0444);
++module_param(de33_latch_words_max, uint, 0444);
++module_param(de33_latch_ns_max, uint, 0444);
++module_param(de33_latch_line_min, int, 0444);
++module_param(de33_latch_line_max, int, 0444);
++module_param(de33_latch_line_active, int, 0444);
++
++static void sun50i_mixer_latch_mode_set(struct sun8i_mixer *mixer,
++					const struct drm_display_mode *mode)
++{
++	/*
++	 * The TCON TV line counter that sun4i_tcon_handler() passes as
++	 * cur_line is zeroed at the start of the vertical sync and counts up
++	 * to vtotal; active video starts vsync + back porch lines later.
++	 */
++	mixer->line_total = mode->crtc_vtotal;
++	mixer->line_active = mode->crtc_vtotal - mode->crtc_vsync_start;
++	de33_latch_line_active = mixer->line_active;
++	de33_latch_line_min = -1;
++	de33_latch_line_max = -1;
++}
++
++/*
++ * Write the snapshot out. @cur_line is the TCON scan line at the vblank
++ * interrupt, or -1 for an immediate write with the CRTC off.
++ */
++static void sun50i_mixer_latch_flush(struct sun8i_mixer *mixer, int cur_line)
++{
++	struct drm_crtc *crtc = NULL;
++	unsigned long flags;
++	unsigned int words;
++	u64 ns;
++
++	spin_lock_irqsave(&mixer->latch_lock, flags);
++	if (!mixer->latch_pending) {
++		spin_unlock_irqrestore(&mixer->latch_lock, flags);
++		return;
++	}
++
++	ns = ktime_get_ns();
++	words = sun50i_planes_flush(mixer->planes_dev, mixer->engine.id);
++	words += sun50i_shadow_flush(mixer->shadow, 0, SUN50I_SHADOW_ALL);
++	ns = ktime_get_ns() - ns;
++
++	mixer->latch_pending = false;
++	if (mixer->latch_vblank_ref) {
++		mixer->latch_vblank_ref = false;
++		crtc = mixer->latch_crtc;
++	}
++
++	de33_latch_flushes++;
++	if (words > de33_latch_words_max)
++		de33_latch_words_max = words;
++	if (ns > de33_latch_ns_max)
++		de33_latch_ns_max = ns;
++	if (cur_line < 0) {
++		de33_latch_flushes_sync++;
++	} else {
++		if (de33_latch_line_min < 0 || cur_line < de33_latch_line_min)
++			de33_latch_line_min = cur_line;
++		if (cur_line > de33_latch_line_max)
++			de33_latch_line_max = cur_line;
++		if ((unsigned int)cur_line >= mixer->line_active)
++			de33_latch_flushes_late++;
++	}
++	spin_unlock_irqrestore(&mixer->latch_lock, flags);
++
++	if (crtc)
++		drm_crtc_vblank_put(crtc);
++}
++
++/* End of an atomic flush: snapshot the frame and wait for the vblank. */
++static void sun50i_mixer_latch_commit(struct sun8i_mixer *mixer,
++				      struct drm_crtc *crtc)
++{
++	bool now = false, put = false;
++	unsigned long flags;
++
++	sun50i_shadow_commit(mixer->shadow, 0, SUN50I_SHADOW_ALL);
++	sun50i_planes_commit(mixer->planes_dev, mixer->engine.id);
++
++	spin_lock_irqsave(&mixer->latch_lock, flags);
++	de33_latch_commits++;
++	if (mixer->latch_pending)
++		de33_latch_coalesced++;
++	mixer->latch_pending = true;
++	mixer->latch_crtc = crtc;
++
++	/*
++	 * Keep the vblank interrupt on until the flush: a commit without a
++	 * page-flip event (legacy cursor update) does not enable it itself.
++	 * drm_crtc_vblank_get() fails while the CRTC is off (the planes of a
++	 * modeset are programmed before the CRTC is enabled, and after it is
++	 * disabled): nothing scans out then, write at once. That also drops
++	 * a reference left from a commit whose vblank never came.
++	 */
++	if (drm_crtc_vblank_get(crtc) == 0) {
++		if (mixer->latch_vblank_ref)
++			put = true;
++		else
++			mixer->latch_vblank_ref = true;
++	} else {
++		now = true;
++	}
++	spin_unlock_irqrestore(&mixer->latch_lock, flags);
++
++	if (put)
++		drm_crtc_vblank_put(crtc);
++	if (now)
++		sun50i_mixer_latch_flush(mixer, -1);
++}
++
++/* TCON vblank interrupt, hard IRQ context */
++static void sun50i_mixer_vblank_quirk(struct sunxi_engine *engine,
++				      unsigned int cur_line)
++{
++	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
++
++	if (READ_ONCE(mixer->latch_pending))
++		sun50i_mixer_latch_flush(mixer, cur_line);
++}
++
+ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+ 			       struct drm_crtc *crtc,
+ 			       struct drm_atomic_commit *state)
+@@ -389,6 +545,8 @@
+ 	if (mixer->cfg->de_type != SUN8I_MIXER_DE33)
+ 		regmap_write(engine->regs, SUN8I_MIXER_GLOBAL_DBUFF,
+ 			     SUN8I_MIXER_GLOBAL_DBUFF_ENABLE);
++	else if (mixer->shadow)
++		sun50i_mixer_latch_commit(mixer, crtc);
+ }
+ 
+ static struct drm_plane **sun8i_layers_init(struct drm_device *drm,
+@@ -481,6 +639,9 @@
+ 	else
+ 		regmap_write(mixer->engine.regs, SUN8I_MIXER_GLOBAL_SIZE, size);
+ 
++	if (mixer->shadow)
++		sun50i_mixer_latch_mode_set(mixer, mode);
++
+ 	regmap_write(engine->regs, SUN8I_MIXER_BLEND_OUTSIZE(bld_base), size);
+ 
+ 	if (interlaced)
+@@ -580,6 +741,7 @@
+ 	.mode_set		= sun8i_mixer_mode_set,
+ 	.apply_color_correction	= sun50i_mixer_apply_color_correction,
+ 	.disable_color_correction = sun50i_mixer_disable_color_correction,
++	.vblank_quirk		= sun50i_mixer_vblank_quirk,
+ };
+ 
+ static const struct regmap_config sun8i_mixer_regmap_config = {
+@@ -703,6 +865,7 @@
+ 	struct drm_device *drm = data;
+ 	struct sun4i_drv *drv = drm->dev_private;
+ 	struct sun8i_mixer *mixer;
++	struct resource *res;
+ 	void __iomem *regs;
+ 	int i, ret;
+ 
+@@ -769,15 +932,26 @@
+ 	else
+ 		mixer->engine.ops = &sun8i_engine_ops;
+ 
+-	regs = devm_platform_ioremap_resource(pdev, 0);
++	regs = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
+ 	if (IS_ERR(regs))
+ 		return PTR_ERR(regs);
+ 
+-	mixer->engine.regs = devm_regmap_init_mmio(dev, regs,
+-						   &sun8i_mixer_regmap_config);
+-	if (IS_ERR(mixer->engine.regs)) {
+-		dev_err(dev, "Couldn't create the mixer regmap\n");
+-		return PTR_ERR(mixer->engine.regs);
++	if (mixer->cfg->de_type == SUN8I_MIXER_DE33 && !mixer->cfg->uses_rcq) {
++		spin_lock_init(&mixer->latch_lock);
++		mixer->shadow = sun50i_shadow_create(dev, regs,
++						     resource_size(res), "display");
++		if (IS_ERR(mixer->shadow)) {
++			dev_err(dev, "Couldn't create the mixer register shadow\n");
++			return PTR_ERR(mixer->shadow);
++		}
++		mixer->engine.regs = sun50i_shadow_regmap(mixer->shadow);
++	} else {
++		mixer->engine.regs = devm_regmap_init_mmio(dev, regs,
++							   &sun8i_mixer_regmap_config);
++		if (IS_ERR(mixer->engine.regs)) {
++			dev_err(dev, "Couldn't create the mixer regmap\n");
++			return PTR_ERR(mixer->engine.regs);
++		}
+ 	}
+ 
+ 	if (mixer->cfg->de_type == SUN8I_MIXER_DE33) {
+diff -ruN a/drivers/gpu/drm/sun4i/sun8i_mixer.h b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+@@ -9,12 +9,15 @@
+ #include <linux/clk.h>
+ #include <linux/regmap.h>
+ #include <linux/reset.h>
++#include <linux/spinlock.h>
+ #include <drm/drm_blend.h>
+ #include <drm/drm_plane.h>
+ 
+ #include "sunxi_engine.h"
+ #include "sun55i_de.h"
+ 
++struct sun50i_shadow;
++
+ #define SUN8I_MIXER_SIZE(w, h)			(((h) - 1) << 16 | ((w) - 1))
+ #define SUN8I_MIXER_COORD(x, y)			((y) << 16 | (x))
+ 
+@@ -274,6 +277,19 @@
+ 
+ 	struct regmap			*top_regs;
+ 	struct device			*planes_dev;
++
++	/*
++	 * DE33 over plain MMIO (no RCQ): the registers are not double-buffered,
++	 * so they are staged in a shadow and written out from the vblank
++	 * interrupt (sun50i_shadow.h, sun50i_mixer_latch_*()).
++	 */
++	struct sun50i_shadow		*shadow;
++	struct drm_crtc			*latch_crtc;
++	spinlock_t			latch_lock;
++	bool				latch_pending;	/* snapshot waits for a vblank */
++	bool				latch_vblank_ref; /* holds a drm_crtc_vblank_get() */
++	unsigned int			line_active;	/* TCON line where active video starts */
++	unsigned int			line_total;
+ 	/* DE33 only: blender and layer CSCs produce BT.601 YCbCr */
+ 	bool				output_yuv;
+ 	struct sun4i_drv		*drv;
