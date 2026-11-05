@@ -28,8 +28,18 @@ the control types 0x02c0 to 0x02c3.
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
+v6: documentation only, no change to the controls or their layout. Shared
+    with a second backend (Rockchip rkvdec VDPU381), bit-exact on v5:
+    - ref_poc: always filled, may be ignored by hardware that keeps the
+      reference picture order counts itself;
+    - ALF coefficients as coded, drivers derive the centre tap (9.12.2);
+    - weighting quantization matrices in raster order, drivers convert
+      (no weighting quantization stream tested yet);
+    - 10-bit output not tied to one capture format;
+    - field coded sequences rejected by the current drivers.
+
  .../userspace-api/media/v4l/biblio.rst        |  10 +
- .../media/v4l/ext-ctrls-codec-stateless.rst   | 358 ++++++++++++++++++
+ .../media/v4l/ext-ctrls-codec-stateless.rst   | 371 ++++++++++++++++++
  .../media/v4l/pixfmt-compressed.rst           |  17 +
  .../media/v4l/videodev2.h.rst.exceptions      |   4 +
  .../media/v4l/vidioc-g-ext-ctrls.rst          |  16 +
@@ -38,9 +48,9 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  drivers/media/v4l2-core/v4l2-ctrls-defs.c     |  16 +
  drivers/media/v4l2-core/v4l2-ioctl.c          |   1 +
  include/media/v4l2-ctrls.h                    |   8 +
- include/uapi/linux/v4l2-controls.h            | 230 +++++++++++
+ include/uapi/linux/v4l2-controls.h            | 236 +++++++++++
  include/uapi/linux/videodev2.h                |   6 +
- 12 files changed, 869 insertions(+)
+ 12 files changed, 888 insertions(+)
 
 diff --git a/Documentation/userspace-api/media/v4l/biblio.rst b/Documentation/userspace-api/media/v4l/biblio.rst
 index 0510aee5b..1dcfc7d38 100644
@@ -67,7 +77,7 @@ diff --git a/Documentation/userspace-api/media/v4l/ext-ctrls-codec-stateless.rst
 index 7ce03eba5..a8fd59d9c 100644
 --- a/Documentation/userspace-api/media/v4l/ext-ctrls-codec-stateless.rst
 +++ b/Documentation/userspace-api/media/v4l/ext-ctrls-codec-stateless.rst
-@@ -5733,3 +5733,361 @@ frame-interlaced picture both elements are equal.
+@@ -5733,3 +5733,374 @@ frame-interlaced picture both elements are equal.
      * - __u8
        - ``reserved``
        - Applications and drivers must set this to zero.
@@ -115,7 +125,12 @@ index 7ce03eba5..a8fd59d9c 100644
 +      - chroma_format, 1 for 4:2:0.
 +    * - __u8
 +      - ``sample_precision``
-+      - sample_precision: 1 for 8-bit and 2 for 10-bit samples.
++      - sample_precision: 1 for 8-bit and 2 for 10-bit samples. The capture
++	formats a driver offers depend on it, so the application sets this
++	control before it enumerates or sets the capture format. A 10-bit
++	stream is not tied to one capture format: drivers offer what their
++	hardware writes, for example a packed 10-bit format, P010 or a
++	compressed format.
 +    * - __u8
 +      - ``encoding_precision``
 +      - encoding_precision: 1 for 8-bit and 2 for 10-bit coding. Set to 1
@@ -147,7 +162,8 @@ index 7ce03eba5..a8fd59d9c 100644
 +      - progressive_sequence.
 +    * - ``V4L2_AVS2_SEQUENCE_FLAG_FIELD_CODED_SEQUENCE``
 +      - 0x00000002
-+      - field_coded_sequence.
++      - field_coded_sequence. Field coded sequences are not supported by the
++	current drivers, which reject this flag.
 +    * - ``V4L2_AVS2_SEQUENCE_FLAG_LOW_DELAY``
 +      - 0x00000004
 +      - low_delay.
@@ -296,8 +312,10 @@ index 7ce03eba5..a8fd59d9c 100644
 +    * - __s32
 +      - ``ref_poc[7]``
 +      - Picture order counts of the reference pictures of the reference
-+	picture, in the order of its own ``ref_pics``. The decoder needs them for
-+	the temporal motion vector prediction.
++	picture, in the order of its own ``ref_pics``. Decoders use them for the
++	temporal motion vector prediction. Applications always fill them;
++	drivers for hardware that keeps the reference picture order counts
++	itself (for example with the co-located motion vectors) may ignore them.
 +    * - __u8
 +      - ``picture_type``
 +      - ``picture_type`` of the reference picture when it was decoded.
@@ -386,10 +404,12 @@ index 7ce03eba5..a8fd59d9c 100644
 +
 +    * - __u8
 +      - ``matrix_4x4[16]``
-+      - 4x4 matrix in raster scan order.
++      - 4x4 matrix in raster scan order: entry ``i * 4 + j`` is row ``i``,
++	column ``j``. Drivers convert it to the order their hardware uses.
 +    * - __u8
 +      - ``matrix_8x8[64]``
-+      - 8x8 matrix in raster scan order.
++      - 8x8 matrix in raster scan order: entry ``i * 8 + j`` is row ``i``,
++	column ``j``.
 +
 +``V4L2_CID_STATELESS_AVS2_ALF (struct)``
 +    Specifies the adaptive loop filter parameters (as extracted from the
@@ -410,10 +430,13 @@ index 7ce03eba5..a8fd59d9c 100644
 +
 +    * - __s16
 +      - ``luma_coeff[16][9]``
-+      - alf_coeff_luma of each luma filter, as coded.
++      - alf_coeff_luma of each luma filter, as coded. Drivers derive the
++	centre coefficient (section 9.12.2 of :ref:`avs2`) and any other form
++	the hardware needs.
 +    * - __s16
 +      - ``chroma_coeff[2][9]``
-+      - alf_coeff_chroma of the Cb (0) and Cr (1) filters, as coded.
++      - alf_coeff_chroma of the Cb (0) and Cr (1) filters, as coded, like
++	``luma_coeff``.
 +    * - __u8
 +      - ``luma_region_filter[16]``
 +      - Index of the luma filter used by each of the 16 regions, derived from
@@ -835,7 +858,7 @@ diff --git a/include/uapi/linux/v4l2-controls.h b/include/uapi/linux/v4l2-contro
 index 032076c3f..f6fb23036 100644
 --- a/include/uapi/linux/v4l2-controls.h
 +++ b/include/uapi/linux/v4l2-controls.h
-@@ -4294,6 +4294,236 @@ struct v4l2_ctrl_h263_slice_params {
+@@ -4294,6 +4294,242 @@ struct v4l2_ctrl_h263_slice_params {
  	__u8	reserved;
  };
  
@@ -884,6 +907,8 @@ index 032076c3f..f6fb23036 100644
 + * @level_id: level_id.
 + * @chroma_format: chroma_format, 1 for 4:2:0.
 + * @sample_precision: sample_precision: 1 for 8-bit, 2 for 10-bit samples.
++ *	The capture formats offered depend on it; 10-bit output is not tied
++ *	to one format (packed 10-bit, P010 or compressed, per driver).
 + * @encoding_precision: encoding_precision: 1 for 8-bit, 2 for 10-bit
 + *	coding. Set to 1 when the profile has no encoding_precision.
 + * @lcu_size: lcu_size, the base 2 logarithm of the largest coding unit
@@ -938,7 +963,9 @@ index 032076c3f..f6fb23036 100644
 + *	@poc of struct v4l2_ctrl_avs2_picture when it was decoded.
 + * @ref_poc: picture order counts of the reference pictures of the
 + *	reference picture itself, in the order of its own reference list
-+ *	(ref_pics[] of the picture control it was decoded with).
++ *	(ref_pics[] of the picture control it was decoded with). Always
++ *	filled by applications; drivers for hardware that keeps them itself
++ *	may ignore them.
 + * @picture_type: picture type of the reference picture when it was decoded,
 + *	see V4L2_AVS2_PICTURE_TYPE_{}.
 + * @num_ref_pics: number of valid entries in @ref_poc.
@@ -1029,8 +1056,9 @@ index 032076c3f..f6fb23036 100644
 + * quantization parameters of the picture header. Every entry is 64 when
 + * weighting quantization is disabled for the picture.
 + *
-+ * @matrix_4x4: 4x4 matrix in raster scan order.
-+ * @matrix_8x8: 8x8 matrix in raster scan order.
++ * @matrix_4x4: 4x4 matrix in raster scan order (entry i * 4 + j is row i,
++ *	column j); drivers convert it to the hardware order.
++ * @matrix_8x8: 8x8 matrix in raster scan order (entry i * 8 + j).
 + */
 +struct v4l2_ctrl_avs2_weight_quant {
 +	__u8	matrix_4x4[16];
@@ -1051,7 +1079,8 @@ index 032076c3f..f6fb23036 100644
 + * The alf_parameter_set() of the picture header, GB/T 33475.2 section
 + * 7.1.8. Only used when the sequence enables the adaptive loop filter.
 + *
-+ * @luma_coeff: alf_coeff_luma[i][j] of the luma filters, as coded.
++ * @luma_coeff: alf_coeff_luma[i][j] of the luma filters, as coded; drivers
++ *	derive the centre coefficient (GB/T 33475.2 section 9.12.2).
 + * @chroma_coeff: alf_coeff_chroma[0][j] (Cb) and alf_coeff_chroma[1][j]
 + *	(Cr), as coded.
 + * @luma_region_filter: luma filter index used by each of the 16 regions,
