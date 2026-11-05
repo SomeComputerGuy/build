@@ -17,8 +17,8 @@ can be used:
     input frame (vendor "60 Hz" mode);
   1 Motion Adaptive, Frame Rate: one output per input frame, from IN_F1
     and IN_F2 (vendor "30 Hz" mode), written to DIT output 1;
-  2 Bob, Frame Rate: spatial interpolation of one field, no motion
-    detection;
+  2 Bob, Frame Rate (default): spatial interpolation of one field, no
+    motion detection;
   3 Weave: both fields of the frame put back together unchanged;
   4 Noise Reduction Only: TNR on progressive input, output from the
     TNR write channel (only offered when FUNC_VSN reports TNR);
@@ -26,14 +26,29 @@ can be used:
     frame, with the field-rate routing of item 0 and all inputs on the
     newest frame (as on the first job of item 0).
   Frame rate outputs one CAPTURE buffer per OUTPUT buffer, field rate
-  two, the second timestamped half a frame period after the first.
+  two, the second timestamped half a frame period after the first: the
+  period comes from the previous OUTPUT buffer, or for the first frame
+  from the next one if it is already queued; otherwise both carry the
+  OUTPUT timestamp.
   The number of CAPTURE buffers per job must not change while either
   queue streams, so a change of rate, or to or from item 4, returns
   -EBUSY then. A change of method at the same rate is accepted; the
   next job starts the new method from the state of a new stream (no
   source history, motion flags or TNR references of the old one). The
   motion-adaptive modes keep one (frame rate, TNR-only) or two (field
-  rate) source frames; bob and weave none.
+  rate) source frames; bob and weave none. Held sources are returned
+  at STREAMOFF (and close); there is no drain command.
+
+  The default is "Bob, Frame Rate", as in the Rockchip IEP driver. The
+  mem2mem streaming tests of v4l2-compliance (1.32.0,
+  v4l2-test-buffers.cpp) handle only one CAPTURE buffer per OUTPUT
+  buffer with no source held back: captureBufs() does a blocking DQBUF
+  on the OUTPUT queue and then exactly one CAPTURE DQBUF per loop, and
+  requires every CAPTURE timestamp to equal that of a queued OUTPUT
+  buffer; testRequests() expects every request complete, while the
+  request of a held source completes only when the source is released.
+  The motion-adaptive and field-rate items therefore cannot be the
+  default of a compliance run; they are opt-in.
 
 - Temporal noise reduction (V4L2_CID_SUNXI_DI300_TNR_MODE: off, fixed,
   adaptive; TNR_STRENGTH for the fixed strength, vendor default 0x3a;
@@ -81,15 +96,15 @@ can be used:
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- .../sunxi/sun50i-di300/sun50i-di300.c         | 907 +++++++++++++++---
+ .../sunxi/sun50i-di300/sun50i-di300.c         | 945 +++++++++++++++---
  .../sunxi/sun50i-di300/sun50i-di300.h         | 105 ++
  include/uapi/linux/sunxi-di300.h              |  62 ++
  include/uapi/linux/v4l2-controls.h            |   7 +
- 4 files changed, 928 insertions(+), 153 deletions(-)
+ 4 files changed, 967 insertions(+), 152 deletions(-)
  create mode 100644 include/uapi/linux/sunxi-di300.h
 
 diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
-index 4dc81dfbf..98e7f4e11 100644
+index 4dc81dfbf..61ea38e84 100644
 --- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
 +++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
 @@ -21,12 +21,14 @@
@@ -107,7 +122,7 @@ index 4dc81dfbf..98e7f4e11 100644
  
  #include <media/v4l2-device.h>
  #include <media/v4l2-ioctl.h>
-@@ -191,21 +193,166 @@ static void deinterlace_write_out_addr(struct deinterlace_dev *dev,
+@@ -191,21 +193,207 @@ static void deinterlace_write_out_addr(struct deinterlace_dev *dev,
  	deinterlace_write(dev, hreg, 0);
  }
  
@@ -240,6 +255,47 @@ index 4dc81dfbf..98e7f4e11 100644
 +	       DEINTERLACE_TNR_STRENGTH_V(s);
 +}
 +
++/*
++ * In the field-rate modes both CAPTURE buffers of a job come from one
++ * OUTPUT buffer. The first carries the OUTPUT timestamp, the second one is
++ * placed half a frame period later. The period is taken from real
++ * timestamps only:
++ *  - the previous OUTPUT buffer of this stream, once there is one;
++ *  - for the first frame after STREAMON, the next OUTPUT buffer, if
++ *    userspace has queued it by the time the job starts.
++ * If neither is available, or the timestamps do not increase, the offset is
++ * 0 and both CAPTURE buffers carry the OUTPUT timestamp. The period is not
++ * guessed, and VIDIOC_S_PARM cannot supply it because mem2mem devices other
++ * than encoders do not implement it. Userspace that wants distinct
++ * timestamps from the first frame on queues two OUTPUT buffers before the
++ * later of the two STREAMON calls.
++ *
++ * @src is still at the head of the OUTPUT ready queue.
++ */
++static u64 deinterlace_second_field_offset(struct deinterlace_ctx *ctx,
++					   struct vb2_v4l2_buffer *src)
++{
++	struct v4l2_m2m_queue_ctx *q_ctx = &ctx->fh.m2m_ctx->out_q_ctx;
++	u64 ts = src->vb2_buf.timestamp;
++	struct v4l2_m2m_buffer *b;
++	unsigned long flags;
++	u64 next = 0;
++
++	if (ctx->prev_ts_valid)
++		return ts > ctx->prev_ts ? (ts - ctx->prev_ts) / 2 : 0;
++
++	spin_lock_irqsave(&q_ctx->rdy_spinlock, flags);
++	list_for_each_entry(b, &q_ctx->rdy_queue, list) {
++		if (&b->vb != src) {
++			next = b->vb.vb2_buf.timestamp;
++			break;
++		}
++	}
++	spin_unlock_irqrestore(&q_ctx->rdy_spinlock, flags);
++
++	return next > ts ? (next - ts) / 2 : 0;
++}
++
  static void deinterlace_device_run(void *priv)
  {
  	struct deinterlace_ctx *ctx = priv;
@@ -280,7 +336,7 @@ index 4dc81dfbf..98e7f4e11 100644
  
  	/*
  	 * Apply this job's field-weave decision, if userspace attached a
-@@ -222,19 +369,16 @@ static void deinterlace_device_run(void *priv)
+@@ -222,19 +410,16 @@ static void deinterlace_device_run(void *priv)
  	}
  
  	/*
@@ -304,7 +360,7 @@ index 4dc81dfbf..98e7f4e11 100644
  		} else if (!dst1) {
  			dst1 = &b->vb;
  			break;
-@@ -243,96 +387,214 @@ static void deinterlace_device_run(void *priv)
+@@ -243,96 +428,208 @@ static void deinterlace_device_run(void *priv)
  	ctx->dst0 = dst0;
  	ctx->dst1 = dst1;
  
@@ -317,22 +373,15 @@ index 4dc81dfbf..98e7f4e11 100644
 -	 * keeps monotonic, evenly spaced timestamps.
 -	 */
 -	if (ctx->prev[0] && src->vb2_buf.timestamp > ctx->prev[0]->vb2_buf.timestamp)
--		dst1->vb2_buf.timestamp +=
--			(src->vb2_buf.timestamp -
--			 ctx->prev[0]->vb2_buf.timestamp) / 2;
 +	dst0->field = V4L2_FIELD_NONE;
 +	if (dst1) {
 +		v4l2_m2m_buf_copy_metadata(src, dst1);
 +		dst1->field = V4L2_FIELD_NONE;
-+		/*
-+		 * The second output is the second field of the same frame:
-+		 * put it half a frame interval after the first one, so
-+		 * field-rate output keeps monotonic, evenly spaced
-+		 * timestamps.
-+		 */
-+		if (ctx->prev_ts_valid && src->vb2_buf.timestamp > ctx->prev_ts)
-+			dst1->vb2_buf.timestamp +=
-+				(src->vb2_buf.timestamp - ctx->prev_ts) / 2;
++		/* the second field of the frame, half a period later */
+ 		dst1->vb2_buf.timestamp +=
+-			(src->vb2_buf.timestamp -
+-			 ctx->prev[0]->vb2_buf.timestamp) / 2;
++			deinterlace_second_field_offset(ctx, src);
 +	}
 +	ctx->prev_ts = src->vb2_buf.timestamp;
 +	ctx->prev_ts_valid = true;
@@ -438,16 +487,16 @@ index 4dc81dfbf..98e7f4e11 100644
 -				  DEINTERLACE_FIELD_ORDER_BFF);
 -	else
 -		deinterlace_write(dev, DEINTERLACE_FIELD_ORDER, 0);
--
++	deinterlace_write(dev, DEINTERLACE_FIELD_ORDER,
++			  ctx->first_field ? DEINTERLACE_FIELD_ORDER_BFF : 0);
+ 
 -	deinterlace_get_planes(&ctx->src_fmt, &in_pl);
 -	deinterlace_get_planes(&ctx->dst_fmt, &out_pl);
 -
 -	/* input pitches are field pitches: two lines of the frame */
 -	for (i = 0; i < 3; i++) {
 -		unsigned int in_pitch = in_pl.pitch[i] * 2;
-+	deinterlace_write(dev, DEINTERLACE_FIELD_ORDER,
-+			  ctx->first_field ? DEINTERLACE_FIELD_ORDER_BFF : 0);
- 
+-
 -		deinterlace_write(dev, DEINTERLACE_IN_F01_PITCH(i),
 -				  DEINTERLACE_IN_F01_PITCH_F0(in_pitch) |
 -				  DEINTERLACE_IN_F01_PITCH_F1(in_pitch));
@@ -583,7 +632,7 @@ index 4dc81dfbf..98e7f4e11 100644
  
  	/*
  	 * Motion flags: two bits per pixel, read from the previous run and
-@@ -344,20 +606,23 @@ static void deinterlace_device_run(void *priv)
+@@ -344,20 +641,23 @@ static void deinterlace_device_run(void *priv)
  	deinterlace_write(dev, DEINTERLACE_OUT_FLAG_ADDR,
  			  ctx->flag_dma[!ctx->flag_idx]);
  	deinterlace_write(dev, DEINTERLACE_FLAG_HADDR, 0);
@@ -612,7 +661,7 @@ index 4dc81dfbf..98e7f4e11 100644
  
  	if (ctx->fmd_active) {
  		reg = (ctx->src_fmt.width - 1) << 16;
-@@ -368,56 +633,98 @@ static void deinterlace_device_run(void *priv)
+@@ -368,56 +668,98 @@ static void deinterlace_device_run(void *priv)
  		/*
  		 * Row thresholds scale with frame area relative to the
  		 * vendor's 720x480 reference, verbatim from
@@ -739,7 +788,7 @@ index 4dc81dfbf..98e7f4e11 100644
  
  	deinterlace_set_bits(dev, DEINTERLACE_INT_CTL,
  			     DEINTERLACE_INT_CTL_FINISH_EN);
-@@ -429,7 +736,8 @@ static int deinterlace_job_ready(void *priv)
+@@ -429,7 +771,8 @@ static int deinterlace_job_ready(void *priv)
  	struct deinterlace_ctx *ctx = priv;
  
  	return v4l2_m2m_num_src_bufs_ready(ctx->fh.m2m_ctx) >= 1 &&
@@ -749,7 +798,7 @@ index 4dc81dfbf..98e7f4e11 100644
  }
  
  static void deinterlace_job_abort(void *priv)
-@@ -439,13 +747,44 @@ static void deinterlace_job_abort(void *priv)
+@@ -439,13 +782,44 @@ static void deinterlace_job_abort(void *priv)
  	ctx->aborting = 1;
  }
  
@@ -796,7 +845,7 @@ index 4dc81dfbf..98e7f4e11 100644
  
  	ctx = v4l2_m2m_get_curr_priv(dev->m2m_dev);
  	if (!ctx) {
-@@ -485,18 +824,42 @@ static irqreturn_t deinterlace_irq(int irq, void *data)
+@@ -485,18 +859,42 @@ static irqreturn_t deinterlace_irq(int irq, void *data)
  		dev->fmd_stats[9] = deinterlace_read(dev, DEINTERLACE_FMD_FIELD_HIST1);
  	}
  
@@ -814,7 +863,7 @@ index 4dc81dfbf..98e7f4e11 100644
 +			ctx->tnr_hist[0] = ctx->tnr_cur;
 +		}
 +	}
- 
++
 +	v4l2_m2m_dst_buf_remove_by_buf(ctx->fh.m2m_ctx, ctx->dst0);
 +	ctx->dst0->sequence = ctx->cap_seq++;
 +	v4l2_m2m_buf_done(ctx->dst0, state);
@@ -823,7 +872,7 @@ index 4dc81dfbf..98e7f4e11 100644
 +		ctx->dst1->sequence = ctx->cap_seq++;
 +		v4l2_m2m_buf_done(ctx->dst1, state);
 +	}
-+
+ 
 +	/* keep as many source frames as the mode reads back */
  	src = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
 +	src->sequence = ctx->out_seq++;
@@ -847,7 +896,7 @@ index 4dc81dfbf..98e7f4e11 100644
  
  	v4l2_m2m_job_finish(ctx->dev->m2m_dev, ctx->fh.m2m_ctx);
  
-@@ -508,6 +871,7 @@ static void deinterlace_init(struct deinterlace_dev *dev)
+@@ -508,6 +906,7 @@ static void deinterlace_init(struct deinterlace_dev *dev)
  	u32 vsn = deinterlace_read(dev, DEINTERLACE_FUNC_VSN);
  
  	dev->has_fmd = DEINTERLACE_FUNC_VSN_FMD_EXIST(vsn) != 0;
@@ -855,7 +904,7 @@ index 4dc81dfbf..98e7f4e11 100644
  
  	deinterlace_write(dev, DEINTERLACE_MD_PARA, DEINTERLACE_MD_PARA_DEFAULT);
  
-@@ -542,6 +906,28 @@ static void deinterlace_init(struct deinterlace_dev *dev)
+@@ -542,6 +941,28 @@ static void deinterlace_init(struct deinterlace_dev *dev)
  				  DEINTERLACE_FMD_BLK_TH_DEFAULT);
  		deinterlace_write(dev, DEINTERLACE_FMD_GLB, 0);
  	}
@@ -884,7 +933,7 @@ index 4dc81dfbf..98e7f4e11 100644
  }
  
  static inline struct deinterlace_ctx *deinterlace_file2ctx(struct file *file)
-@@ -671,7 +1057,19 @@ static int deinterlace_try_fmt_vid_cap(struct file *file, void *priv,
+@@ -671,7 +1092,19 @@ static int deinterlace_try_fmt_vid_cap(struct file *file, void *priv,
  	if (!deinterlace_check_format(ctx->src_fmt.pixelformat))
  		return -EINVAL;
  
@@ -905,7 +954,7 @@ index 4dc81dfbf..98e7f4e11 100644
  	f->fmt.pix.field = V4L2_FIELD_NONE;
  	f->fmt.pix.width = ctx->src_fmt.width;
  	f->fmt.pix.height = ctx->src_fmt.height;
-@@ -687,9 +1085,11 @@ static int deinterlace_try_fmt_vid_out(struct file *file, void *priv,
+@@ -687,9 +1120,11 @@ static int deinterlace_try_fmt_vid_out(struct file *file, void *priv,
  	if (!deinterlace_check_format(f->fmt.pix.pixelformat))
  		f->fmt.pix.pixelformat = deinterlace_formats[0];
  
@@ -918,7 +967,7 @@ index 4dc81dfbf..98e7f4e11 100644
  		f->fmt.pix.field = V4L2_FIELD_INTERLACED;
  
  	deinterlace_prepare_format(&f->fmt.pix);
-@@ -818,7 +1218,9 @@ static int deinterlace_buf_prepare(struct vb2_buffer *vb)
+@@ -818,7 +1253,9 @@ static int deinterlace_buf_prepare(struct vb2_buffer *vb)
  	if (vb2_plane_size(vb, 0) < pix_fmt->sizeimage)
  		return -EINVAL;
  
@@ -929,7 +978,7 @@ index 4dc81dfbf..98e7f4e11 100644
  
  	return 0;
  }
-@@ -873,13 +1275,75 @@ static void deinterlace_queue_cleanup(struct vb2_queue *vq, u32 state)
+@@ -873,13 +1310,75 @@ static void deinterlace_queue_cleanup(struct vb2_queue *vq, u32 state)
  	}
  }
  
@@ -1005,7 +1054,7 @@ index 4dc81dfbf..98e7f4e11 100644
  		ret = pm_runtime_resume_and_get(dev);
  		if (ret < 0) {
  			dev_err(dev, "Failed to enable module\n");
-@@ -893,6 +1357,22 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
+@@ -893,6 +1392,22 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
  		ctx->prev[0] = NULL;
  		ctx->prev[1] = NULL;
  		ctx->aborting = 0;
@@ -1028,7 +1077,7 @@ index 4dc81dfbf..98e7f4e11 100644
  
  		/* two bits per pixel, lines padded to 32 bytes (vendor) */
  		ctx->flag_pitch = ALIGN(ctx->src_fmt.width * 2, 256) / 8;
-@@ -916,6 +1396,9 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
+@@ -916,6 +1431,9 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
  
  			goto err_no_mem2;
  		}
@@ -1038,7 +1087,7 @@ index 4dc81dfbf..98e7f4e11 100644
  	}
  
  	return 0;
-@@ -924,6 +1407,8 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
+@@ -924,6 +1442,8 @@ static int deinterlace_start_streaming(struct vb2_queue *vq, unsigned int count)
  	dma_free_coherent(dev, ctx->flag_size, ctx->flag_buf[0],
  			  ctx->flag_dma[0]);
  err_no_mem1:
@@ -1047,7 +1096,7 @@ index 4dc81dfbf..98e7f4e11 100644
  	pm_runtime_put(dev);
  err_runtime_get:
  	deinterlace_queue_cleanup(vq, VB2_BUF_STATE_QUEUED);
-@@ -942,6 +1427,8 @@ static void deinterlace_stop_streaming(struct vb2_queue *vq)
+@@ -942,6 +1462,8 @@ static void deinterlace_stop_streaming(struct vb2_queue *vq)
  				  ctx->flag_dma[0]);
  		dma_free_coherent(dev, ctx->flag_size, ctx->flag_buf[1],
  				  ctx->flag_dma[1]);
@@ -1056,7 +1105,7 @@ index 4dc81dfbf..98e7f4e11 100644
  
  		pm_runtime_put(dev);
  	}
-@@ -998,22 +1485,58 @@ static int deinterlace_queue_init(void *priv, struct vb2_queue *src_vq,
+@@ -998,22 +1520,58 @@ static int deinterlace_queue_init(void *priv, struct vb2_queue *src_vq,
  	return 0;
  }
  
@@ -1127,7 +1176,7 @@ index 4dc81dfbf..98e7f4e11 100644
  
  static int deinterlace_g_volatile_ctrl(struct v4l2_ctrl *ctrl)
  {
-@@ -1041,6 +1564,31 @@ static int deinterlace_s_ctrl(struct v4l2_ctrl *ctrl)
+@@ -1041,6 +1599,31 @@ static int deinterlace_s_ctrl(struct v4l2_ctrl *ctrl)
  	case V4L2_CID_SUNXI_DI300_FMD_ENABLE:
  		ctx->fmd_enabled = ctrl->val;
  		break;
@@ -1159,7 +1208,7 @@ index 4dc81dfbf..98e7f4e11 100644
  	default:
  		return -EINVAL;
  	}
-@@ -1066,6 +1614,37 @@ static const struct v4l2_ctrl_config deinterlace_fmd_stats_ctrl = {
+@@ -1066,6 +1649,37 @@ static const struct v4l2_ctrl_config deinterlace_fmd_stats_ctrl = {
  	.dims	= { DEINTERLACE_FMD_STATS_COUNT },
  };
  
@@ -1197,7 +1246,7 @@ index 4dc81dfbf..98e7f4e11 100644
  static const struct v4l2_ctrl_config deinterlace_fmd_enable_ctrl = {
  	.ops	= &deinterlace_ctrl_ops,
  	.id	= V4L2_CID_SUNXI_DI300_FMD_ENABLE,
-@@ -1078,23 +1657,25 @@ static const struct v4l2_ctrl_config deinterlace_fmd_enable_ctrl = {
+@@ -1078,23 +1692,25 @@ static const struct v4l2_ctrl_config deinterlace_fmd_enable_ctrl = {
  };
  
  /*
@@ -1232,21 +1281,26 @@ index 4dc81dfbf..98e7f4e11 100644
  	.step	= 1,
  	.def	= DEINTERLACE_FMD_WEAVE_DISABLED,
  	.dims	= { DEINTERLACE_FMD_WEAVE_COUNT },
-@@ -1130,21 +1711,41 @@ static int deinterlace_open(struct file *file)
+@@ -1130,21 +1746,46 @@ static int deinterlace_open(struct file *file)
  	v4l2_fh_init(&ctx->fh, video_devdata(file));
  	ctx->dev = dev;
  
-+	ctx->ctrl_mode = DEINTERLACE_MODE_MOTION_FIELD;
++	ctx->ctrl_mode = DEINTERLACE_MODE_BOB_FRAME;
 +	ctx->tnr_strength = DEINTERLACE_TNR_STRENGTH_DEF;
 +	ctx->tnr_gain_min = deinterlace_tnr_gain_bounds[0][0];
 +	ctx->tnr_gain_max = deinterlace_tnr_gain_bounds[0][1];
 +
 +	v4l2_ctrl_handler_init(&ctx->hdl, 7);
++	/*
++	 * Default "Bob, Frame Rate", as in the Rockchip IEP driver: one
++	 * CAPTURE buffer per OUTPUT buffer, no source held back. The
++	 * motion-adaptive and field-rate items are opt-in.
++	 */
 +	v4l2_ctrl_new_std_menu_items(&ctx->hdl, &deinterlace_ctrl_ops,
 +				     V4L2_CID_DEINTERLACING_MODE,
 +				     DEINTERLACE_MODE_BOB_FIELD,
 +				     dev->has_tnr ? 0 : BIT(DEINTERLACE_MODE_TNR),
-+				     DEINTERLACE_MODE_MOTION_FIELD,
++				     DEINTERLACE_MODE_BOB_FRAME,
 +				     deinterlace_mode_menu);
 +	if (dev->has_tnr) {
 +		ctx->tnr_ctrl = v4l2_ctrl_new_custom(&ctx->hdl,
