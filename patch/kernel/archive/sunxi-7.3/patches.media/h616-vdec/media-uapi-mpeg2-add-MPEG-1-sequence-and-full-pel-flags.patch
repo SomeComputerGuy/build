@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 03 Nov 2026 04:07:08 +0000
-Subject: media: uapi: mpeg2: add MPEG-1 sequence and full pel flags
+Subject: media: uapi: mpeg2: add MPEG-1 sequence and full pel flags and the MPEG-1 parsed slice format
 
 MPEG-1 (ISO/IEC 11172-2) is the base of MPEG-2 and stateless MPEG-2
 decoders can decode it, but the uAPI could not say that a bitstream is
@@ -19,9 +19,46 @@ and never had a way to send D-pictures, which only MPEG-1 streams have,
 so nothing changes for them. Drivers without an MPEG-1 mode have to
 reject the flag.
 
+The flags alone cannot tell applications whether a decoder decodes
+MPEG-1: the control framework does not check the flags of compound
+controls, and the existing MPEG-2 drivers silently decode a sequence
+with V4L2_MPEG2_SEQ_FLAG_MPEG1 or the full pel flags as MPEG-2, which
+gives wrong pictures instead of an error that would let the application
+fall back to software decoding.
+
+Add V4L2_PIX_FMT_MPEG1_SLICE ('MG1S') for MPEG-1 parsed slice data, so
+that MPEG-1 support is discovered with VIDIOC_ENUM_FMT like every other
+coded format, and so that kernels and drivers without it fail at
+VIDIOC_S_FMT. The format reuses the MPEG-2 sequence, picture and
+quantisation controls unchanged; V4L2_MPEG2_SEQ_FLAG_MPEG1 is set with
+the new format and only with it, so that the controls keep describing
+the bitstream on their own.
+
+MPEG-1 D-pictures (DC coefficients only) are rare and not every MPEG-1
+capable decoder decodes them: the Rockchip VDPU2 MPEG-1 mode has no
+DC-only decoding and Hantro rejects the D picture coding type. Say so
+in the uAPI, and that the rejection also applies to
+VIDIOC_TRY_EXT_CTRLS, so that applications can find out whether a
+decoder supports D-pictures before they hand one to it, and decode or
+drop them otherwise.
+
+The format, flags and documentation are shared with the Rockchip
+(Hantro VPU2) side of this uAPI: orangepi5 k15-mpeg1 commits
+21d0963e021e, f22ca213f036 and f89a5beffc2e.
+
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
+--- a/include/uapi/linux/videodev2.h
++++ b/include/uapi/linux/videodev2.h
+@@ -765,6 +765,7 @@
+ #define V4L2_PIX_FMT_MPEG1    v4l2_fourcc('M', 'P', 'G', '1') /* MPEG-1 ES     */
+ #define V4L2_PIX_FMT_MPEG2    v4l2_fourcc('M', 'P', 'G', '2') /* MPEG-2 ES     */
+ #define V4L2_PIX_FMT_MPEG2_SLICE v4l2_fourcc('M', 'G', '2', 'S') /* MPEG-2 parsed slice data */
++#define V4L2_PIX_FMT_MPEG1_SLICE v4l2_fourcc('M', 'G', '1', 'S') /* MPEG-1 parsed slice data */
+ #define V4L2_PIX_FMT_MPEG4    v4l2_fourcc('M', 'P', 'G', '4') /* MPEG-4 part 2 ES */
+ #define V4L2_PIX_FMT_XVID     v4l2_fourcc('X', 'V', 'I', 'D') /* Xvid           */
+ #define V4L2_PIX_FMT_VC1_ANNEX_G v4l2_fourcc('V', 'C', '1', 'G') /* SMPTE 421M Annex G compliant stream */
 --- a/include/uapi/linux/v4l2-controls.h
 +++ b/include/uapi/linux/v4l2-controls.h
 @@ -2005,6 +2005,7 @@
@@ -41,9 +78,41 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  
  #define V4L2_CID_STATELESS_MPEG2_PICTURE (V4L2_CID_CODEC_STATELESS_BASE+221)
  /**
+--- a/Documentation/userspace-api/media/v4l/pixfmt-compressed.rst
++++ b/Documentation/userspace-api/media/v4l/pixfmt-compressed.rst
+@@ -129,6 +129,29 @@
+ 	this pixel format. The output buffer must contain the appropriate number
+ 	of macroblocks to decode a full corresponding frame to the matching
+ 	capture buffer.
++    * .. _V4L2-PIX-FMT-MPEG1-SLICE:
++
++      - ``V4L2_PIX_FMT_MPEG1_SLICE``
++      - 'MG1S'
++      - MPEG-1 parsed slice data, as extracted from the MPEG-1
++	(ISO/IEC 11172-2) bitstream. This format is adapted for stateless
++	video decoders that implement a MPEG-1 pipeline with the
++	:ref:`stateless_decoder`. It uses the controls of
++	``V4L2_PIX_FMT_MPEG2_SLICE``: metadata associated with the frame to
++	decode is required to be passed through the
++	``V4L2_CID_STATELESS_MPEG2_SEQUENCE`` and
++	``V4L2_CID_STATELESS_MPEG2_PICTURE`` controls, with
++	``V4L2_MPEG2_SEQ_FLAG_MPEG1`` set in the sequence control and the
++	fields that come from the MPEG-2 extensions filled as described for
++	that flag. Quantisation matrices can optionally be specified through
++	the ``V4L2_CID_STATELESS_MPEG2_QUANTISATION`` control.
++	See the :ref:`associated Codec Control IDs <v4l2-codec-stateless-mpeg2>`.
++	Exactly one output and one capture buffer must be provided for use with
++	this pixel format. The output buffer must contain the appropriate number
++	of macroblocks to decode a full corresponding frame to the matching
++	capture buffer. Decoders that enumerate this format decode MPEG-1
++	sequences; decoders that only enumerate ``V4L2_PIX_FMT_MPEG2_SLICE``
++	do not.
+     * .. _V4L2-PIX-FMT-MPEG4:
+ 
+       - ``V4L2_PIX_FMT_MPEG4``
 --- a/Documentation/userspace-api/media/v4l/ext-ctrls-codec-stateless.rst
 +++ b/Documentation/userspace-api/media/v4l/ext-ctrls-codec-stateless.rst
-@@ -1317,6 +1317,17 @@
+@@ -1317,6 +1317,19 @@
        - 0x01
        - Indication that all the frames for the sequence are progressive instead
  	of interlaced.
@@ -51,9 +120,11 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +      - 0x02
 +      - The sequence is an ISO/IEC 11172-2 (MPEG-1) sequence: the inverse
 +	quantisation uses the MPEG-1 mismatch control, motion vectors may be
-+	full pel and pictures may be D-pictures. MPEG-1 has no sequence or
-+	picture extensions: applications set the fields as ISO/IEC 13818-2
-+	defines them for MPEG-1 bitstreams (chroma_format 1,
++	full pel and pictures may be D-pictures. Applications set this flag
++	if and only if the coded format is ``V4L2_PIX_FMT_MPEG1_SLICE``;
++	drivers reject it with ``V4L2_PIX_FMT_MPEG2_SLICE``. MPEG-1 has no
++	sequence or picture extensions: applications set the fields as
++	ISO/IEC 13818-2 defines them for MPEG-1 bitstreams (chroma_format 1,
 +	V4L2_MPEG2_SEQ_FLAG_PROGRESSIVE, frame pictures with
 +	V4L2_MPEG2_PIC_FLAG_FRAME_PRED_DCT and V4L2_MPEG2_PIC_FLAG_PROGRESSIVE,
 +	intra_dc_precision 0, both components of ``f_code[0]`` set to
@@ -61,7 +132,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  
  .. raw:: latex
  
-@@ -1366,8 +1377,9 @@
+@@ -1366,8 +1379,12 @@
      * - __u8
        - ``picture_coding_type``
        - Picture coding type for the frame covered by the current slice
@@ -69,11 +140,14 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 -	V4L2_MPEG2_PIC_CODING_TYPE_B).
 +	(V4L2_MPEG2_PIC_CODING_TYPE_I, V4L2_MPEG2_PIC_CODING_TYPE_P,
 +	V4L2_MPEG2_PIC_CODING_TYPE_B, or V4L2_MPEG2_PIC_CODING_TYPE_D in MPEG-1
-+	sequences).
++	sequences). Decoding D-pictures is optional: drivers that cannot
++	decode them reject V4L2_MPEG2_PIC_CODING_TYPE_D, also in
++	``VIDIOC_TRY_EXT_CTRLS``, which applications can use to find out
++	whether D-pictures are supported.
      * - __u8
        - ``picture_structure``
        - Picture structure (1: interlaced top field, 2: interlaced bottom field,
-@@ -1415,6 +1427,16 @@
+@@ -1415,6 +1432,16 @@
      * - ``V4L2_MPEG2_PIC_FLAG_PROGRESSIVE``
        - 0x00000080
        - Indicates whether the current frame is progressive.
@@ -90,9 +164,19 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  
  .. raw:: latex
  
+--- a/drivers/media/v4l2-core/v4l2-ioctl.c
++++ b/drivers/media/v4l2-core/v4l2-ioctl.c
+@@ -1508,6 +1508,7 @@
+ 		case V4L2_PIX_FMT_H263:		descr = "H.263"; break;
+ 		case V4L2_PIX_FMT_MPEG1:	descr = "MPEG-1 ES"; break;
+ 		case V4L2_PIX_FMT_MPEG2:	descr = "MPEG-2 ES"; break;
++		case V4L2_PIX_FMT_MPEG1_SLICE:	descr = "MPEG-1 Parsed Slice Data"; break;
+ 		case V4L2_PIX_FMT_MPEG2_SLICE:	descr = "MPEG-2 Parsed Slice Data"; break;
+ 		case V4L2_PIX_FMT_MPEG4:	descr = "MPEG-4 Part 2 ES"; break;
+ 		case V4L2_PIX_FMT_XVID:		descr = "Xvid"; break;
 --- a/drivers/media/v4l2-core/v4l2-ctrls-core.c
 +++ b/drivers/media/v4l2-core/v4l2-ctrls-core.c
-@@ -1632,6 +1632,7 @@
+@@ -1641,6 +1641,7 @@
  		case V4L2_MPEG2_PIC_CODING_TYPE_I:
  		case V4L2_MPEG2_PIC_CODING_TYPE_P:
  		case V4L2_MPEG2_PIC_CODING_TYPE_B:

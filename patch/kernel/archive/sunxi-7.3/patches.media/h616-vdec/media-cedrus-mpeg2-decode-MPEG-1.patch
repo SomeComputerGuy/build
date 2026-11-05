@@ -1,29 +1,129 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 03 Nov 2026 04:07:08 +0000
-Subject: media: cedrus: mpeg2: decode MPEG-1
+Subject: media: cedrus: mpeg2: decode MPEG-1 as V4L2_PIX_FMT_MPEG1_SLICE
 
 The engine has an MPEG-1 mode, selected with the MPEG-1 decoder type in
 the trigger register, and takes the full pel flags and the picture
 coding type (D-pictures included) in the picture header register. Jens
-Kuske's VE MPEG test program decoded MPEG-1 that way. Use it for
-sequences with V4L2_MPEG2_SEQ_FLAG_MPEG1, and reject the MPEG-1-only
-features (D-pictures, full pel vectors) in MPEG-2 sequences and field
-pictures in MPEG-1 sequences.
+Kuske's VE MPEG test program decoded MPEG-1 that way.
+
+Enumerate V4L2_PIX_FMT_MPEG1_SLICE on every variant with the MPEG-2
+decoder, with the limits of the MPEG-2 format, and select the MPEG-1
+mode from the coded format. The MPEG-2 controls are shared by both
+formats: V4L2_MPEG2_SEQ_FLAG_MPEG1, the full pel picture flags and
+D-pictures are only accepted with the MPEG-1 format, and are rejected in
+try_ctrl otherwise, so that an application finds out at
+VIDIOC_S_EXT_CTRLS (or VIDIOC_TRY_EXT_CTRLS, which is how it learns
+that this decoder does decode D-pictures). A decoding job whose
+sequence control disagrees with the coded format, which can happen
+after the format changed, fails, as do field pictures in MPEG-1
+sequences.
 
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
---- a/drivers/staging/media/sunxi/cedrus/cedrus.h
-+++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
-@@ -229,6 +229,7 @@
- 			bool		pair_pending;
- 			unsigned int	pair_dst;
- 			u8		pair_structure;
-+			bool		mpeg1;
- 		} mpeg2;
- 		struct {
- 			unsigned int	last_frame_p_type;
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -271,6 +271,33 @@
+ 		if (pic->width > CEDRUS_MPEG4_MAX_WIDTH ||
+ 		    cedrus_check_pic_size(ctx, pic->width, pic->height))
+ 			return -EINVAL;
++	} else if (ctrl->id == V4L2_CID_STATELESS_MPEG2_SEQUENCE) {
++		const struct v4l2_ctrl_mpeg2_sequence *seq =
++			ctrl->p_new.p_mpeg2_sequence;
++		struct cedrus_ctx *ctx = container_of(ctrl->handler,
++						      struct cedrus_ctx, hdl);
++
++		/* MPEG-1 sequences come with the MPEG-1 coded format only. */
++		if (seq->flags & V4L2_MPEG2_SEQ_FLAG_MPEG1 &&
++		    ctx->src_fmt.pixelformat != V4L2_PIX_FMT_MPEG1_SLICE)
++			return -EINVAL;
++	} else if (ctrl->id == V4L2_CID_STATELESS_MPEG2_PICTURE) {
++		const struct v4l2_ctrl_mpeg2_picture *pic =
++			ctrl->p_new.p_mpeg2_picture;
++		struct cedrus_ctx *ctx = container_of(ctrl->handler,
++						      struct cedrus_ctx, hdl);
++
++		/*
++		 * D-pictures and full pel vectors only exist in MPEG-1. The
++		 * engine decodes D-pictures, so with the MPEG-1 coded format
++		 * they pass, also in VIDIOC_TRY_EXT_CTRLS, which applications
++		 * use to find out.
++		 */
++		if (ctx->src_fmt.pixelformat != V4L2_PIX_FMT_MPEG1_SLICE &&
++		    (pic->picture_coding_type == V4L2_MPEG2_PIC_CODING_TYPE_D ||
++		     pic->flags & (V4L2_MPEG2_PIC_FLAG_FULL_PEL_FORWARD |
++				   V4L2_MPEG2_PIC_FLAG_FULL_PEL_BACKWARD)))
++			return -EINVAL;
+ 	}
+ 
+ 	return 0;
+@@ -284,12 +311,14 @@
+ 	{
+ 		.cfg = {
+ 			.id	= V4L2_CID_STATELESS_MPEG2_SEQUENCE,
++			.ops	= &cedrus_ctrl_ops,
+ 		},
+ 		.capabilities	= CEDRUS_CAPABILITY_MPEG2_DEC,
+ 	},
+ 	{
+ 		.cfg = {
+ 			.id	= V4L2_CID_STATELESS_MPEG2_PICTURE,
++			.ops	= &cedrus_ctrl_ops,
+ 		},
+ 		.capabilities	= CEDRUS_CAPABILITY_MPEG2_DEC,
+ 	},
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -36,6 +36,11 @@
+ 		.capabilities	= CEDRUS_CAPABILITY_MPEG2_DEC,
+ 	},
+ 	{
++		.pixelformat	= V4L2_PIX_FMT_MPEG1_SLICE,
++		.directions	= CEDRUS_DECODE_SRC,
++		.capabilities	= CEDRUS_CAPABILITY_MPEG2_DEC,
++	},
++	{
+ 		.pixelformat	= V4L2_PIX_FMT_H264_SLICE,
+ 		.directions	= CEDRUS_DECODE_SRC,
+ 		.capabilities	= CEDRUS_CAPABILITY_H264_DEC,
+@@ -222,6 +227,7 @@
+ 
+ 	switch (pix_fmt->pixelformat) {
+ 	case V4L2_PIX_FMT_MPEG2_SLICE:
++	case V4L2_PIX_FMT_MPEG1_SLICE:
+ 	case V4L2_PIX_FMT_H264_SLICE:
+ 	case V4L2_PIX_FMT_HEVC_SLICE:
+ 	case V4L2_PIX_FMT_VP8_FRAME:
+@@ -518,6 +524,7 @@
+ 
+ 	switch (ctx->src_fmt.pixelformat) {
+ 	case V4L2_PIX_FMT_MPEG2_SLICE:
++	case V4L2_PIX_FMT_MPEG1_SLICE:
+ 		ctx->current_codec = &cedrus_dec_ops_mpeg2;
+ 		break;
+ 	case V4L2_PIX_FMT_H264_SLICE:
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+@@ -43,6 +43,7 @@
+ 
+ 	switch (ctx->src_fmt.pixelformat) {
+ 	case V4L2_PIX_FMT_MPEG2_SLICE:
++	case V4L2_PIX_FMT_MPEG1_SLICE:
+ 		run.mpeg2.sequence = cedrus_find_control_data(ctx,
+ 			V4L2_CID_STATELESS_MPEG2_SEQUENCE);
+ 		run.mpeg2.picture = cedrus_find_control_data(ctx,
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -51,6 +51,7 @@
+ 	case V4L2_PIX_FMT_MPEG4_SLICE:
+ 	case V4L2_PIX_FMT_H263_SLICE:
+ 	case V4L2_PIX_FMT_SPK_SLICE:
++	case V4L2_PIX_FMT_MPEG1_SLICE:
+ 		reg |= VE_MODE_DEC_MPEG;
+ 		break;
+ 
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
 @@ -52,7 +52,7 @@
@@ -35,7 +135,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	const struct v4l2_ctrl_mpeg2_sequence *seq;
  	const struct v4l2_ctrl_mpeg2_picture *pic;
  	const struct v4l2_ctrl_mpeg2_quantisation *quantisation;
-@@ -66,6 +66,26 @@
+@@ -66,6 +66,30 @@
  	seq = run->mpeg2.sequence;
  	pic = run->mpeg2.picture;
  
@@ -46,10 +146,15 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +	 * (DC coefficients only). The engine has an MPEG-1 mode for it,
 +	 * selected in the trigger register, and takes the full pel flags and
 +	 * the picture coding type in the picture header register; Jens
-+	 * Kuske's VE MPEG test program drives MPEG-1 that way. MPEG-1 has
-+	 * frame pictures only.
++	 * Kuske's VE MPEG test program drives MPEG-1 that way. The coded
++	 * format says which one is decoded; the sequence flag has to agree
++	 * with it (it may not after a format change, the controls are only
++	 * checked against the format when they are set). MPEG-1 has frame
++	 * pictures only.
 +	 */
-+	mpeg1 = seq->flags & V4L2_MPEG2_SEQ_FLAG_MPEG1;
++	mpeg1 = ctx->src_fmt.pixelformat == V4L2_PIX_FMT_MPEG1_SLICE;
++	if (mpeg1 != !!(seq->flags & V4L2_MPEG2_SEQ_FLAG_MPEG1))
++		return -EINVAL;
 +	if (mpeg1 && pic->picture_structure != V4L2_MPEG2_PIC_FRAME)
 +		return -EINVAL;
 +	if (!mpeg1 &&
@@ -57,12 +162,11 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +	     pic->flags & (V4L2_MPEG2_PIC_FLAG_FULL_PEL_FORWARD |
 +			   V4L2_MPEG2_PIC_FLAG_FULL_PEL_BACKWARD)))
 +		return -EINVAL;
-+	ctx->codec.mpeg2.mpeg1 = mpeg1;
 +
  	quantisation = run->mpeg2.quantisation;
  
  	/* Activate MPEG engine. */
-@@ -124,8 +144,10 @@
+@@ -124,8 +148,10 @@
  	reg |= VE_DEC_MPEG_MP12HDR_Q_SCALE_TYPE(pic->flags & V4L2_MPEG2_PIC_FLAG_Q_SCALE_TYPE);
  	reg |= VE_DEC_MPEG_MP12HDR_INTRA_VLC_FORMAT(pic->flags & V4L2_MPEG2_PIC_FLAG_INTRA_VLC);
  	reg |= VE_DEC_MPEG_MP12HDR_ALTERNATE_SCAN(pic->flags & V4L2_MPEG2_PIC_FLAG_ALT_SCAN);
@@ -75,15 +179,15 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  
  	cedrus_write(dev, VE_DEC_MPEG_MP12HDR, reg);
  
-@@ -248,8 +270,9 @@
+@@ -248,8 +274,9 @@
  	u32 reg;
  
  	/* Trigger MPEG engine. */
 -	reg = VE_DEC_MPEG_TRIGGER_HW_MPEG_VLD | VE_DEC_MPEG_TRIGGER_MPEG2 |
 -	      VE_DEC_MPEG_TRIGGER_MB_BOUNDARY;
 +	reg = VE_DEC_MPEG_TRIGGER_HW_MPEG_VLD | VE_DEC_MPEG_TRIGGER_MB_BOUNDARY;
-+	reg |= ctx->codec.mpeg2.mpeg1 ? VE_DEC_MPEG_TRIGGER_MPEG1 :
-+					VE_DEC_MPEG_TRIGGER_MPEG2;
++	reg |= ctx->src_fmt.pixelformat == V4L2_PIX_FMT_MPEG1_SLICE ?
++	       VE_DEC_MPEG_TRIGGER_MPEG1 : VE_DEC_MPEG_TRIGGER_MPEG2;
  
  	cedrus_write(dev, VE_DEC_MPEG_TRIGGER, reg);
  }
