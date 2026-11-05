@@ -1,0 +1,41 @@
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Subject: media: cedrus: offer 10-bit AFBC capture for AVS2
+
+10-bit AVS2 already reconstructs into a 10-bit AFBC surface behind its
+P010 output, but AFBC itself could not be selected as the capture
+format for an AVS2 source, as it can for H.265 and VP9. The vendor
+library decodes 4K AVS2 into AFBC on this decoder, and on the H616 the
+P010 secondary write limits a 4K Main10 stream to just under 60 fps
+while the compressed output alone has headroom.
+
+Add YUV420_10_AFBC_16X16_SPLIT as an opt-in capture format for 10-bit
+AVS2, after the plain formats so that P010 stays the default. The AVS2
+code already programs the single-plane AFBC addresses for the current
+picture and the references, the AFBC VE_MODE bits and the HIGH10
+10-bit configuration the vendor uses when no P010 output is enabled.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -163,6 +163,19 @@
+ 		.depth		= 8,
+ 		.src_format	= V4L2_PIX_FMT_VP9_FRAME,
+ 	},
++	/*
++	 * 10-bit AVS2 into AFBC, as the vendor library does at 4K. Opt-in
++	 * like the VP9 entries: P010 (with the same AFBC reconstruction
++	 * behind it) stays the default 10-bit capture format.
++	 */
++	{
++		.pixelformat	= V4L2_PIX_FMT_YUV420_10_AFBC_16X16_SPLIT,
++		.directions	= CEDRUS_DECODE_DST,
++		.capabilities	= CEDRUS_CAPABILITY_UNTILED |
++				  CEDRUS_CAPABILITY_AVS2_DEC,
++		.depth		= 10,
++		.src_format	= V4L2_PIX_FMT_AVS2_FRAME,
++	},
+ };
+ 
+ #define CEDRUS_FORMATS_COUNT	ARRAY_SIZE(cedrus_formats)
