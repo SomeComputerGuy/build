@@ -1,0 +1,167 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 5 Nov 2026 20:10:00 +0000
+Subject: [PATCH] drm/panfrost: Resume a still-active job after a timeout
+ instead of resetting
+
+JOB_TIMEOUT_MS is 500 ms, far below what an OpenCL kernel may legitimately
+run. When the timeout fires, panfrost_reset() soft-stops the slots, resets
+the GPU and resubmits the stopped job from JS_TAIL, so the hardware resumes
+it at the task it had reached. But the soft reset throws away the dirty L2
+lines: the stores of the tasks that had already completed since the last
+write-back, and the hardware's own update of the job header. The resumed
+job then finishes with stale data in the buffers it still had to write,
+and nobody is told.
+
+Seen with the OpenCL CTS on a Mali-G31 (Allwinner H616): Integer Ops
+quick_long_math and quick_ulong_math fail in '/' and '%' only. Those
+kernels (long16 64-bit division, heavy spilling) run for more than 500 ms;
+each run logs
+
+  panfrost 1800000.gpu: gpu sched timeout, js=1, config=0x7300, status=0x8, head=0xa0161c0, tail=0xa0161c0
+
+(status 0x8 = ACTIVE), and the work-items in flight at the reset come back
+with their last 16-byte store missing: elements 14 and 15 of every 16 are
+stale while 0-13 are right. The same mechanism loses rows of the Thread
+Dimensions tests and makes big image kernels time out instead of finishing.
+
+A slot that still reports ACTIVE is not hung, it is busy. Soft-stop its job
+and resume it without the reset, the way the Arm driver time-slices jobs:
+the stopped job keeps its header and L2 contents and continues where it
+stopped. The reset stays for everything else: faults, a slot that does not
+go idle after the soft-stop (a real hang, which now costs 100 ms more to
+detect since the tasks in flight get that long to drain), and the MMU
+fault path. A job that is merely long does not get its karma increased.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/panfrost/panfrost_job.c | 66 ++++++++++++++++++-------
+ 1 file changed, 49 insertions(+), 17 deletions(-)
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
+index d59b486..b1ff46d 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_job.c
++++ b/drivers/gpu/drm/panfrost/panfrost_job.c
+@@ -655,7 +655,7 @@ static u32 panfrost_active_slots(struct panfrost_device *pfdev,
+ 
+ static void
+ panfrost_reset(struct panfrost_device *pfdev,
+-	       struct drm_sched_job *bad)
++	       struct drm_sched_job *bad, bool job_active)
+ {
+ 	u32 js_state, js_state_mask = 0xffffffff;
+ 	unsigned int i, j;
+@@ -683,7 +683,8 @@ panfrost_reset(struct panfrost_device *pfdev,
+ 
+ 	cookie = dma_fence_begin_signalling();
+ 
+-	if (bad)
++	/* A job that is merely long is not guilty of anything. */
++	if (bad && !job_active)
+ 		drm_sched_increase_karma(bad);
+ 
+ 	/* Mask job interrupts and synchronize to make sure we won't be
+@@ -698,13 +699,18 @@ panfrost_reset(struct panfrost_device *pfdev,
+ 		job_write(pfdev, JS_COMMAND(i), JS_COMMAND_SOFT_STOP);
+ 	}
+ 
+-	/* Wait at most 10ms for soft-stops to complete */
++	/* Wait at most 10ms for soft-stops to complete. A job that was still
++	 * active gets 100ms: the soft-stop lets the tasks already issued run
++	 * to completion, and a long compute kernel has hundreds in flight.
++	 */
+ 	ret = readl_poll_timeout(pfdev->iomem + JOB_INT_JS_STATE, js_state,
+ 				 !panfrost_active_slots(pfdev, &js_state_mask, js_state),
+-				 10, 10000);
++				 10, job_active ? 100000 : 10000);
+ 
+-	if (ret)
++	if (ret) {
+ 		dev_err(pfdev->base.dev, "Soft-stop failed\n");
++		job_active = false;
++	}
+ 
+ 	/* Handle the remaining interrupts before we reset. */
+ 	panfrost_jm_handle_irqs(pfdev);
+@@ -729,8 +735,16 @@ panfrost_reset(struct panfrost_device *pfdev,
+ 	memset(pfdev->jobs, 0, sizeof(pfdev->jobs));
+ 	spin_unlock(&pfdev->js->job_lock);
+ 
+-	/* Proceed with reset now. */
+-	panfrost_device_reset(pfdev, false);
++	/* Proceed with reset now, unless the slot was simply busy with a long
++	 * job. That job stopped at a task boundary and will be resumed from
++	 * JS_TAIL (see panfrost_job_handle_err()). The hardware keeps its
++	 * resume state in the job header and the results of the tasks that
++	 * already finished in the L2: a soft reset throws both away, and the
++	 * job then completes with stale data in the buffers it had still to
++	 * write and no error reported.
++	 */
++	if (!job_active)
++		panfrost_device_reset(pfdev, false);
+ 
+ 	/* GPU has been reset, we can clear the reset pending bit. */
+ 	atomic_set(&pfdev->reset.pending, 0);
+@@ -763,6 +777,8 @@ static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
+ 	struct panfrost_job *job = to_panfrost_job(sched_job);
+ 	struct panfrost_device *pfdev = job->pfdev;
+ 	int js = panfrost_job_get_slot(job);
++	bool job_active;
++	u32 js_status;
+ 
+ 	/*
+ 	 * If the GPU managed to complete this jobs fence, the timeout has
+@@ -787,18 +803,34 @@ static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
+ 		return DRM_GPU_SCHED_STAT_NO_HANG;
+ 	}
+ 
+-	dev_err(pfdev->base.dev, "gpu sched timeout, js=%d, config=0x%x, status=0x%x, head=0x%x, tail=0x%x, sched_job=%p",
+-		js,
+-		job_read(pfdev, JS_CONFIG(js)),
+-		job_read(pfdev, JS_STATUS(js)),
+-		job_read(pfdev, JS_HEAD_LO(js)),
+-		job_read(pfdev, JS_TAIL_LO(js)),
+-		sched_job);
++	/*
++	 * A slot that is still ACTIVE is not hung, it is running a job that
++	 * takes longer than JOB_TIMEOUT_MS. Compute kernels legitimately do.
++	 * Soft-stop such a job and resume it, the way the Arm driver
++	 * time-slices jobs, instead of resetting the GPU under it; the reset
++	 * stays for faults and for jobs that do not stop.
++	 */
++	js_status = job_read(pfdev, JS_STATUS(js));
++	job_active = js_status == DRM_PANFROST_EXCEPTION_ACTIVE;
+ 
+-	panfrost_core_dump(job);
++	if (job_active) {
++		dev_dbg(pfdev->base.dev, "job still active after %u ms, js=%d, head=0x%x, sched_job=%p: soft-stopping it to resume",
++			JOB_TIMEOUT_MS, js, job_read(pfdev, JS_HEAD_LO(js)),
++			sched_job);
++	} else {
++		dev_err(pfdev->base.dev, "gpu sched timeout, js=%d, config=0x%x, status=0x%x, head=0x%x, tail=0x%x, sched_job=%p",
++			js,
++			job_read(pfdev, JS_CONFIG(js)),
++			js_status,
++			job_read(pfdev, JS_HEAD_LO(js)),
++			job_read(pfdev, JS_TAIL_LO(js)),
++			sched_job);
++
++		panfrost_core_dump(job);
++	}
+ 
+ 	atomic_set(&pfdev->reset.pending, 1);
+-	panfrost_reset(pfdev, sched_job);
++	panfrost_reset(pfdev, sched_job, job_active);
+ 
+ 	return DRM_GPU_SCHED_STAT_RESET;
+ }
+@@ -808,7 +840,7 @@ static void panfrost_reset_work(struct work_struct *work)
+ 	struct panfrost_device *pfdev;
+ 
+ 	pfdev = container_of(work, struct panfrost_device, reset.work);
+-	panfrost_reset(pfdev, NULL);
++	panfrost_reset(pfdev, NULL, false);
+ }
+ 
+ static const struct drm_sched_backend_ops panfrost_sched_ops = {
