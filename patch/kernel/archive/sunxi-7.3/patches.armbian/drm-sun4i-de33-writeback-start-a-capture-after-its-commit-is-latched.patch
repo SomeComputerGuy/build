@@ -1,0 +1,160 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 09:00:00 +0000
+Subject: drm/sun4i: de33 writeback: Start a capture after its commit is latched
+
+drm_atomic_helper_commit_tail_rpm() calls the writeback connector's
+atomic_commit from commit_modeset_enables(), before the planes of the
+commit are programmed, not after them as the driver assumed. A vblank
+interrupt between the two started the capture on the previous frame.
+
+Queue the job unarmed. The mixer's latch commit (the end of the CRTC
+atomic flush) arms the jobs of its commit with the number of its
+snapshot, and the vblank interrupt starts an armed job only once that
+snapshot has been written out.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/gpu/drm/sun4i/sun50i_wb.c
++++ b/drivers/gpu/drm/sun4i/sun50i_wb.c
+@@ -195,6 +195,9 @@
+ 	bool			csc;		/* csc_coeff programmed */
+ 	u32			csc_coeff[SUN50I_WB_CSC_COEFF_NUM];
+ 	unsigned int		busy_frames;
++	/* the mixer snapshot holding this job's commit (sun50i_wb_arm()) */
++	bool			armed;
++	unsigned int		latch_seq;
+ };
+ 
+ struct sun50i_wb {
+@@ -540,8 +543,14 @@
+ 	if (!wb->running && !list_empty(&wb->pending)) {
+ 		job = list_first_entry(&wb->pending, struct sun50i_wb_job,
+ 				       list);
+-		/* a job starts at the vblank of its own CRTC */
+-		if (job->mixer == mixer) {
++		/*
++		 * A job starts at the vblank of its own CRTC, once the latch
++		 * flush wrote its commit's registers: started earlier it would
++		 * capture the previous frame.
++		 */
++		if (job->mixer == mixer && job->armed &&
++		    (int)(READ_ONCE(mixer->latch_flushed_seq) -
++			  job->latch_seq) >= 0) {
+ 			list_del(&job->list);
+ 			wb->running = job;
+ 			sun50i_wb_start(wb, job);
+@@ -555,6 +564,27 @@
+ }
+ 
+ /*
++ * sun50i_mixer_latch_commit(), under the mixer's latch lock: the planes of
++ * the commit are in snapshot @latch_seq. The jobs of this mixer queued by the
++ * commit (not armed yet) may start once that snapshot is written out.
++ */
++void sun50i_wb_arm(struct sun50i_wb *wb, struct sun8i_mixer *mixer,
++		   unsigned int latch_seq)
++{
++	struct sun50i_wb_job *job;
++	unsigned long flags;
++
++	spin_lock_irqsave(&wb->lock, flags);
++	list_for_each_entry(job, &wb->pending, list) {
++		if (job->mixer != mixer || job->armed)
++			continue;
++		job->latch_seq = latch_seq;
++		job->armed = true;
++	}
++	spin_unlock_irqrestore(&wb->lock, flags);
++}
++
++/*
+  * The CRTC the connector is attached to is turned off or re-modeset: its
+  * vblank interrupt stops, so captures still queued or running could never
+  * complete. Fail every job, not only this CRTC's:
+@@ -603,9 +633,10 @@
+ };
+ 
+ /*
+- * drm_atomic_helper_commit_writebacks(): the planes of this commit are
+- * programmed (and, on the DE33, latched for the next vblank). Queue the
+- * capture; the vblank interrupt starts it.
++ * drm_atomic_helper_commit_writebacks(), from commit_modeset_enables(): the
++ * planes of this commit are not programmed yet. Queue the capture unarmed;
++ * the mixer's latch commit arms it (sun50i_wb_arm()) and the vblank interrupt
++ * that writes those registers out starts it.
+  */
+ static void sun50i_wb_connector_atomic_commit(struct drm_connector *connector,
+ 					      struct drm_atomic_commit *state)
+--- a/drivers/gpu/drm/sun4i/sun50i_wb.h
++++ b/drivers/gpu/drm/sun4i/sun50i_wb.h
+@@ -13,5 +13,7 @@
+ struct sun8i_mixer;
+ 
+ void sun50i_wb_vblank(struct sun50i_wb *wb, struct sun8i_mixer *mixer);
++void sun50i_wb_arm(struct sun50i_wb *wb, struct sun8i_mixer *mixer,
++		   unsigned int latch_seq);
+ 
+ #endif /* _SUN50I_WB_H_ */
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -349,6 +349,7 @@
+ 	ns = ktime_get_ns() - ns;
+ 
+ 	mixer->latch_pending = false;
++	WRITE_ONCE(mixer->latch_flushed_seq, mixer->latch_seq);
+ 	if (mixer->latch_vblank_ref) {
+ 		mixer->latch_vblank_ref = false;
+ 		crtc = mixer->latch_crtc;
+@@ -380,6 +381,7 @@
+ 				      struct drm_crtc *crtc)
+ {
+ 	bool now = false, put = false;
++	struct sun50i_wb *wb;
+ 	unsigned long flags;
+ 
+ 	sun50i_shadow_commit(mixer->shadow, 0, SUN50I_SHADOW_ALL);
+@@ -391,6 +393,17 @@
+ 		de33_latch_coalesced++;
+ 	mixer->latch_pending = true;
+ 	mixer->latch_crtc = crtc;
++	mixer->latch_seq++;
++
++	/*
++	 * A write-back job of this commit was queued before its planes were
++	 * programmed (drm_atomic_helper_commit_writebacks() runs from
++	 * commit_modeset_enables()): from here it may start, once the vblank
++	 * interrupt has written this snapshot out.
++	 */
++	wb = READ_ONCE(mixer->wb);
++	if (wb)
++		sun50i_wb_arm(wb, mixer, mixer->latch_seq);
+ 
+ 	/*
+ 	 * Keep the vblank interrupt on until the flush: a commit without a
+@@ -428,8 +441,8 @@
+ 
+ 	/*
+ 	 * The frame's registers are written: a queued write-back capture of
+-	 * this mixer starts now, in the same blanking, and records the first
+-	 * frame scanned out with them.
++	 * this mixer whose commit is in them starts now, in the same blanking,
++	 * and records the first frame scanned out with them.
+ 	 */
+ 	wb = READ_ONCE(mixer->wb);
+ 	if (wb)
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+@@ -289,6 +289,9 @@
+ 	spinlock_t			latch_lock;
+ 	bool				latch_pending;	/* snapshot waits for a vblank */
+ 	bool				latch_vblank_ref; /* holds a drm_crtc_vblank_get() */
++	/* snapshots taken / written out, for the write-back (sun50i_wb_arm()) */
++	unsigned int			latch_seq;
++	unsigned int			latch_flushed_seq;
+ 	unsigned int			line_active;	/* TCON line where active video starts */
+ 	unsigned int			line_total;
+ 	/* DE33 only: blender and layer CSCs produce BT.601 YCbCr */
+-- 
+2.43.0
