@@ -1,0 +1,244 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 07:30:00 +0000
+Subject: [PATCH] media: cedrus: enc: give every encoder address register a buffer
+
+The first encode on the H616 (runner job 34, kernel c29) faulted at the
+start of every picture, I pictures included:
+
+  sun50i-iommu 30f0000.iommu: Page fault for 0x0000000000000000 (master 3, dir rd, L1 page table, status 0x8)
+  cedrus 1c0e000.video-codec: frame processing timed out!
+
+The video engine (IOMMU master 3) read through an address register that
+held 0. The encoder programmed the registers the vendor library programs,
+and like the library left the motion vector buffer (0xb60) and the
+deblocking buffer (0xbc4) at 0 and did not write the rate control buffer
+(0xb9c, written by the library only with its rate control on), the
+temporal filter counts (0xbc8) or the second reference (0xba8/0xbac); the
+encoder reset before each picture clears them all. The engine still
+reads through some of them. Without an IOMMU (the vendor stack, the
+Hardened-BliKVM lab, Bootlin's V3s) that is a harmless read of physical
+address 0; behind the IOMMU it is a page fault, the fault handler resets
+the master, the picture never completes and the watchdog fires. The one
+other encoder of this family that runs behind an IOMMU, the T527 driver,
+gives 0xb60, 0xb9c and 0xbc4 real buffers at every picture size.
+
+Allocate one auxiliary buffer per context at start_streaming with a
+region for each of the four registers, at twice the documented sizes
+(the older register map's motion vector buffer: 8 bytes per macroblock;
+the rate control buffer: 12 bytes per macroblock row and 500; the T527
+line buffer: 8 bytes per luma column), program them before every
+picture, and point the second reference slot at the reference picture.
+The IOMMU stays on and every master stays translated.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
+@@ -67,6 +67,30 @@
+ 	size_t		subpix_size;
+ };
+ 
++/*
++ * Auxiliary buffers behind the encoder's remaining address registers: the
++ * motion vector buffer (0xb60), the rate control buffer (0xb9c), the
++ * deblocking line buffer (0xbc4) and the temporal filter counts (0xbc8).
++ * The vendor library leaves the first and the third at 0 and does not
++ * write the others at a fixed QP, and the engine still reads through them:
++ * without an IOMMU that is a harmless read of physical address 0, behind
++ * the IOMMU it is a page fault that stalls the engine (job 34 on the
++ * H616: "Page fault for 0x0 (master 3, dir rd, L1 page table)" at the start
++ * of every picture, then the watchdog). The T527 driver, the one other
++ * encoder of this family that runs behind an IOMMU, gives each of them a
++ * buffer. One allocation, in that order; sizes in cedrus_enc_h264_start().
++ */
++struct cedrus_enc_h264_aux {
++	void		*buf;
++	dma_addr_t	dma;
++	size_t		size;
++
++	size_t		mv_offset;
++	size_t		rc_offset;
++	size_t		line_offset;
++	size_t		tfcnt_offset;
++};
++
+ struct cedrus_enc_h264_ctx {
+ 	struct v4l2_h264_enc	enc;
+ 	struct v4l2_fract	timeperframe;
+@@ -78,6 +102,8 @@
+ 	dma_addr_t		mb_info_dma;
+ 	size_t			mb_info_size;
+ 
++	struct cedrus_enc_h264_aux aux;
++
+ 	/* Emulation prevention is off while the bit writer puts raw bits. */
+ 	bool			eptb_disabled;
+ };
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -335,6 +335,53 @@
+ 
+ /* Engine */
+ 
++/*
++ * The auxiliary buffers, see struct cedrus_enc_h264_aux. The documented
++ * sizes (the motion vector buffer of the older register map, 8 bytes per
++ * macroblock; the rate control buffer, 12 bytes per macroblock row and 500;
++ * the line buffer of the T527, 8 bytes per luma column) are doubled: how
++ * far the engine reads through them is not documented, and a short buffer
++ * is a page fault.
++ */
++static int cedrus_enc_h264_aux_alloc(struct cedrus_ctx *ctx)
++{
++	struct cedrus_enc_h264_ctx *h264_ctx = &ctx->codec.enc_h264;
++	struct cedrus_enc_h264_aux *aux = &h264_ctx->aux;
++	struct device *dev = ctx->dev->dev;
++	unsigned int width_mbs = h264_ctx->width_mbs;
++	unsigned int height_mbs = h264_ctx->height_mbs;
++	size_t mv_size, rc_size, line_size;
++
++	mv_size = ALIGN(ALIGN(width_mbs, 4) * height_mbs * 8 * 2, SZ_4K);
++	rc_size = ALIGN((12 * height_mbs + 500) * 2, SZ_4K);
++	line_size = ALIGN(8 * width_mbs * 16 * 2, SZ_4K);
++
++	aux->mv_offset = 0;
++	aux->rc_offset = aux->mv_offset + mv_size;
++	aux->line_offset = aux->rc_offset + rc_size;
++	/* The temporal filter counts: one more motion vector buffer's worth. */
++	aux->tfcnt_offset = aux->line_offset + line_size;
++	aux->size = aux->tfcnt_offset + mv_size;
++
++	aux->buf = dma_alloc_attrs(dev, aux->size, &aux->dma, GFP_KERNEL,
++				   DMA_ATTR_NO_KERNEL_MAPPING);
++	if (!aux->buf)
++		return -ENOMEM;
++
++	return 0;
++}
++
++static void cedrus_enc_h264_aux_free(struct cedrus_ctx *ctx)
++{
++	struct cedrus_enc_h264_aux *aux = &ctx->codec.enc_h264.aux;
++	struct device *dev = ctx->dev->dev;
++
++	if (aux->buf)
++		dma_free_attrs(dev, aux->size, aux->buf, aux->dma,
++			       DMA_ATTR_NO_KERNEL_MAPPING);
++	aux->buf = NULL;
++}
++
+ static int cedrus_enc_h264_start(struct cedrus_ctx *ctx)
+ {
+ 	struct cedrus_enc_h264_ctx *h264_ctx = &ctx->codec.enc_h264;
+@@ -353,6 +400,10 @@
+ 	if (!h264_ctx->mb_info)
+ 		return -ENOMEM;
+ 
++	ret = cedrus_enc_h264_aux_alloc(ctx);
++	if (ret)
++		goto error_mb_info;
++
+ 	memset(enc, 0, sizeof(*enc));
+ 	enc->ops = &cedrus_enc_h264_core_ops;
+ 	enc->rbsp_ops = &cedrus_enc_h264_rbsp_ops;
+@@ -365,15 +416,19 @@
+ 	enc->flags = V4L2_H264_ENC_FLAG_INTER_PRED;
+ 
+ 	ret = v4l2_h264_enc_init(enc);
+-	if (ret) {
+-		dma_free_attrs(dev, h264_ctx->mb_info_size, h264_ctx->mb_info,
+-			       h264_ctx->mb_info_dma,
+-			       DMA_ATTR_NO_KERNEL_MAPPING);
+-		h264_ctx->mb_info = NULL;
+-		return ret;
+-	}
++	if (ret)
++		goto error_aux;
+ 
+ 	return 0;
++
++error_aux:
++	cedrus_enc_h264_aux_free(ctx);
++error_mb_info:
++	dma_free_attrs(dev, h264_ctx->mb_info_size, h264_ctx->mb_info,
++		       h264_ctx->mb_info_dma, DMA_ATTR_NO_KERNEL_MAPPING);
++	h264_ctx->mb_info = NULL;
++
++	return ret;
+ }
+ 
+ static void cedrus_enc_h264_stop(struct cedrus_ctx *ctx)
+@@ -383,6 +438,8 @@
+ 
+ 	v4l2_h264_enc_exit(&h264_ctx->enc);
+ 
++	cedrus_enc_h264_aux_free(ctx);
++
+ 	if (h264_ctx->mb_info)
+ 		dma_free_attrs(dev, h264_ctx->mb_info_size, h264_ctx->mb_info,
+ 			       h264_ctx->mb_info_dma,
+@@ -466,6 +523,7 @@
+ {
+ 	struct cedrus_dev *dev = ctx->dev;
+ 	struct cedrus_enc_h264_ctx *h264_ctx = &ctx->codec.enc_h264;
++	struct cedrus_enc_h264_aux *aux = &h264_ctx->aux;
+ 	struct v4l2_h264_enc *enc = &h264_ctx->enc;
+ 	struct v4l2_h264_enc_state *state = &enc->state_active;
+ 	struct v4l2_h264_enc_ref *ref = &enc->ref;
+@@ -571,9 +629,18 @@
+ 		ref_rec = rec;
+ 	}
+ 
++	/*
++	 * Every address register of the block names mapped memory: the
++	 * engine reads through the ones the vendor library leaves at 0 or
++	 * does not write (struct cedrus_enc_h264_aux), and the reset of the
++	 * block before this picture cleared them all.
++	 */
+ 	cedrus_write(dev, VE_ENC_AVC_MB_INFO_ADDR,
+ 		     cedrus_enc_addr(ctx, h264_ctx->mb_info_dma));
+-	cedrus_write(dev, VE_ENC_AVC_MV_BUF_ADDR, 0);
++	cedrus_write(dev, VE_ENC_AVC_MV_BUF_ADDR,
++		     cedrus_enc_addr(ctx, aux->dma + aux->mv_offset));
++	cedrus_write(dev, VE_ENC_AVC_RC_BUF_ADDR,
++		     cedrus_enc_addr(ctx, aux->dma + aux->rc_offset));
+ 
+ 	cedrus_write(dev, VE_ENC_AVC_REC_ADDR_Y,
+ 		     cedrus_enc_addr(ctx, rec->rec_dma));
+@@ -584,13 +651,22 @@
+ 	cedrus_write(dev, VE_ENC_AVC_REF0_ADDR_C,
+ 		     cedrus_enc_addr(ctx, ref_rec->rec_dma +
+ 				     ref_rec->rec_luma_size));
++	/* One reference: the second reference slot names the same picture. */
++	cedrus_write(dev, VE_ENC_AVC_REF1_ADDR_Y,
++		     cedrus_enc_addr(ctx, ref_rec->rec_dma));
++	cedrus_write(dev, VE_ENC_AVC_REF1_ADDR_C,
++		     cedrus_enc_addr(ctx, ref_rec->rec_dma +
++				     ref_rec->rec_luma_size));
+ 
+ 	cedrus_write(dev, VE_ENC_AVC_SUBPIX_ADDR_LAST,
+ 		     cedrus_enc_addr(ctx, ref_rec->subpix_dma));
+ 	cedrus_write(dev, VE_ENC_AVC_SUBPIX_ADDR_NEW,
+ 		     cedrus_enc_addr(ctx, rec->subpix_dma));
+ 
+-	cedrus_write(dev, VE_ENC_AVC_DEBLK_ADDR, 0);
++	cedrus_write(dev, VE_ENC_AVC_DEBLK_ADDR,
++		     cedrus_enc_addr(ctx, aux->dma + aux->line_offset));
++	cedrus_write(dev, VE_ENC_AVC_TFCNT_ADDR,
++		     cedrus_enc_addr(ctx, aux->dma + aux->tfcnt_offset));
+ 	cedrus_write(dev, VE_ENC_AVC_CYCLIC_INTRA_REFRESH, 0);
+ 
+ 	/* Quantisation and motion estimation. */
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+@@ -1452,6 +1452,8 @@
+ #define VE_ENC_AVC_STM_BIT_OFFSET		(VE_ENGINE_ENC_AVC + 0x88)
+ #define VE_ENC_AVC_STM_BIT_MAX			(VE_ENGINE_ENC_AVC + 0x8c)
+ #define VE_ENC_AVC_STM_BIT_LEN			(VE_ENGINE_ENC_AVC + 0x90)
++/* The rate control buffer of the vendor library (12 bytes per macroblock row). */
++#define VE_ENC_AVC_RC_BUF_ADDR			(VE_ENGINE_ENC_AVC + 0x9c)
+ 
+ #define VE_ENC_AVC_REF0_ADDR_Y			(VE_ENGINE_ENC_AVC + 0xa0)
+ #define VE_ENC_AVC_REF0_ADDR_C			(VE_ENGINE_ENC_AVC + 0xa4)
