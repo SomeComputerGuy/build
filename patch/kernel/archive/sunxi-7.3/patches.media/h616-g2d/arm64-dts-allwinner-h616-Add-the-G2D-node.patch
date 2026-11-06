@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 12:00:00 +0000
+Subject: arm64: dts: allwinner: h616: Add the G2D node
+
+Add the G2D 2D graphics engine at 0x01480000 (H616 user manual v1.0,
+memory map and interrupt 122 = GIC SPI 90) with its bus, module and
+MBUS clocks, the bus reset and IOMMU master 6 (table 3-8). The driver
+sets the module clock rate itself.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+@@ -274,6 +274,17 @@
+ 			iommus = <&iommu 1>;
+ 		};
+ 
++		g2d: g2d@1480000 {
++			compatible = "allwinner,sun50i-h616-g2d";
++			reg = <0x01480000 0x40000>;
++			interrupts = <GIC_SPI 90 IRQ_TYPE_LEVEL_HIGH>;
++			clocks = <&ccu CLK_BUS_G2D>, <&ccu CLK_G2D>,
++				 <&ccu CLK_MBUS_G2D>;
++			clock-names = "bus", "mod", "mbus";
++			resets = <&ccu RST_BUS_G2D>;
++			iommus = <&iommu 6>;
++		};
++
+ 		gpu: gpu@1800000 {
+ 			compatible = "allwinner,sun50i-h616-mali",
+ 				     "arm,mali-bifrost";
