@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 01:13:01 +0000
+Subject: [PATCH] media: cedrus: enable H.264 encoding on the H616
+
+The H616 video engine (decoder IP 0x33010, encoder IP 0x12011) has the
+H.264 encoder: the datasheet gives baseline, main and high profiles up to
+4K at 25 fps. The vendor library drives it like the H6's, which the
+Hardened-BliKVM lab confirmed on the H616 in 2026-10: addresses in units
+of 256 bytes in the encoder block, the visible size in units of 8 pixels
+in the input stage, and the "h6" motion estimation parameters. Enable the
+encoder with those flags.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/staging/media/sunxi/cedrus/cedrus.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+index 23a6cd34a..c169d5718 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -1203,7 +1203,8 @@ static const struct cedrus_variant sun50i_h616_cedrus_variant = {
+ 			  CEDRUS_CAPABILITY_MPEG4_DEC |
+ 			  CEDRUS_CAPABILITY_AVS2_DEC |
+ 			  CEDRUS_CAPABILITY_JPEG_DEC |
+-			  CEDRUS_CAPABILITY_AVS_DEC,
++			  CEDRUS_CAPABILITY_AVS_DEC |
++			  CEDRUS_CAPABILITY_H264_ENC,
+ 	/*
+ 	 * The vendor policy rate for this decoder (libVE, IP 0x33010).
+ 	 * 4K 10-bit P010 output is bound by the VE: 600 MHz leaves H.265
+@@ -1219,6 +1220,10 @@ static const struct cedrus_variant sun50i_h616_cedrus_variant = {
+ 	.h265_max_width	= 6144,
+ 	.h265_max_height = 4320,
+ 	.jpeg_rotate_out = true,
++	/* The 0x12011 encoder: the vendor library's "h6" programming. */
++	.enc_flags	= CEDRUS_ENC_FLAG_ADDR_SHIFT_8 |
++			  CEDRUS_ENC_FLAG_ISP_SIZE_8PX |
++			  CEDRUS_ENC_FLAG_H6_PARAMS,
+ };
+ 
+ static const struct of_device_id cedrus_dt_match[] = {
