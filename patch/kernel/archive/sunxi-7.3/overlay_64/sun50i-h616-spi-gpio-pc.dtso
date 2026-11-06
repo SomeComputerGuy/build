@@ -1,0 +1,54 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * Bit-banged SPI host (spi-gpio, CONFIG_SPI_GPIO) on four free GPIOs of
+ * the 26-pin header, with a spidev device on chip select 0. It is the
+ * test host for the SPI1 target of the spi1-target overlay, wired with
+ * four jumpers, and works as a plain extra SPI host otherwise.
+ *
+ * Orange Pi Zero2, 26-pin header:
+ *   pin 13 PC5  SCK   -> pin 23 PH6 SPI1_CLK
+ *   pin 11 PC6  MOSI  -> pin 19 PH7 SPI1_MOSI
+ *   pin 22 PC7  MISO  <- pin 21 PH8 SPI1_MISO
+ *   pin 15 PC8  CS0   -> pin 3  PH5 SPI1_CS0
+ *
+ * Registers as bus 2 (alias spi2): /dev/spidev2.0. The bit-banged clock
+ * is a few hundred kHz at most; spi-max-frequency only caps the request.
+ * Uses no SoC peripheral; PC5-PC8 are the (unused) SDC2 data pins.
+ */
+
+/ {
+	compatible = "allwinner,sun50i-h616", "allwinner,sun50i-h618";
+
+	fragment@0 {
+		target-path = "/aliases";
+		__overlay__ {
+			spi2 = "/spi-gpio";
+		};
+	};
+
+	fragment@1 {
+		target-path = "/";
+		__overlay__ {
+			spi_gpio: spi-gpio {
+				compatible = "spi-gpio";
+				#address-cells = <1>;
+				#size-cells = <0>;
+				/* &pio bank C = 2; flags 0 = GPIO_ACTIVE_HIGH, 1 = GPIO_ACTIVE_LOW */
+				sck-gpios = <&pio 2 5 0>;	/* PC5 */
+				mosi-gpios = <&pio 2 6 0>;	/* PC6 */
+				miso-gpios = <&pio 2 7 0>;	/* PC7 */
+				cs-gpios = <&pio 2 8 1>;	/* PC8, active low */
+				num-chipselects = <1>;
+				status = "okay";
+
+				spidev2_0: spidev@0 {
+					compatible = "armbian,spi-dev";
+					reg = <0>;
+					spi-max-frequency = <500000>;
+				};
+			};
+		};
+	};
+};

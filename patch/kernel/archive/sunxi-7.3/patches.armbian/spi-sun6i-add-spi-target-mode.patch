@@ -1,0 +1,414 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 6 Nov 2026 00:00:00 +0000
+Subject: spi: sun6i: Add SPI target (slave) mode
+
+The Allwinner SPI controller works as a host or as a target, selected by
+GCR.MODE (H616 user manual v1.0, 9.3.3.5 and 9.3.6.1): with MODE cleared
+it waits for the external host to assert SS and drive SPI_CLK, shifts the
+TX FIFO out on MISO and fills the RX FIFO from MOSI. The driver only
+supported host mode.
+
+Register the controller as an SPI target when its node carries the
+standard "spi-slave" property, as spi-imx does. A target transfer is PIO:
+the TX FIFO is preloaded (zeros for an RX-only transfer) and refilled from
+the TX empty-request interrupt, the RX ready level is set to the rest of
+the transfer (or 3/4 of the FIFO), and the transfer completes once
+tfr->len bytes have been received, which in a full-duplex shift is also
+when the last TX byte has gone out. There are no burst counters in target
+mode, so the host sizes the transfer: bytes beyond len stay in the FIFO
+and go with the FIFO reset after the transfer, and a FIFO under- or
+overrun ends the transfer with -EIO. The wait is interruptible and the
+target_abort callback completes it (spidev release, "(null)" written to
+the sysfs slave attribute). SS is an input, so set_cs only selects the SSx
+input. The module clock is raised to four times the handler's
+spi-max-frequency, the host clock to expect, within the 200 MHz the host
+path uses, so the input shift register samples reliably. SDM/SDC sample
+modes, DMA and the dual/quad modes are host-only and stay off for a
+target.
+
+Host mode is unchanged: same mode bits, DMA, clock programming and
+interrupt handling; the target paths only run for a controller that was
+allocated as a target.
+
+Usage: "spi-slave;" in the controller node, then
+echo spidev > /sys/class/spi_slave/spiN/slave (or spi-slave-time,
+spi-slave-system-control) for the protocol handler.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+
+--- a/drivers/spi/spi-sun6i.c
++++ b/drivers/spi/spi-sun6i.c
+@@ -51,6 +51,7 @@
+ #define SUN6I_INT_CTL_RF_RDY			BIT(0)
+ #define SUN6I_INT_CTL_TF_ERQ			BIT(4)
+ #define SUN6I_INT_CTL_RF_OVF			BIT(8)
++#define SUN6I_INT_CTL_TF_UDR			BIT(11)
+ #define SUN6I_INT_CTL_TC			BIT(12)
+ 
+ #define SUN6I_INT_STA_REG		0x14
+@@ -78,6 +79,9 @@
+ 
+ #define SUN6I_MAX_XFER_SIZE		0xffffff
+ 
++/* Target mode: module clock ceiling when following the host's bus clock */
++#define SUN6I_TARGET_MAX_MCLK		200000000UL
++
+ #define SUN6I_BURST_CNT_REG		0x30
+ 
+ #define SUN6I_XMIT_CNT_REG		0x34
+@@ -114,6 +118,11 @@
+ 	u8			*rx_buf;
+ 	int			len;
+ 	const struct sun6i_spi_cfg *cfg;
++
++	/* Target mode: bytes the host still has to clock in, abort/error flags */
++	unsigned int		rx_left;
++	bool			target_aborted;
++	bool			target_error;
+ };
+ 
+ static inline u32 sun6i_spi_read(struct sun6i_spi *sspi, u32 reg)
+@@ -156,6 +165,15 @@
+ 	/* See how much data is available */
+ 	len = sun6i_spi_get_rx_fifo_count(sspi);
+ 
++	/*
++	 * A target has no burst counter: the host decides how many bytes it
++	 * clocks, so never read past the end of this transfer's buffer.
++	 */
++	if (spi_controller_is_target(sspi->host)) {
++		len = min(len, sspi->rx_left);
++		sspi->rx_left -= len;
++	}
++
+ 	while (len--) {
+ 		byte = readb(sspi->base_addr + SUN6I_RXDATA_REG);
+ 		if (sspi->rx_buf)
+@@ -181,6 +199,24 @@
+ 	}
+ }
+ 
++/*
++ * Target mode: raise RF_RDY when the rest of the transfer has arrived, or
++ * 3/4 of the FIFO as in host mode when more than that is still expected.
++ * Returns the programmed level.
++ */
++static u32 sun6i_spi_target_set_rx_trigger(struct sun6i_spi *sspi)
++{
++	u32 level = min_t(u32, sspi->rx_left, sspi->cfg->fifo_depth / 4 * 3);
++	u32 reg = sun6i_spi_read(sspi, SUN6I_FIFO_CTL_REG);
++
++	reg &= ~(SUN6I_FIFO_CTL_RF_RDY_TRIG_LEVEL_MASK <<
++		 SUN6I_FIFO_CTL_RF_RDY_TRIG_LEVEL_BITS);
++	reg |= level << SUN6I_FIFO_CTL_RF_RDY_TRIG_LEVEL_BITS;
++	sun6i_spi_write(sspi, SUN6I_FIFO_CTL_REG, reg);
++
++	return level;
++}
++
+ static void sun6i_spi_set_cs(struct spi_device *spi, bool enable)
+ {
+ 	struct sun6i_spi *sspi = spi_controller_get_devdata(spi->controller);
+@@ -190,6 +226,12 @@
+ 	reg &= ~SUN6I_TFR_CTL_CS_MASK;
+ 	reg |= SUN6I_TFR_CTL_CS(spi_get_chipselect(spi, 0));
+ 
++	/* A target only picks the SSx input it listens on; the host drives it */
++	if (spi_controller_is_target(spi->controller)) {
++		sun6i_spi_write(sspi, SUN6I_TFR_CTL_REG, reg);
++		return;
++	}
++
+ 	if (enable)
+ 		reg |= SUN6I_TFR_CTL_CS_LEVEL;
+ 	else
+@@ -274,6 +316,133 @@
+ 	return 0;
+ }
+ 
++/*
++ * Target (slave) mode, H616 user manual 9.3.3.5: with GCR.MODE cleared the
++ * controller waits for the host to assert SS and drive SPI_CLK; the TX FIFO
++ * is shifted out on MISO and MOSI is shifted into the RX FIFO. There are no
++ * burst counters and no TC for a transfer the host sizes, so the transfer
++ * is complete once the RX FIFO has delivered tfr->len bytes (SPI is full
++ * duplex: that is also the moment the last TX byte has been clocked out).
++ * PIO only; the wait is unbounded until the host clocks the data or the
++ * transfer is aborted (spi_target_abort, or the spidev user is signalled).
++ */
++static int sun6i_spi_target_transfer_one(struct spi_controller *host,
++					 struct spi_device *spi,
++					 struct spi_transfer *tfr)
++{
++	struct sun6i_spi *sspi = spi_controller_get_devdata(host);
++	unsigned int trig_level = sspi->cfg->fifo_depth / 4 * 3;
++	unsigned long mclk_rate;
++	int ret = 0;
++	u32 reg;
++
++	if (tfr->len > SUN6I_MAX_XFER_SIZE)
++		return -EINVAL;
++	if (!tfr->len)
++		return 0;
++
++	reinit_completion(&sspi->done);
++	sspi->tx_buf = tfr->tx_buf;
++	sspi->rx_buf = tfr->rx_buf;
++	sspi->len = tfr->len;
++	sspi->rx_left = tfr->len;
++	sspi->target_aborted = false;
++	sspi->target_error = false;
++
++	/* Clear pending interrupts and reset both FIFOs */
++	sun6i_spi_write(sspi, SUN6I_INT_STA_REG, ~0);
++	sun6i_spi_write(sspi, SUN6I_FIFO_CTL_REG,
++			SUN6I_FIFO_CTL_RF_RST | SUN6I_FIFO_CTL_TF_RST);
++
++	/* TX refill at 3/4 empty as in host mode; RX level per the transfer */
++	sun6i_spi_write(sspi, SUN6I_FIFO_CTL_REG,
++			trig_level << SUN6I_FIFO_CTL_TF_ERQ_TRIG_LEVEL_BITS);
++	sun6i_spi_target_set_rx_trigger(sspi);
++
++	/*
++	 * Clock polarity and phase, bit order and SS polarity follow the
++	 * host's. SS is an input: the controller owns it, and every byte the
++	 * host clocks is received (no dummy bursts to discard).
++	 */
++	reg = sun6i_spi_read(sspi, SUN6I_TFR_CTL_REG);
++	reg &= ~(SUN6I_TFR_CTL_CPOL | SUN6I_TFR_CTL_CPHA | SUN6I_TFR_CTL_FBS |
++		 SUN6I_TFR_CTL_SPOL | SUN6I_TFR_CTL_DHB |
++		 SUN6I_TFR_CTL_CS_MANUAL);
++
++	if (spi->mode & SPI_CPOL)
++		reg |= SUN6I_TFR_CTL_CPOL;
++
++	if (spi->mode & SPI_CPHA)
++		reg |= SUN6I_TFR_CTL_CPHA;
++
++	if (spi->mode & SPI_LSB_FIRST)
++		reg |= SUN6I_TFR_CTL_FBS;
++
++	if (!(spi->mode & SPI_CS_HIGH))
++		reg |= SUN6I_TFR_CTL_SPOL;
++
++	sun6i_spi_write(sspi, SUN6I_TFR_CTL_REG, reg);
++
++	/*
++	 * SPI_CLK comes from the host. The module clock only has to sample
++	 * it: keep it at least four times the expected bus clock (the
++	 * device's spi-max-frequency) so the input shift register is safe,
++	 * within the 200 MHz the host path uses for a 100 MHz bus.
++	 */
++	mclk_rate = clk_get_rate(sspi->mclk);
++	if (mclk_rate < 4UL * tfr->speed_hz)
++		clk_set_rate(sspi->mclk,
++			     min(4UL * tfr->speed_hz, SUN6I_TARGET_MAX_MCLK));
++
++	/* Enable the controller; MODE stays 0 (target) from runtime resume */
++	reg = sun6i_spi_read(sspi, SUN6I_GBL_CTL_REG);
++	reg &= ~SUN6I_GBL_CTL_MASTER;
++	reg |= SUN6I_GBL_CTL_BUS_ENABLE;
++	sun6i_spi_write(sspi, SUN6I_GBL_CTL_REG, reg);
++
++	/* Preload the TX FIFO (zeros for an RX-only transfer) */
++	sun6i_spi_fill_fifo(sspi);
++
++	/* RX level, FIFO errors, and TX refills for long transfers */
++	reg = SUN6I_INT_CTL_RF_RDY | SUN6I_INT_CTL_RF_OVF | SUN6I_INT_CTL_TF_UDR;
++	if (sspi->len)
++		reg |= SUN6I_INT_CTL_TF_ERQ;
++	sun6i_spi_write(sspi, SUN6I_INT_CTL_REG, reg);
++
++	if (wait_for_completion_interruptible(&sspi->done) ||
++	    sspi->target_aborted)
++		ret = -EINTR;
++	else if (sspi->target_error)
++		ret = -EIO;
++
++	sun6i_spi_write(sspi, SUN6I_INT_CTL_REG, 0);
++
++	/*
++	 * Stop listening until the next transfer and drop whatever a
++	 * half-done or over-long host transfer left in the FIFOs.
++	 */
++	reg = sun6i_spi_read(sspi, SUN6I_GBL_CTL_REG);
++	sun6i_spi_write(sspi, SUN6I_GBL_CTL_REG, reg & ~SUN6I_GBL_CTL_BUS_ENABLE);
++	sun6i_spi_write(sspi, SUN6I_FIFO_CTL_REG,
++			SUN6I_FIFO_CTL_RF_RST | SUN6I_FIFO_CTL_TF_RST);
++
++	if (ret == -EIO)
++		dev_warn(&host->dev, "%s: FIFO error in target transfer of %u bytes\n",
++			 dev_name(&spi->dev), tfr->len);
++
++	return ret;
++}
++
++static int sun6i_spi_target_abort(struct spi_controller *host)
++{
++	struct sun6i_spi *sspi = spi_controller_get_devdata(host);
++
++	sspi->target_aborted = true;
++	complete(&sspi->done);
++
++	return 0;
++}
++
+ static int sun6i_spi_transfer_one(struct spi_controller *host,
+ 				  struct spi_device *spi,
+ 				  struct spi_transfer *tfr)
+@@ -288,6 +457,9 @@
+ 	int ret = 0;
+ 	u32 reg;
+ 
++	if (spi_controller_is_target(host))
++		return sun6i_spi_target_transfer_one(host, spi, tfr);
++
+ 	if (tfr->len > SUN6I_MAX_XFER_SIZE)
+ 		return -EINVAL;
+ 
+@@ -531,11 +703,64 @@
+ 	return ret;
+ }
+ 
++static irqreturn_t sun6i_spi_target_handler(struct sun6i_spi *sspi, u32 status)
++{
++	u32 level;
++
++	/* FIFO under/overrun: the host clocked faster or longer than served */
++	if (status & (SUN6I_INT_CTL_RF_OVF | SUN6I_INT_CTL_TF_UDR)) {
++		sun6i_spi_write(sspi, SUN6I_INT_STA_REG,
++				status & (SUN6I_INT_CTL_RF_OVF | SUN6I_INT_CTL_TF_UDR));
++		if (sspi->rx_left) {
++			sspi->target_error = true;
++			complete(&sspi->done);
++		}
++		return IRQ_HANDLED;
++	}
++
++	/* Receive FIFO at the trigger level */
++	if (status & SUN6I_INT_CTL_RF_RDY) {
++		/*
++		 * Clear first, then drain; the level is re-armed below and a
++		 * byte arriving in between is caught by the final re-check,
++		 * so no wakeup is lost on the last bytes of a transfer.
++		 */
++		do {
++			sun6i_spi_write(sspi, SUN6I_INT_STA_REG, SUN6I_INT_CTL_RF_RDY);
++			sun6i_spi_drain_fifo(sspi);
++			if (!sspi->rx_left) {
++				complete(&sspi->done);
++				return IRQ_HANDLED;
++			}
++			level = sun6i_spi_target_set_rx_trigger(sspi);
++		} while (sun6i_spi_get_rx_fifo_count(sspi) >= level);
++
++		return IRQ_HANDLED;
++	}
++
++	/* Transmit FIFO 3/4 empty */
++	if (status & SUN6I_INT_CTL_TF_ERQ) {
++		sun6i_spi_fill_fifo(sspi);
++
++		if (!sspi->len)
++			sun6i_spi_disable_interrupt(sspi, SUN6I_INT_CTL_TF_ERQ);
++
++		sun6i_spi_write(sspi, SUN6I_INT_STA_REG, SUN6I_INT_CTL_TF_ERQ);
++
++		return IRQ_HANDLED;
++	}
++
++	return IRQ_NONE;
++}
++
+ static irqreturn_t sun6i_spi_handler(int irq, void *dev_id)
+ {
+ 	struct sun6i_spi *sspi = dev_id;
+ 	u32 status = sun6i_spi_read(sspi, SUN6I_INT_STA_REG);
+ 
++	if (spi_controller_is_target(sspi->host))
++		return sun6i_spi_target_handler(sspi, status);
++
+ 	/* Transfer complete */
+ 	if (status & SUN6I_INT_CTL_TC) {
+ 		sun6i_spi_write(sspi, SUN6I_INT_STA_REG, SUN6I_INT_CTL_TC);
+@@ -592,7 +817,9 @@
+ 		goto err2;
+ 	}
+ 
++	/* Host mode with transmit pause, or target mode (MODE = 0) */
+ 	sun6i_spi_write(sspi, SUN6I_GBL_CTL_REG,
++			spi_controller_is_target(host) ? 0 :
+ 			SUN6I_GBL_CTL_MASTER | SUN6I_GBL_CTL_TP);
+ 
+ 	return 0;
+@@ -636,16 +863,23 @@
+ 	struct spi_controller *host;
+ 	struct sun6i_spi *sspi;
+ 	struct resource *mem;
++	bool target_mode;
+ 	int ret = 0, irq;
+ 
+-	host = devm_spi_alloc_host(&pdev->dev, sizeof(struct sun6i_spi));
++	target_mode = of_property_read_bool(pdev->dev.of_node, "spi-slave");
++	if (target_mode)
++		host = devm_spi_alloc_target(&pdev->dev, sizeof(struct sun6i_spi));
++	else
++		host = devm_spi_alloc_host(&pdev->dev, sizeof(struct sun6i_spi));
+ 	if (!host) {
+-		dev_err(&pdev->dev, "Unable to allocate SPI Host\n");
++		dev_err(&pdev->dev, "Unable to allocate SPI %s\n",
++			target_mode ? "Target" : "Host");
+ 		return -ENOMEM;
+ 	}
+ 
+ 	platform_set_drvdata(pdev, host);
+ 	sspi = spi_controller_get_devdata(host);
++	sspi->host = host;
+ 
+ 	sspi->base_addr = devm_platform_get_and_ioremap_resource(pdev, 0, &mem);
+ 	if (IS_ERR(sspi->base_addr))
+@@ -662,7 +896,6 @@
+ 		return ret;
+ 	}
+ 
+-	sspi->host = host;
+ 	sspi->cfg = of_device_get_match_data(&pdev->dev);
+ 
+ 	host->max_speed_hz = 100 * 1000 * 1000;
+@@ -671,8 +904,12 @@
+ 	host->set_cs = sun6i_spi_set_cs;
+ 	host->transfer_one = sun6i_spi_transfer_one;
+ 	host->num_chipselect = 4;
+-	host->mode_bits = SPI_CPOL | SPI_CPHA | SPI_CS_HIGH | SPI_LSB_FIRST |
+-			  sspi->cfg->mode_bits;
++	host->mode_bits = SPI_CPOL | SPI_CPHA | SPI_CS_HIGH | SPI_LSB_FIRST;
++	if (target_mode)
++		/* single-bit PIO only; the host sizes the transfers */
++		host->target_abort = sun6i_spi_target_abort;
++	else
++		host->mode_bits |= sspi->cfg->mode_bits;
+ 	host->bits_per_word_mask = SPI_BPW_MASK(8);
+ 	host->auto_runtime_pm = true;
+ 	host->max_transfer_size = sun6i_spi_max_transfer_size;
+@@ -717,7 +954,7 @@
+ 		host->dma_rx = NULL;
+ 	}
+ 
+-	if (host->dma_tx && host->dma_rx) {
++	if (host->dma_tx && host->dma_rx && !target_mode) {
+ 		sspi->dma_addr_tx = mem->start + SUN6I_TXDATA_REG;
+ 		sspi->dma_addr_rx = mem->start + SUN6I_RXDATA_REG;
+ 		host->can_dma = sun6i_spi_can_dma;
+@@ -740,7 +977,8 @@
+ 
+ 	ret = spi_register_controller(host);
+ 	if (ret) {
+-		dev_err(&pdev->dev, "cannot register SPI host\n");
++		dev_err(&pdev->dev, "cannot register SPI %s\n",
++			target_mode ? "target" : "host");
+ 		goto err_pm_disable;
+ 	}
+ 
