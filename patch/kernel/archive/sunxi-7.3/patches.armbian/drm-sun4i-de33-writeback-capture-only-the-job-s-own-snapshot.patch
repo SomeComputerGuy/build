@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 21:00:00 +0000
+Subject: drm/sun4i: de33 writeback: Capture only the job's own snapshot
+
+A job that could not start at the vblank that wrote its commit out was
+started later on whatever was on screen then: the "picture unchanged"
+check compared against the snapshot seen when the job first reached
+the head of an idle unit, not against the job's own snapshot. Under a
+4K decode plus a memcpy load the unit was still writing out the
+previous capture at that vblank (de33_wb_busy_frames), the job started
+one frame late and recorded the next commit's picture as its own, with
+a good fence (two "early" captures in 600 flips; the scan-out itself
+was right, every flip event and flush one vblank apart). A commit
+coalesced with the next one before a flush had the same effect.
+
+Compare with the job's own latch_seq instead, and fail such a job with
+-EIO (de33_wb_lost) as a picture replaced after an OVERFLOW already
+was. Look at the following jobs in the same interrupt, so the next
+job, whose snapshot is the one on screen, still starts at once.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/gpu/drm/sun4i/sun50i_wb.c
++++ b/drivers/gpu/drm/sun4i/sun50i_wb.c
+@@ -200,13 +200,6 @@
+ 	/* the mixer snapshot holding this job's commit (sun50i_wb_arm()) */
+ 	bool			armed;
+ 	unsigned int		latch_seq;
+-	/*
+-	 * The snapshot on screen when the job could first start: a capture
+-	 * postponed or repeated later records the same picture only while
+-	 * no other snapshot has been written out since.
+-	 */
+-	bool			eligible;
+-	unsigned int		frame_seq;
+ 	unsigned int		tries;		/* captures started */
+ 	unsigned int		deferred;	/* starts postponed */
+ 	int			status;
+@@ -606,39 +599,43 @@
+ 		}
+ 	}
+ 
+-	if (!wb->running && !list_empty(&wb->pending)) {
++	/*
++	 * A job starts at the vblank of its own CRTC, once the latch flush
++	 * wrote its commit's registers: started earlier it would capture the
++	 * previous frame. It captures its own picture only while snapshot
++	 * latch_seq is the one on screen: a job that could not start at that
++	 * vblank (the unit still writing out the previous capture, a start
++	 * postponed, a repeat after OVERFLOW) or whose commit was coalesced
++	 * with the next one would record a later commit's picture as its
++	 * own. Such a job fails, and the next one is looked at.
++	 */
++	while (!wb->running && !list_empty(&wb->pending)) {
+ 		job = list_first_entry(&wb->pending, struct sun50i_wb_job,
+ 				       list);
+-		/*
+-		 * A job starts at the vblank of its own CRTC, once the latch
+-		 * flush wrote its commit's registers: started earlier it would
+-		 * capture the previous frame.
+-		 */
+-		if (job->mixer == mixer && job->armed &&
+-		    (int)(flushed - job->latch_seq) >= 0) {
+-			if (!job->eligible) {
+-				job->eligible = true;
+-				job->frame_seq = flushed;
+-			}
++		if (job->mixer != mixer || !job->armed ||
++		    (int)(flushed - job->latch_seq) < 0)
++			break;
++
++		if (flushed != job->latch_seq) {
++			/* the job's picture is no longer on screen */
++			list_del(&job->list);
++			de33_wb_lost++;
++			sun50i_wb_job_end(&done, job, -EIO);
++			continue;
++		}
+ 
+-			if (flushed != job->frame_seq) {
+-				/* the job's picture is no longer on screen */
+-				list_del(&job->list);
+-				de33_wb_lost++;
+-				sun50i_wb_job_end(&done, job, -EIO);
+-			} else if (late &&
+-				   job->deferred < SUN50I_WB_MAX_BUSY_FRAMES) {
+-				job->deferred++;
+-				de33_wb_deferred++;
+-			} else {
+-				list_del(&job->list);
+-				wb->running = job;
+-				job->tries++;
+-				if ((int)cur_line > de33_wb_start_line_max)
+-					de33_wb_start_line_max = cur_line;
+-				sun50i_wb_start(wb, job);
+-			}
++		if (late && job->deferred < SUN50I_WB_MAX_BUSY_FRAMES) {
++			job->deferred++;
++			de33_wb_deferred++;
++			break;
+ 		}
++
++		list_del(&job->list);
++		wb->running = job;
++		job->tries++;
++		if ((int)cur_line > de33_wb_start_line_max)
++			de33_wb_start_line_max = cur_line;
++		sun50i_wb_start(wb, job);
+ 	}
+ 
+ 	spin_unlock_irqrestore(&wb->lock, flags);
