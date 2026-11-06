@@ -1,0 +1,499 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 20:00:00 +0000
+Subject: drm/sun4i: de33: Send the flip event after the latch flush, never
+ write the latch in active video
+
+Three holes in the DE33 vblank register latch:
+
+- The page-flip event was armed with drm_crtc_arm_vblank_event() and so
+  sent by drm_crtc_handle_vblank(), before the vblank_quirk that writes
+  the registers out. A client woken by it could commit the next frame
+  before this one was in the hardware, and a flush that had to wait for
+  a later vblank would still have reported the flip. The mixer now takes
+  the event (new sunxi_engine_ops.hold_event) and sends it right after
+  the flush that writes its commit, with that vblank's count and time.
+  A new drain op writes out and sends what is left when the CRTC goes
+  off.
+
+- The snapshot (process context) took the planes and the blender shadow
+  one after the other outside the latch lock, the flush (vblank IRQ) the
+  other way round: an unsynced commit (legacy cursor) racing a flush
+  could write one commit's planes with the next one's blender. Take both
+  snapshots under the latch lock.
+
+- de33_latch_flushes_late (0-1 per run in the writeback jobs, line
+  339-369 of 806): the TCON vblank status bits are set at every vblank
+  whether the interrupt is enabled or not, and only the handler clears
+  them. drm_crtc_vblank_get() after the vblank interrupt had been off
+  (vblank off delay, modeset) enabled it with a stale bit set, so the
+  handler ran at once, mid-frame, and flushed the latch into active
+  video. sun4i_tcon_enable_vblank() now clears the status bits in the
+  enabling write (counted in sun4i_tcon vblank_stale_cleared).
+  Independently of the cause, a vblank interrupt serviced too late for
+  the flush to end inside the blanking (TCON line >= line_deadline,
+  line_active minus ~50 us) now leaves the snapshot and its events for
+  the next vblank (de33_latch_deferred), at most twice; then it is
+  written anyway (de33_latch_forced) and late ones are not postponed
+  until a flush lands in time again, so a mode whose line counter does
+  not behave as assumed degrades to the old immediate write.
+
+New read-only counters de33_latch_{line_deadline,deferred,forced,
+events,events_now}. DE2/DE3, the A523 RCQ path and the TV encoder
+mixer's register values are unchanged.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/gpu/drm/sun4i/sun4i_crtc.c
++++ b/drivers/gpu/drm/sun4i/sun4i_crtc.c
+@@ -96,12 +96,25 @@
+ 	if (event) {
+ 		crtc->state->event = NULL;
+ 
+-		spin_lock_irq(&crtc->dev->event_lock);
+-		if (drm_crtc_vblank_get(crtc) == 0)
+-			drm_crtc_arm_vblank_event(crtc, event);
+-		else
++		if (drm_crtc_vblank_get(crtc) == 0) {
++			/*
++			 * An engine that writes its registers out from the
++			 * vblank interrupt sends the event itself, after
++			 * that write: drm_crtc_arm_vblank_event() would send
++			 * it from drm_crtc_handle_vblank(), before the write,
++			 * and at the next vblank even if the write had to
++			 * wait for a later one.
++			 */
++			if (!sunxi_engine_hold_event(scrtc->engine, crtc, event)) {
++				spin_lock_irq(&crtc->dev->event_lock);
++				drm_crtc_arm_vblank_event(crtc, event);
++				spin_unlock_irq(&crtc->dev->event_lock);
++			}
++		} else {
++			spin_lock_irq(&crtc->dev->event_lock);
+ 			drm_crtc_send_vblank_event(crtc, event);
+-		spin_unlock_irq(&crtc->dev->event_lock);
++			spin_unlock_irq(&crtc->dev->event_lock);
++		}
+ 	}
+ 
+ 	if (crtc->state->color_mgmt_changed) {
+@@ -129,6 +142,9 @@
+ 
+ 	sun4i_tcon_set_status(scrtc->tcon, encoder, false);
+ 
++	/* nothing scans out any more: write out and send what waits for a vblank */
++	sunxi_engine_drain(scrtc->engine);
++
+ 	drm_crtc_vblank_off(crtc);
+ 
+ 	if (crtc->state->event && !crtc->state->active) {
+--- a/drivers/gpu/drm/sun4i/sun4i_tcon.c
++++ b/drivers/gpu/drm/sun4i/sun4i_tcon.c
+@@ -86,6 +86,17 @@
+ module_param(arm_line_max, int, 0444);
+ module_param(arm_line_count, int, 0444);
+ 
++/*
++ * Vblank interrupts enabled with a vblank status bit already set: the bit
++ * latches every frame whether or not the interrupt is enabled, so a stale
++ * one would fire the handler at once, at an arbitrary scan line, and be
++ * taken for a vblank (counter, events, the DE33 register latch written in
++ * active video). sun4i_tcon_enable_vblank() clears it; this counts how
++ * often it was set. Read-only diagnostic.
++ */
++static unsigned int vblank_stale_cleared;
++module_param(vblank_stale_cleared, uint, 0444);
++
+ static struct drm_connector *sun4i_tcon_get_connector(const struct drm_encoder *encoder)
+ {
+ 	struct drm_connector *connector;
+@@ -273,13 +284,16 @@
+ 
+ void sun4i_tcon_enable_vblank(struct sun4i_tcon *tcon, bool enable)
+ {
+-	u32 mask, val = 0;
++	u32 mask, val = 0, status = 0, ints;
+ 
+ 	DRM_DEBUG_DRIVER("%sabling VBLANK interrupt\n", enable ? "En" : "Dis");
+ 
+ 	mask = SUN4I_TCON_GINT0_VBLANK_ENABLE(0) |
+ 		SUN4I_TCON_GINT0_VBLANK_ENABLE(1) |
+ 		SUN4I_TCON_GINT0_TCON0_TRI_FINISH_ENABLE;
++	ints = SUN4I_TCON_GINT0_VBLANK_INT(0) |
++		SUN4I_TCON_GINT0_VBLANK_INT(1) |
++		SUN4I_TCON_GINT0_TCON0_TRI_FINISH_INT;
+ 
+ 	if (enable)
+ 		val = mask;
+@@ -287,6 +301,20 @@
+         if (!enable && tcon->quirks->vblank_delay)
+ 		hrtimer_cancel(&tcon->flip_timer);
+ 
++	/*
++	 * The status bits are set at every vblank, enabled or not, and only
++	 * the handler clears them. Enabling the interrupt with one still set
++	 * from a frame while it was off fires the handler right away, in the
++	 * middle of the frame: clear them in the same write, so the first
++	 * interrupt is the next real vblank.
++	 */
++	if (enable) {
++		regmap_read(tcon->regs, SUN4I_TCON_GINT0_REG, &status);
++		if (status & ints)
++			vblank_stale_cleared++;
++		mask |= ints;
++	}
++
+ 	regmap_update_bits(tcon->regs, SUN4I_TCON_GINT0_REG, mask, val);
+ 
+ 	/* TEMP: move the TCON1/TV vblank IRQ line for the RCQ-arm timing probe */
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -287,9 +287,28 @@
+  * and what DE2/DE3 do in hardware with GLB_DBUFF. While the CRTC is off
+  * nothing scans out and there is no vblank, so the writes go out at once.
+  *
++ * The page-flip event of a commit is sent from the same interrupt, right
++ * after its registers are written (sun50i_mixer_hold_event()), not by
++ * drm_crtc_handle_vblank() before them: a client woken by the event cannot
++ * commit the next frame before this one is in the hardware, and a flush
++ * that has to wait for a later vblank keeps its event waiting with it.
++ * The snapshot and the flush exclude each other (latch_lock), so a flush
++ * never writes the planes of one commit with the blender of another.
++ *
++ * An interrupt serviced so late that the flush would not end inside the
++ * blanking (TCON line >= line_deadline) leaves the snapshot for the next
++ * vblank instead of writing it into active video (de33_latch_deferred), at
++ * most LATCH_MAX_DEFER times; then it is written anyway (de33_latch_forced)
++ * and the next late one is not postponed until a flush lands in time again,
++ * so a mode whose line counter does not behave as assumed degrades to the
++ * old immediate write instead of a frozen display.
++ *
+  * The counters are read-only diagnostics: a frame-coherent update needs
+  * de33_latch_flushes_late == 0 and de33_latch_line_max < de33_latch_line_active.
+  */
++#define LATCH_MAX_DEFER		2
++#define LATCH_FLUSH_BUDGET_NS	50000	/* flush ns_max is ~16 us (job 19) */
++
+ static unsigned int de33_latch_commits;
+ static unsigned int de33_latch_coalesced;	/* commits before the previous one flushed */
+ static unsigned int de33_latch_flushes;
+@@ -300,6 +319,11 @@
+ static int de33_latch_line_min = -1;		/* TCON line at flush, min/max */
+ static int de33_latch_line_max = -1;
+ static int de33_latch_line_active = -1;		/* first active TCON line of the mode */
++static int de33_latch_line_deadline = -1;	/* later than this: wait a vblank */
++static unsigned int de33_latch_deferred;	/* vblanks a snapshot was held back */
++static unsigned int de33_latch_forced;		/* written late after LATCH_MAX_DEFER */
++static unsigned int de33_latch_events;		/* flip events sent after the flush */
++static unsigned int de33_latch_events_now;	/* ... already flushed when handed over */
+ module_param(de33_latch_commits, uint, 0444);
+ module_param(de33_latch_coalesced, uint, 0444);
+ module_param(de33_latch_flushes, uint, 0444);
+@@ -310,6 +334,11 @@
+ module_param(de33_latch_line_min, int, 0444);
+ module_param(de33_latch_line_max, int, 0444);
+ module_param(de33_latch_line_active, int, 0444);
++module_param(de33_latch_line_deadline, int, 0444);
++module_param(de33_latch_deferred, uint, 0444);
++module_param(de33_latch_forced, uint, 0444);
++module_param(de33_latch_events, uint, 0444);
++module_param(de33_latch_events_now, uint, 0444);
+ 
+ static void sun50i_mixer_latch_mode_set(struct sun8i_mixer *mixer,
+ 					const struct drm_display_mode *mode)
+@@ -319,22 +348,64 @@
+ 	 * cur_line is zeroed at the start of the vertical sync and counts up
+ 	 * to vtotal; active video starts vsync + back porch lines later.
+ 	 */
++	unsigned int margin = 1;
++	unsigned long flags;
++
++	/* lines a flush may take: LATCH_FLUSH_BUDGET_NS, at most half the window */
++	if (mode->crtc_clock > 0 && mode->crtc_htotal > 0) {
++		u64 ns_line = div_u64((u64)mode->crtc_htotal * 1000000,
++				      mode->crtc_clock);
++
++		if (ns_line)
++			margin = max_t(unsigned int, 1,
++				       DIV_ROUND_UP_ULL(LATCH_FLUSH_BUDGET_NS, ns_line));
++	}
++
++	spin_lock_irqsave(&mixer->latch_lock, flags);
+ 	mixer->line_total = mode->crtc_vtotal;
+ 	mixer->line_active = mode->crtc_vtotal - mode->crtc_vsync_start;
++	mixer->line_deadline = mixer->line_active - min(margin, mixer->line_active / 2);
++	mixer->latch_defer_off = false;
++	spin_unlock_irqrestore(&mixer->latch_lock, flags);
+ 	de33_latch_line_active = mixer->line_active;
++	de33_latch_line_deadline = mixer->line_deadline;
+ 	de33_latch_line_min = -1;
+ 	de33_latch_line_max = -1;
+ }
+ 
++/* send the events of a written-out snapshot, outside the latch lock */
++static void sun50i_mixer_send_events(struct drm_crtc *crtc,
++				     struct list_head *events)
++{
++	struct drm_pending_vblank_event *e, *n;
++	unsigned int count = 0;
++	unsigned long flags;
++
++	if (list_empty(events))
++		return;
++
++	spin_lock_irqsave(&crtc->dev->event_lock, flags);
++	list_for_each_entry_safe(e, n, events, base.link) {
++		list_del_init(&e->base.link);
++		drm_crtc_send_vblank_event(crtc, e);
++		count++;
++	}
++	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
++
++	while (count--)
++		drm_crtc_vblank_put(crtc);
++}
++
+ /*
+  * Write the snapshot out. @cur_line is the TCON scan line at the vblank
+  * interrupt, or -1 for an immediate write with the CRTC off.
+  */
+ static void sun50i_mixer_latch_flush(struct sun8i_mixer *mixer, int cur_line)
+ {
+-	struct drm_crtc *crtc = NULL;
++	struct drm_crtc *crtc = NULL, *ev_crtc;
+ 	unsigned long flags;
+ 	unsigned int words;
++	LIST_HEAD(events);
+ 	u64 ns;
+ 
+ 	spin_lock_irqsave(&mixer->latch_lock, flags);
+@@ -343,6 +414,25 @@
+ 		return;
+ 	}
+ 
++	if (cur_line >= 0 && mixer->line_active &&
++	    (unsigned int)cur_line >= mixer->line_deadline) {
++		/* too late for this blanking: the next vblank, events held */
++		if (!mixer->latch_defer_off &&
++		    mixer->latch_deferred < LATCH_MAX_DEFER) {
++			mixer->latch_deferred++;
++			de33_latch_deferred++;
++			spin_unlock_irqrestore(&mixer->latch_lock, flags);
++			return;
++		}
++		if (mixer->latch_deferred) {
++			de33_latch_forced++;
++			mixer->latch_defer_off = true;
++		}
++	} else if (cur_line >= 0 && mixer->line_active) {
++		mixer->latch_defer_off = false;
++	}
++	mixer->latch_deferred = 0;
++
+ 	ns = ktime_get_ns();
+ 	words = sun50i_planes_flush(mixer->planes_dev, mixer->engine.id);
+ 	words += sun50i_shadow_flush(mixer->shadow, 0, SUN50I_SHADOW_ALL);
+@@ -354,6 +444,8 @@
+ 		mixer->latch_vblank_ref = false;
+ 		crtc = mixer->latch_crtc;
+ 	}
++	ev_crtc = mixer->latch_crtc;
++	list_splice_init(&mixer->latch_events, &events);
+ 
+ 	de33_latch_flushes++;
+ 	if (words > de33_latch_words_max)
+@@ -370,8 +462,13 @@
+ 		if ((unsigned int)cur_line >= mixer->line_active)
+ 			de33_latch_flushes_late++;
+ 	}
++	if (!list_empty(&events))
++		de33_latch_events++;
+ 	spin_unlock_irqrestore(&mixer->latch_lock, flags);
+ 
++	/* the registers are in: now the flip may be reported */
++	if (ev_crtc)
++		sun50i_mixer_send_events(ev_crtc, &events);
+ 	if (crtc)
+ 		drm_crtc_vblank_put(crtc);
+ }
+@@ -384,10 +481,15 @@
+ 	struct sun50i_wb *wb;
+ 	unsigned long flags;
+ 
++	/*
++	 * Under the latch lock: a flush on another CPU (vblank interrupt)
++	 * must not write the planes of one snapshot with the blender of the
++	 * next. Unsynced commits (legacy cursor updates, which do not wait
++	 * for the previous flip) can get here during a flush.
++	 */
++	spin_lock_irqsave(&mixer->latch_lock, flags);
+ 	sun50i_shadow_commit(mixer->shadow, 0, SUN50I_SHADOW_ALL);
+ 	sun50i_planes_commit(mixer->planes_dev, mixer->engine.id);
+-
+-	spin_lock_irqsave(&mixer->latch_lock, flags);
+ 	de33_latch_commits++;
+ 	if (mixer->latch_pending)
+ 		de33_latch_coalesced++;
+@@ -429,6 +531,50 @@
+ 		sun50i_mixer_latch_flush(mixer, -1);
+ }
+ 
++/*
++ * atomic_flush, right after sun8i_mixer_commit(): the event goes with the
++ * snapshot just taken and is sent when that snapshot is written out. If the
++ * vblank interrupt already wrote it (it came between the two calls), the
++ * frame has been on screen since that vblank: send the event now, with that
++ * vblank's count and time.
++ */
++static bool sun50i_mixer_hold_event(struct sunxi_engine *engine,
++				    struct drm_crtc *crtc,
++				    struct drm_pending_vblank_event *event)
++{
++	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
++	unsigned long flags;
++	bool held = false;
++	LIST_HEAD(now);
++
++	if (!mixer->shadow)
++		return false;
++
++	spin_lock_irqsave(&mixer->latch_lock, flags);
++	if (mixer->latch_pending && mixer->latch_crtc == crtc) {
++		list_add_tail(&event->base.link, &mixer->latch_events);
++		held = true;
++	} else {
++		de33_latch_events_now++;
++	}
++	spin_unlock_irqrestore(&mixer->latch_lock, flags);
++
++	if (!held) {
++		list_add_tail(&event->base.link, &now);
++		sun50i_mixer_send_events(crtc, &now);
++	}
++	return true;
++}
++
++/* CRTC going off: nothing scans out, write at once and send the events */
++static void sun50i_mixer_drain(struct sunxi_engine *engine)
++{
++	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
++
++	if (mixer->shadow && READ_ONCE(mixer->latch_pending))
++		sun50i_mixer_latch_flush(mixer, -1);
++}
++
+ /* TCON vblank interrupt, hard IRQ context */
+ static void sun50i_mixer_vblank_quirk(struct sunxi_engine *engine,
+ 				      unsigned int cur_line)
+@@ -766,6 +912,8 @@
+ 	.apply_color_correction	= sun50i_mixer_apply_color_correction,
+ 	.disable_color_correction = sun50i_mixer_disable_color_correction,
+ 	.vblank_quirk		= sun50i_mixer_vblank_quirk,
++	.hold_event		= sun50i_mixer_hold_event,
++	.drain			= sun50i_mixer_drain,
+ };
+ 
+ static const struct regmap_config sun8i_mixer_regmap_config = {
+@@ -962,6 +1110,7 @@
+ 
+ 	if (mixer->cfg->de_type == SUN8I_MIXER_DE33 && !mixer->cfg->uses_rcq) {
+ 		spin_lock_init(&mixer->latch_lock);
++		INIT_LIST_HEAD(&mixer->latch_events);
+ 		mixer->shadow = sun50i_shadow_create(dev, regs,
+ 						     resource_size(res), "display");
+ 		if (IS_ERR(mixer->shadow)) {
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+@@ -294,6 +294,12 @@
+ 	unsigned int			latch_flushed_seq;
+ 	unsigned int			line_active;	/* TCON line where active video starts */
+ 	unsigned int			line_total;
++	/* last TCON line at which a flush still ends inside the blanking */
++	unsigned int			line_deadline;
++	unsigned int			latch_deferred;	/* vblanks this snapshot waited */
++	bool				latch_defer_off; /* last flush forced: don't wait */
++	/* page-flip events of the pending snapshot (sun50i_mixer_hold_event()) */
++	struct list_head		latch_events;
+ 	/* DE33 only: blender and layer CSCs produce BT.601 YCbCr */
+ 	bool				output_yuv;
+ 	/* DE33 write-back connector capturing this mixer (sun50i_wb.c) */
+--- a/drivers/gpu/drm/sun4i/sunxi_engine.h
++++ b/drivers/gpu/drm/sun4i/sunxi_engine.h
+@@ -11,6 +11,7 @@
+ struct drm_device;
+ struct drm_crtc_state;
+ struct drm_display_mode;
++struct drm_pending_vblank_event;
+ 
+ struct sunxi_engine;
+ 
+@@ -127,6 +128,33 @@
+ 	 */
+ 	void (*mode_set)(struct sunxi_engine *engine,
+ 			 const struct drm_display_mode *mode);
++
++	/**
++	 * @hold_event:
++	 *
++	 * For an engine whose registers are written out from the vblank
++	 * interrupt (the H616 DE33 latch): take the page-flip event of the
++	 * commit just made and send it only once that commit's registers
++	 * are in the hardware, so userspace never learns of a flip that has
++	 * not happened yet. Called from atomic_flush after @commit, with a
++	 * vblank reference held for the event; the engine drops it after
++	 * sending. Returns false if the engine does not hold events: the
++	 * caller arms the event as usual.
++	 *
++	 * This function is optional.
++	 */
++	bool (*hold_event)(struct sunxi_engine *engine, struct drm_crtc *crtc,
++			   struct drm_pending_vblank_event *event);
++
++	/**
++	 * @drain:
++	 *
++	 * The CRTC is being turned off: write out any register state still
++	 * waiting for a vblank and send the events held for it.
++	 *
++	 * This function is optional.
++	 */
++	void (*drain)(struct sunxi_engine *engine);
+ };
+ 
+ /**
+@@ -164,6 +192,34 @@
+ }
+ 
+ /**
++ * sunxi_engine_hold_event() - let the engine send a commit's vblank event
++ * @engine:	pointer to the engine
++ * @crtc:	pointer to crtc the engine is associated with
++ * @event:	the event, with a vblank reference held for it
++ *
++ * Returns: true if the engine took the event.
++ */
++static inline bool
++sunxi_engine_hold_event(struct sunxi_engine *engine, struct drm_crtc *crtc,
++			struct drm_pending_vblank_event *event)
++{
++	if (engine->ops && engine->ops->hold_event)
++		return engine->ops->hold_event(engine, crtc, event);
++	return false;
++}
++
++/**
++ * sunxi_engine_drain() - write out pending state before the CRTC goes off
++ * @engine:	pointer to the engine
++ */
++static inline void
++sunxi_engine_drain(struct sunxi_engine *engine)
++{
++	if (engine->ops && engine->ops->drain)
++		engine->ops->drain(engine);
++}
++
++/**
+  * sunxi_engine_layers_init() - Create planes (layers) for the engine
+  * @drm:	pointer to the drm_device for which planes will be created
+  * @engine:	pointer to the engine
