@@ -1,0 +1,232 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 18:00:00 +0000
+Subject: [PATCH] media: cedrus: jpeg: drain on V4L2_DEC_CMD_STOP
+
+JPEG is decoded without requests: the driver parses the image itself,
+so the decoder is used through the stateful decoder interface, and
+GStreamer's v4l2jpegdec (gst-plugins-good) and FFmpeg's v4l2m2m
+decoders autoplug it on the V4L2_PIX_FMT_JPEG source format. At the end
+of the stream, and before each renegotiation, these clients drain the
+decoder with V4L2_DEC_CMD_STOP. cedrus only offers the stateless
+V4L2_DEC_CMD_FLUSH and refuses STOP with -EINVAL; GStreamer then falls
+back to queueing empty source buffers until the capture side reports
+the end of the stream. vb2 turns each empty buffer into a full-length
+one ("use of bytesused == 0 is deprecated"), the JPEG parser refuses
+it, the capture buffer comes back with V4L2_BUF_FLAG_ERROR and a stale
+timestamp, and GStreamer queues the next empty buffer: about 50 failed
+jobs a second ("Failed to setup decoding job: -22") until the pipeline
+is killed, after the picture itself decoded fine.
+
+Implement the stateful drain for JPEG with the mem2mem helpers: STOP
+marks the capture buffer of the last source buffer queued before it
+with V4L2_BUF_FLAG_LAST (or the next capture buffer, empty, when no
+source buffer is pending), after which dequeueing returns -EPIPE; START
+and a restart of the streams resume decoding. The jobs of the other
+codecs never enter the draining state and keep the stateless FLUSH
+command for the capture buffer they hold.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../staging/media/sunxi/cedrus/cedrus_dec.c        |   28 +++++++-
+ .../staging/media/sunxi/cedrus/cedrus_dec.h        |    1 
+ .../drivers/staging/media/sunxi/cedrus/cedrus_hw.c |    7 +-
+ .../staging/media/sunxi/cedrus/cedrus_video.c      |   73 +++++++++++++++++++-
+ 4 files changed, 100 insertions(+), 9 deletions(-)
+
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+@@ -55,6 +55,30 @@
+ 	dev->last_src_pixelformat = ctx->src_fmt.pixelformat;
+ }
+ 
++/*
++ * Return the buffers of the current job and finish it. JPEG is decoded
++ * without requests, like a stateful decoder, and drains on
++ * V4L2_DEC_CMD_STOP: the capture buffer of the last source buffer queued
++ * before the command carries V4L2_BUF_FLAG_LAST, and no job runs after
++ * it until V4L2_DEC_CMD_START or a restart of the streams. The other
++ * codecs never enter the draining state.
++ */
++void cedrus_job_finish(struct cedrus_ctx *ctx, enum vb2_buffer_state state)
++{
++	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
++	struct vb2_v4l2_buffer *src, *dst;
++
++	src = v4l2_m2m_next_src_buf(m2m_ctx);
++	dst = v4l2_m2m_next_dst_buf(m2m_ctx);
++
++	if (src && dst && v4l2_m2m_is_last_draining_src_buf(m2m_ctx, src)) {
++		dst->flags |= V4L2_BUF_FLAG_LAST;
++		v4l2_m2m_mark_stopped(m2m_ctx);
++	}
++
++	v4l2_m2m_buf_done_and_job_finish(ctx->dev->m2m_dev, m2m_ctx, state);
++}
++
+ void cedrus_device_run(void *priv)
+ {
+ 	struct cedrus_ctx *ctx = priv;
+@@ -253,8 +277,6 @@
+ 
+ 		ctx->current_codec->trigger(ctx);
+ 	} else {
+-		v4l2_m2m_buf_done_and_job_finish(ctx->dev->m2m_dev,
+-						 ctx->fh.m2m_ctx,
+-						 VB2_BUF_STATE_ERROR);
++		cedrus_job_finish(ctx, VB2_BUF_STATE_ERROR);
+ 	}
+ }
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_dec.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec.h
+@@ -17,6 +17,7 @@
+ #define _CEDRUS_DEC_H_
+ 
+ void cedrus_device_run(void *priv);
++void cedrus_job_finish(struct cedrus_ctx *ctx, enum vb2_buffer_state state);
+ void cedrus_engine_switch_reset(struct cedrus_ctx *ctx);
+ 
+ #endif
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -28,6 +28,7 @@
+ #include <media/v4l2-mem2mem.h>
+ 
+ #include "cedrus.h"
++#include "cedrus_dec.h"
+ #include "cedrus_hw.h"
+ #include "cedrus_regs.h"
+ 
+@@ -304,8 +305,7 @@
+ 	if (state == VB2_BUF_STATE_DONE && ctx->current_codec->post_process)
+ 		ctx->current_codec->post_process(ctx);
+ 
+-	v4l2_m2m_buf_done_and_job_finish(ctx->dev->m2m_dev, ctx->fh.m2m_ctx,
+-					 state);
++	cedrus_job_finish(ctx, state);
+ 
+ 	return IRQ_HANDLED;
+ }
+@@ -327,8 +327,7 @@
+ 		cedrus_enc_report_layout(dev);
+ 
+ 	reset_control_reset(dev->rstc);
+-	v4l2_m2m_buf_done_and_job_finish(ctx->dev->m2m_dev, ctx->fh.m2m_ctx,
+-					 VB2_BUF_STATE_ERROR);
++	cedrus_job_finish(ctx, VB2_BUF_STATE_ERROR);
+ }
+ 
+ int cedrus_hw_suspend(struct device *device)
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -821,6 +821,57 @@
+ 	return cedrus_g_selection(file, priv, s);
+ }
+ 
++/*
++ * The stateless codecs take V4L2_DEC_CMD_FLUSH, for the capture buffer
++ * they hold. JPEG is decoded without requests and drains like a stateful
++ * decoder: V4L2_DEC_CMD_STOP marks the capture buffer of the last queued
++ * image with V4L2_BUF_FLAG_LAST, V4L2_DEC_CMD_START resumes decoding.
++ * Without it, clients of the stateful decoder interface fall back to
++ * queueing empty source buffers at the end of the stream, which the JPEG
++ * parser refuses one after the other: the client never sees the end of
++ * the stream.
++ */
++static int cedrus_try_decoder_cmd(struct file *file, void *priv,
++				  struct v4l2_decoder_cmd *dc)
++{
++	struct cedrus_ctx *ctx = cedrus_file2ctx(file);
++
++	if (ctx->src_fmt.pixelformat == V4L2_PIX_FMT_JPEG)
++		return v4l2_m2m_ioctl_try_decoder_cmd(file, priv, dc);
++
++	return v4l2_m2m_ioctl_stateless_try_decoder_cmd(file, priv, dc);
++}
++
++static int cedrus_decoder_cmd(struct file *file, void *priv,
++			      struct v4l2_decoder_cmd *dc)
++{
++	struct cedrus_ctx *ctx = cedrus_file2ctx(file);
++	struct v4l2_m2m_ctx *m2m_ctx = ctx->fh.m2m_ctx;
++	int ret;
++
++	if (ctx->src_fmt.pixelformat != V4L2_PIX_FMT_JPEG)
++		return v4l2_m2m_ioctl_stateless_decoder_cmd(file, priv, dc);
++
++	ret = v4l2_m2m_ioctl_try_decoder_cmd(file, priv, dc);
++	if (ret)
++		return ret;
++
++	/* Nothing to drain before the source queue streams. */
++	if (!vb2_is_streaming(&m2m_ctx->out_q_ctx.q))
++		return 0;
++
++	ret = v4l2_m2m_ioctl_decoder_cmd(file, priv, dc);
++	if (ret)
++		return ret;
++
++	if (dc->cmd == V4L2_DEC_CMD_START) {
++		vb2_clear_last_buffer_dequeued(&m2m_ctx->cap_q_ctx.q);
++		v4l2_m2m_try_schedule(m2m_ctx);
++	}
++
++	return 0;
++}
++
+ const struct v4l2_ioctl_ops cedrus_ioctl_ops = {
+ 	.vidioc_querycap		= cedrus_querycap,
+ 
+@@ -850,8 +901,8 @@
+ 	.vidioc_streamon		= v4l2_m2m_ioctl_streamon,
+ 	.vidioc_streamoff		= v4l2_m2m_ioctl_streamoff,
+ 
+-	.vidioc_try_decoder_cmd		= v4l2_m2m_ioctl_stateless_try_decoder_cmd,
+-	.vidioc_decoder_cmd		= v4l2_m2m_ioctl_stateless_decoder_cmd,
++	.vidioc_try_decoder_cmd		= cedrus_try_decoder_cmd,
++	.vidioc_decoder_cmd		= cedrus_decoder_cmd,
+ 
+ 	.vidioc_subscribe_event		= v4l2_ctrl_subscribe_event,
+ 	.vidioc_unsubscribe_event	= v4l2_event_unsubscribe,
+@@ -951,6 +1002,8 @@
+ 	struct cedrus_dev *dev = ctx->dev;
+ 	int ret = 0;
+ 
++	v4l2_m2m_update_start_streaming_state(ctx->fh.m2m_ctx, vq);
++
+ 	if (V4L2_TYPE_IS_OUTPUT(vq->type)) {
+ 		ret = pm_runtime_resume_and_get(dev->dev);
+ 		if (ret < 0)
+@@ -986,6 +1039,8 @@
+ 	}
+ 
+ 	cedrus_queue_cleanup(vq, VB2_BUF_STATE_ERROR);
++
++	v4l2_m2m_update_stop_streaming_state(ctx->fh.m2m_ctx, vq);
+ }
+ 
+ static void cedrus_buf_cleanup(struct vb2_buffer *vb)
+@@ -1002,6 +1057,20 @@
+ 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
+ 	struct cedrus_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
+ 
++	/* A capture buffer queued after the drain completed ends it empty. */
++	if (V4L2_TYPE_IS_CAPTURE(vb->vb2_queue->type) &&
++	    vb2_is_streaming(vb->vb2_queue) &&
++	    v4l2_m2m_dst_buf_is_last(ctx->fh.m2m_ctx)) {
++		unsigned int i;
++
++		for (i = 0; i < vb->num_planes; i++)
++			vb2_set_plane_payload(vb, i, 0);
++
++		vbuf->field = V4L2_FIELD_NONE;
++		v4l2_m2m_last_buffer_done(ctx->fh.m2m_ctx, vbuf);
++		return;
++	}
++
+ 	v4l2_m2m_buf_queue(ctx->fh.m2m_ctx, vbuf);
+ }
+ 
+-- 
+2.55.0
