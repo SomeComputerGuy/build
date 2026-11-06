@@ -1,0 +1,346 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 6 Nov 2026 00:00:00 +0000
+Subject: i2c: mv64xxx: Add I2C target (slave) mode for the Allwinner variant
+
+The TWI engine of the Allwinner SoCs (like the Marvell original) can be
+addressed as an I2C target: TWI_ADDR/TWI_XADDR hold the own 7- or 10-bit
+address, and with BUS_EN and A_ACK set the engine acks it and raises
+INT_FLAG for the address, every data byte and STOP/repeated START,
+stretching SCL until the flag is cleared (H616 user manual v1.0, 9.1.3.5
+and 9.1.6.1-9.1.6.5, status codes 0x60-0xC8). The driver had no
+reg_slave/unreg_slave.
+
+Implement the target side for the Allwinner compatibles (sun4i-a10 /
+sun6i-a31 register layout). reg_target programs the address registers and
+arms TWSIEN|ACK|INTEN; the interrupt loop hands the 0x60-0xC8 states to a
+target FSM that drives the i2c_slave_event backend: WRITE_REQUESTED on
+0x60/0x68/0x70/0x78, WRITE_RECEIVED on 0x80/0x90 (a refusing backend nacks
+the next byte), READ_REQUESTED on 0xA8/0xB0, READ_PROCESSED on 0xB8, STOP
+on 0xA0 and on 0x88/0x98/0xC0/0xC8, after which the engine has left the
+addressed state. ACK stays set, so the host decides a read's length. A
+host transfer of our own that loses arbitration to, or is pre-empted by,
+an own-address match is failed with -EAGAIN so the core retries it. The
+end of a host transfer and hw_init (reset after an error) re-arm the
+listener instead of dropping INTEN, so the engine keeps answering between
+our own transfers. Functionality reports I2C_FUNC_SLAVE for these
+controllers.
+
+Nothing changes without a registered target: the address registers stay
+0, INTEN is still dropped at the end of a transfer, and the Marvell
+variants are untouched.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+
+--- a/drivers/i2c/busses/i2c-mv64xxx.c
++++ b/drivers/i2c/busses/i2c-mv64xxx.c
+@@ -57,6 +57,35 @@
+ #define	MV64XXX_I2C_STATUS_MAST_RD_ADDR_2_NO_ACK	0xe8
+ #define	MV64XXX_I2C_STATUS_NO_STATUS			0xf8
+ 
++/* Ctlr status values while addressed as a target (own address matched) */
++#define	MV64XXX_I2C_STATUS_TGT_WR_ADDR_ACK		0x60
++#define	MV64XXX_I2C_STATUS_TGT_WR_ADDR_LOST_ARB		0x68
++#define	MV64XXX_I2C_STATUS_TGT_GC_ACK			0x70
++#define	MV64XXX_I2C_STATUS_TGT_GC_LOST_ARB		0x78
++#define	MV64XXX_I2C_STATUS_TGT_WR_DATA_ACK		0x80
++#define	MV64XXX_I2C_STATUS_TGT_WR_DATA_NO_ACK		0x88
++#define	MV64XXX_I2C_STATUS_TGT_GC_DATA_ACK		0x90
++#define	MV64XXX_I2C_STATUS_TGT_GC_DATA_NO_ACK		0x98
++#define	MV64XXX_I2C_STATUS_TGT_STOP			0xa0
++#define	MV64XXX_I2C_STATUS_TGT_RD_ADDR_ACK		0xa8
++#define	MV64XXX_I2C_STATUS_TGT_RD_ADDR_LOST_ARB		0xb0
++#define	MV64XXX_I2C_STATUS_TGT_RD_DATA_ACK		0xb8
++#define	MV64XXX_I2C_STATUS_TGT_RD_DATA_NO_ACK		0xc0
++#define	MV64XXX_I2C_STATUS_TGT_RD_LAST_ACK		0xc8
++
++/*
++ * Own-address register: the 7-bit address in [7:1], or 11110 + addr[9:8]
++ * with addr[7:0] in the extended address register. Bit 0 is general call.
++ */
++#define	MV64XXX_I2C_ADDR_7BIT(addr)			((addr) << 1)
++#define	MV64XXX_I2C_ADDR_10BIT_HI(addr)			(0xf0 | (((addr) >> 7) & 0x6))
++#define	MV64XXX_I2C_ADDR_10BIT_LO(addr)			((addr) & 0xff)
++
++/* Control bits that keep the engine listening for its own address */
++#define	MV64XXX_I2C_TGT_CNTL_BITS	(MV64XXX_I2C_REG_CONTROL_TWSIEN | \
++					 MV64XXX_I2C_REG_CONTROL_ACK | \
++					 MV64XXX_I2C_REG_CONTROL_INTEN)
++
+ /* Register defines (I2C bridge) */
+ #define	MV64XXX_I2C_REG_TX_DATA_LO			0xc0
+ #define	MV64XXX_I2C_REG_TX_DATA_HI			0xc4
+@@ -153,6 +182,9 @@
+ 	struct i2c_bus_recovery_info	rinfo;
+ 	bool			atomic;
+ 	bool			rtpm_pinned;
++	/* Allwinner variant: the engine can be addressed as a target */
++	bool			has_target;
++	struct i2c_client	*target;
+ };
+ 
+ static struct mv64xxx_i2c_regs mv64xxx_i2c_regs_mv64xxx = {
+@@ -202,6 +234,175 @@
+  *****************************************************************************
+  */
+ 
++#if IS_ENABLED(CONFIG_I2C_SLAVE)
++/*
++ * Target (slave) mode, H616 user manual 9.1.3.5/9.1.6: with TWSIEN and ACK
++ * set the engine answers its own address (ADDR/XADDR registers), raises
++ * IFLG for every byte and stretches SCL until IFLG is cleared. ACK is kept
++ * set, so the host decides the length of a read; STOP or a repeated START
++ * is reported as 0xa0. Called with drv_data->lock held.
++ */
++static void
++mv64xxx_i2c_target_arm(struct mv64xxx_i2c_data *drv_data)
++{
++	struct i2c_client *client = drv_data->target;
++	u32 addr, ext_addr = 0;
++
++	if (client->flags & I2C_CLIENT_TEN) {
++		addr = MV64XXX_I2C_ADDR_10BIT_HI(client->addr);
++		ext_addr = MV64XXX_I2C_ADDR_10BIT_LO(client->addr);
++	} else {
++		addr = MV64XXX_I2C_ADDR_7BIT(client->addr);
++	}
++
++	writel(addr, drv_data->reg_base + drv_data->reg_offsets.addr);
++	writel(ext_addr, drv_data->reg_base + drv_data->reg_offsets.ext_addr);
++
++	if (drv_data->state == MV64XXX_I2C_STATE_IDLE) {
++		drv_data->cntl_bits = MV64XXX_I2C_TGT_CNTL_BITS;
++		writel(drv_data->cntl_bits,
++		       drv_data->reg_base + drv_data->reg_offsets.control);
++	}
++}
++
++static bool
++mv64xxx_i2c_target_status(u32 status)
++{
++	return status >= MV64XXX_I2C_STATUS_TGT_WR_ADDR_ACK &&
++	       status <= MV64XXX_I2C_STATUS_TGT_RD_LAST_ACK;
++}
++
++static void
++mv64xxx_i2c_target_fsm(struct mv64xxx_i2c_data *drv_data, u32 status)
++{
++	struct i2c_client *client = drv_data->target;
++	u8 val = 0;
++
++	/*
++	 * Addressed while a host transfer of ours was pending (0x68/0x78/
++	 * 0xb0 arbitration lost, or START still waiting for a free bus):
++	 * fail that transfer, the core retries it.
++	 */
++	if (drv_data->state != MV64XXX_I2C_STATE_IDLE) {
++		drv_data->state = MV64XXX_I2C_STATE_IDLE;
++		drv_data->rc = -EAGAIN;
++		drv_data->block = 0;
++		wake_up(&drv_data->waitq);
++	}
++
++	drv_data->cntl_bits = MV64XXX_I2C_TGT_CNTL_BITS;
++
++	switch (status) {
++	case MV64XXX_I2C_STATUS_TGT_WR_ADDR_ACK: /* 0x60 */
++	case MV64XXX_I2C_STATUS_TGT_WR_ADDR_LOST_ARB: /* 0x68 */
++	case MV64XXX_I2C_STATUS_TGT_GC_ACK: /* 0x70 */
++	case MV64XXX_I2C_STATUS_TGT_GC_LOST_ARB: /* 0x78 */
++		i2c_slave_event(client, I2C_SLAVE_WRITE_REQUESTED, &val);
++		break;
++
++	case MV64XXX_I2C_STATUS_TGT_WR_DATA_ACK: /* 0x80 */
++	case MV64XXX_I2C_STATUS_TGT_GC_DATA_ACK: /* 0x90 */
++		val = readl(drv_data->reg_base + drv_data->reg_offsets.data);
++		/* The byte is already acked; a refusing backend nacks the next one */
++		if (i2c_slave_event(client, I2C_SLAVE_WRITE_RECEIVED, &val))
++			drv_data->cntl_bits &= ~MV64XXX_I2C_REG_CONTROL_ACK;
++		break;
++
++	case MV64XXX_I2C_STATUS_TGT_WR_DATA_NO_ACK: /* 0x88 */
++	case MV64XXX_I2C_STATUS_TGT_GC_DATA_NO_ACK: /* 0x98 */
++		/* Nacked byte, the engine leaves the addressed state */
++		readl(drv_data->reg_base + drv_data->reg_offsets.data);
++		i2c_slave_event(client, I2C_SLAVE_STOP, &val);
++		break;
++
++	case MV64XXX_I2C_STATUS_TGT_RD_ADDR_ACK: /* 0xa8 */
++	case MV64XXX_I2C_STATUS_TGT_RD_ADDR_LOST_ARB: /* 0xb0 */
++		i2c_slave_event(client, I2C_SLAVE_READ_REQUESTED, &val);
++		writel(val, drv_data->reg_base + drv_data->reg_offsets.data);
++		break;
++
++	case MV64XXX_I2C_STATUS_TGT_RD_DATA_ACK: /* 0xb8 */
++		i2c_slave_event(client, I2C_SLAVE_READ_PROCESSED, &val);
++		writel(val, drv_data->reg_base + drv_data->reg_offsets.data);
++		break;
++
++	case MV64XXX_I2C_STATUS_TGT_STOP: /* 0xa0 */
++	case MV64XXX_I2C_STATUS_TGT_RD_DATA_NO_ACK: /* 0xc0 */
++	case MV64XXX_I2C_STATUS_TGT_RD_LAST_ACK: /* 0xc8 */
++		i2c_slave_event(client, I2C_SLAVE_STOP, &val);
++		break;
++	}
++
++	writel(drv_data->cntl_bits,
++	       drv_data->reg_base + drv_data->reg_offsets.control);
++}
++
++static int
++mv64xxx_i2c_reg_target(struct i2c_client *client)
++{
++	struct mv64xxx_i2c_data *drv_data = i2c_get_adapdata(client->adapter);
++	unsigned long flags;
++	int rc;
++
++	if (!drv_data->has_target)
++		return -EOPNOTSUPP;
++
++	rc = pm_runtime_resume_and_get(&client->adapter->dev);
++	if (rc)
++		return rc;
++
++	spin_lock_irqsave(&drv_data->lock, flags);
++	if (drv_data->target) {
++		spin_unlock_irqrestore(&drv_data->lock, flags);
++		pm_runtime_put_autosuspend(&client->adapter->dev);
++		return -EBUSY;
++	}
++	drv_data->target = client;
++	mv64xxx_i2c_target_arm(drv_data);
++	spin_unlock_irqrestore(&drv_data->lock, flags);
++
++	return 0;
++}
++
++static int
++mv64xxx_i2c_unreg_target(struct i2c_client *client)
++{
++	struct mv64xxx_i2c_data *drv_data = i2c_get_adapdata(client->adapter);
++	unsigned long flags;
++
++	spin_lock_irqsave(&drv_data->lock, flags);
++	drv_data->target = NULL;
++	writel(0, drv_data->reg_base + drv_data->reg_offsets.addr);
++	writel(0, drv_data->reg_base + drv_data->reg_offsets.ext_addr);
++	if (drv_data->state == MV64XXX_I2C_STATE_IDLE) {
++		drv_data->cntl_bits = MV64XXX_I2C_REG_CONTROL_TWSIEN;
++		writel(drv_data->cntl_bits,
++		       drv_data->reg_base + drv_data->reg_offsets.control);
++	}
++	spin_unlock_irqrestore(&drv_data->lock, flags);
++
++	pm_runtime_put_autosuspend(&client->adapter->dev);
++
++	return 0;
++}
++#else
++static inline void
++mv64xxx_i2c_target_arm(struct mv64xxx_i2c_data *drv_data)
++{
++}
++
++static inline bool
++mv64xxx_i2c_target_status(u32 status)
++{
++	return false;
++}
++
++static inline void
++mv64xxx_i2c_target_fsm(struct mv64xxx_i2c_data *drv_data, u32 status)
++{
++}
++#endif /* CONFIG_I2C_SLAVE */
++
+ /* Reset hardware and initialize FSM */
+ static void
+ mv64xxx_i2c_hw_init(struct mv64xxx_i2c_data *drv_data)
+@@ -228,6 +429,9 @@
+ 		udelay(5);
+ 
+ 	drv_data->state = MV64XXX_I2C_STATE_IDLE;
++
++	if (drv_data->target)
++		mv64xxx_i2c_target_arm(drv_data);
+ }
+ 
+ static void
+@@ -411,7 +615,9 @@
+ 	case MV64XXX_I2C_ACTION_RCV_DATA_STOP:
+ 		drv_data->msg->buf[drv_data->byte_posn++] =
+ 			readl(drv_data->reg_base + drv_data->reg_offsets.data);
+-		if (!drv_data->atomic)
++		if (drv_data->target)
++			drv_data->cntl_bits |= MV64XXX_I2C_TGT_CNTL_BITS;
++		else if (!drv_data->atomic)
+ 			drv_data->cntl_bits &= ~MV64XXX_I2C_REG_CONTROL_INTEN;
+ 		writel(drv_data->cntl_bits | MV64XXX_I2C_REG_CONTROL_STOP,
+ 			drv_data->reg_base + drv_data->reg_offsets.control);
+@@ -430,7 +636,9 @@
+ 		drv_data->rc = -EIO;
+ 		fallthrough;
+ 	case MV64XXX_I2C_ACTION_SEND_STOP:
+-		if (!drv_data->atomic)
++		if (drv_data->target)
++			drv_data->cntl_bits |= MV64XXX_I2C_TGT_CNTL_BITS;
++		else if (!drv_data->atomic)
+ 			drv_data->cntl_bits &= ~MV64XXX_I2C_REG_CONTROL_INTEN;
+ 		writel(drv_data->cntl_bits | MV64XXX_I2C_REG_CONTROL_STOP,
+ 			drv_data->reg_base + drv_data->reg_offsets.control);
+@@ -530,8 +738,12 @@
+ 			ndelay(100);
+ 
+ 		status = readl(drv_data->reg_base + drv_data->reg_offsets.status);
+-		mv64xxx_i2c_fsm(drv_data, status);
+-		mv64xxx_i2c_do_action(drv_data);
++		if (drv_data->target && mv64xxx_i2c_target_status(status)) {
++			mv64xxx_i2c_target_fsm(drv_data, status);
++		} else {
++			mv64xxx_i2c_fsm(drv_data, status);
++			mv64xxx_i2c_do_action(drv_data);
++		}
+ 
+ 		if (drv_data->irq_clear_inverted)
+ 			writel(drv_data->cntl_bits | MV64XXX_I2C_REG_CONTROL_IFLG,
+@@ -743,7 +955,13 @@
+ static u32
+ mv64xxx_i2c_functionality(struct i2c_adapter *adap)
+ {
+-	return I2C_FUNC_I2C | I2C_FUNC_10BIT_ADDR | I2C_FUNC_SMBUS_EMUL;
++	struct mv64xxx_i2c_data *drv_data = i2c_get_adapdata(adap);
++	u32 func = I2C_FUNC_I2C | I2C_FUNC_10BIT_ADDR | I2C_FUNC_SMBUS_EMUL;
++
++	if (IS_ENABLED(CONFIG_I2C_SLAVE) && drv_data->has_target)
++		func |= I2C_FUNC_SLAVE;
++
++	return func;
+ }
+ 
+ static int
+@@ -798,6 +1016,10 @@
+ 	.xfer = mv64xxx_i2c_xfer,
+ 	.xfer_atomic = mv64xxx_i2c_xfer_atomic,
+ 	.functionality = mv64xxx_i2c_functionality,
++#if IS_ENABLED(CONFIG_I2C_SLAVE)
++	.reg_target = mv64xxx_i2c_reg_target,
++	.unreg_target = mv64xxx_i2c_unreg_target,
++#endif
+ };
+ 
+ /*
+@@ -875,8 +1097,11 @@
+ 		bus_freq = I2C_MAX_STANDARD_MODE_FREQ; /* 100kHz by default */
+ 
+ 	if (of_device_is_compatible(np, "allwinner,sun4i-a10-i2c") ||
+-	    of_device_is_compatible(np, "allwinner,sun6i-a31-i2c"))
++	    of_device_is_compatible(np, "allwinner,sun6i-a31-i2c")) {
+ 		drv_data->clk_n_base_0 = true;
++		/* TWI_ADDR/TWI_XADDR and the 0x60-0xc8 target states */
++		drv_data->has_target = true;
++	}
+ 
+ 	if (!mv64xxx_find_baud_factors(drv_data, bus_freq, tclk)) {
+ 		rc = -EINVAL;

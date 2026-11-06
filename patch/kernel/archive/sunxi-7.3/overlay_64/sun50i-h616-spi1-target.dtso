@@ -1,0 +1,50 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * SPI1 as an SPI target (slave) controller: an external SPI host drives
+ * the bus, the board answers. Single-bit PIO transfers, sized by the host
+ * (spi-sun6i target mode, needs the "spi: sun6i: Add SPI target (slave)
+ * mode" patch; CONFIG_SPI_SLAVE).
+ *
+ * Orange Pi Zero2, 26-pin header:
+ *   pin 23 PH6  SPI1_CLK   (input from the host)
+ *   pin 19 PH7  SPI1_MOSI  (input from the host)
+ *   pin 21 PH8  SPI1_MISO  (output to the host)
+ *   pin 3   PH5  SPI1_CS0   (input from the host, active low)
+ *
+ * The controller registers as /sys/class/spi_slave/spi1 (alias spi1) and
+ * takes its protocol handler from user space, for example
+ *   echo spidev > /sys/class/spi_slave/spi1/slave      -> /dev/spidev1.0
+ *   echo spi-slave-time > /sys/class/spi_slave/spi1/slave
+ *   echo "(null)" > /sys/class/spi_slave/spi1/slave    (remove it)
+ * The handler's spi-max-frequency is the host clock to expect (spidev:
+ * SPI_IOC_WR_MAX_SPEED_HZ or the per-transfer speed_hz).
+ *
+ * Conflicts: spidev1_*, spi-spidev (SPI1 host), uart2-ph (PH5-PH8),
+ * i2c3-ph (PH5), i2c4-ph (PH6/PH7), i2s3-ph (PH5-PH9). A loopback test
+ * host is the spi-gpio-pc overlay (four jumpers, see there).
+ */
+
+/ {
+	compatible = "allwinner,sun50i-h616", "allwinner,sun50i-h618";
+
+	fragment@0 {
+		target-path = "/aliases";
+		__overlay__ {
+			spi1 = "/soc/spi@5011000";
+		};
+	};
+
+	fragment@1 {
+		target = <&spi1>;
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&spi1_pins>, <&spi1_cs0_pin>;
+			spi-slave;
+			status = "okay";
+		};
+	};
+};

@@ -1,0 +1,57 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * TWI3 on the 26-pin header as an I2C target (slave) device: the board
+ * answers at address 0x64 as a 256-byte 24C02 EEPROM (i2c-slave-eeprom
+ * backend, CONFIG_I2C_SLAVE_EEPROM; memory file
+ * /sys/bus/i2c/devices/3-1064/slave-eeprom). Needs the "i2c: mv64xxx: Add
+ * I2C target (slave) mode for the Allwinner variant" patch. The controller
+ * still works as an I2C host for other devices on the same bus (i2c-3).
+ *
+ * Orange Pi Zero2, 26-pin header:
+ *   pin 5  PH4  TWI3_SCK
+ *   pin 3  PH5  TWI3_SDA
+ * The pins get the SoC pull-ups, for a host side without its own.
+ *
+ * Loopback test with another TWI of the same board as the host, two
+ * jumpers: i2c2-ph overlay (PH2 pin 8 SCK, PH3 pin 10 SDA):
+ *   pin 5 PH4 <-> pin 8 PH2,  pin 3 PH5 <-> pin 10 PH3
+ * then e.g. i2cset -y 2 0x64 0x00 0x5a; i2cget -y 2 0x64 0x00 -> 0x5a.
+ *
+ * Conflicts: i2c3-ph (same bus, use one), spdif-out (PH4), spidev1_* /
+ * spi1-target / uart2-ph / i2s3-ph (PH5).
+ */
+
+/ {
+	compatible = "allwinner,sun50i-h616", "allwinner,sun50i-h618";
+
+	fragment@0 {
+		target = <&pio>;
+		__overlay__ {
+			i2c3_ph_pu_pins: i2c3-ph-pu-pins {
+				pins = "PH4", "PH5";
+				function = "i2c3";
+				bias-pull-up;
+			};
+		};
+	};
+
+	fragment@1 {
+		target = <&i2c3>;
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <0>;
+			pinctrl-names = "default";
+			pinctrl-0 = <&i2c3_ph_pu_pins>;
+			clock-frequency = <100000>;
+			status = "okay";
+
+			eeprom@64 {
+				compatible = "slave-24c02";
+				/* 0x64 | I2C_OWN_SLAVE_ADDRESS (bit 30) */
+				reg = <0x40000064>;
+			};
+		};
+	};
+};
