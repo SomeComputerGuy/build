@@ -13,13 +13,17 @@
  *   pin 21 PH8  SPI1_MISO  (output to the host)
  *   pin 3   PH5  SPI1_CS0   (input from the host, active low)
  *
- * The controller registers as /sys/class/spi_slave/spi1 (alias spi1) and
- * takes its protocol handler from user space, for example
- *   echo spidev > /sys/class/spi_slave/spi1/slave      -> /dev/spidev1.0
- *   echo spi-slave-time > /sys/class/spi_slave/spi1/slave
+ * The controller registers as /sys/class/spi_slave/spi1 (alias spi1) with
+ * the spidev protocol handler on it (child node "slave", the Armbian
+ * "armbian,spi-dev" compatible): /dev/spidev1.0 at boot. The handler can
+ * be swapped from user space:
  *   echo "(null)" > /sys/class/spi_slave/spi1/slave    (remove it)
- * The handler's spi-max-frequency is the host clock to expect (spidev:
- * SPI_IOC_WR_MAX_SPEED_HZ or the per-transfer speed_hz).
+ *   echo spi-dev > /sys/class/spi_slave/spi1/slave     -> /dev/spidev1.0
+ *   echo spi-slave-time > /sys/class/spi_slave/spi1/slave
+ * ("spidev" is not a name the spidev driver matches: it binds by its
+ * spi_device_id table, where Armbian's entry is "spi-dev".) The speed
+ * handed to spidev (SPI_IOC_WR_MAX_SPEED_HZ or the per-transfer speed_hz)
+ * is the host clock to expect.
  *
  * Conflicts: spidev1_*, spi-spidev (SPI1 host), uart2-ph (PH5-PH8),
  * i2c3-ph (PH5), i2c4-ph (PH6/PH7), i2s3-ph (PH5-PH9). A loopback test
@@ -39,12 +43,14 @@
 	fragment@1 {
 		target = <&spi1>;
 		__overlay__ {
-			#address-cells = <1>;
-			#size-cells = <0>;
 			pinctrl-names = "default";
 			pinctrl-0 = <&spi1_pins>, <&spi1_cs0_pin>;
 			spi-slave;
 			status = "okay";
+
+			slave {
+				compatible = "armbian,spi-dev";
+			};
 		};
 	};
 };
