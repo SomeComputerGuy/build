@@ -1,0 +1,136 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 22:00:00 +0000
+Subject: drm/sun4i: de33 writeback: Fail a capture that ran into the next
+ snapshot
+
+A capture that is not finished at the vblank after its start is not
+always a slow write-out: under a 4K decode plus a memcpy load the unit
+sometimes begins recording only at the frame after the one it was
+started for. Six such captures in 1800 flips (runner job 60) held the
+next commit's picture, uniform over the whole frame, with a good
+fence, although that commit was made several milliseconds after the
+captured commit's flip event and its own event came one vblank later:
+the scan-out was right, the capture was one frame late. Each was the
+only capture busy at the next vblank in its run (de33_wb_busy_frames).
+
+Starting a job only while its snapshot is on screen does not cover
+this, the frame the unit records is chosen later. Mark a running
+capture whenever another snapshot is on screen at a vblank at which it
+is not finished, and fail it with -EIO (de33_wb_lost, and
+de33_wb_replaced) once it ends, as a job whose picture was replaced
+before it could start already is. While the snapshot is unchanged a
+late frame is the same picture and the capture stays good.
+
+Record the start line of the first captures that were busy and that
+finished at the next vblank (de33_wb_busy_start_line_min,
+de33_wb_quick_start_line_max), to tell whether late starts follow the
+interrupt latency.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/gpu/drm/sun4i/sun50i_wb.c
++++ b/drivers/gpu/drm/sun4i/sun50i_wb.c
+@@ -200,6 +200,12 @@
+ 	/* the mixer snapshot holding this job's commit (sun50i_wb_arm()) */
+ 	bool			armed;
+ 	unsigned int		latch_seq;
++	/*
++	 * Another snapshot was on screen at a vblank at which the running
++	 * capture was not finished: the unit may be recording that frame.
++	 */
++	bool			replaced;
++	int			start_line;	/* TCON line at the start */
+ 	unsigned int		tries;		/* captures started */
+ 	unsigned int		deferred;	/* starts postponed */
+ 	int			status;
+@@ -228,7 +234,10 @@
+  * repeated on the next frame after one, starts postponed because the vblank
+  * interrupt came with the beam already in active video (and the latest TCON
+  * line seen at a start), and jobs failed because the picture they were to
+- * capture had been replaced before a capture could succeed.
++ * capture had been replaced before a capture could succeed (also counted:
++ * de33_wb_replaced, the captures among them that were running while
++ * another snapshot went on screen). Start lines: the lowest of captures
++ * still busy at the next vblank, the highest of captures finished there.
+  */
+ static unsigned int de33_wb_jobs;
+ static unsigned int de33_wb_done;
+@@ -242,6 +251,9 @@
+ static unsigned int de33_wb_deferred;
+ static unsigned int de33_wb_lost;
+ static int de33_wb_start_line_max = -1;
++static unsigned int de33_wb_replaced;
++static int de33_wb_busy_start_line_min = -1;
++static int de33_wb_quick_start_line_max = -1;
+ module_param(de33_wb_jobs, uint, 0444);
+ module_param(de33_wb_done, uint, 0444);
+ module_param(de33_wb_failed, uint, 0444);
+@@ -254,6 +266,9 @@
+ module_param(de33_wb_deferred, uint, 0444);
+ module_param(de33_wb_lost, uint, 0444);
+ module_param(de33_wb_start_line_max, int, 0444);
++module_param(de33_wb_replaced, uint, 0444);
++module_param(de33_wb_busy_start_line_min, int, 0444);
++module_param(de33_wb_quick_start_line_max, int, 0444);
+ 
+ static inline struct sun50i_wb *
+ connector_to_sun50i_wb(struct drm_connector *connector)
+@@ -567,6 +582,15 @@
+ 		de33_wb_status_last = sts;
+ 		if (sts & SUN50I_WB_STATUS_FINISH) {
+ 			status = 0;
++			if (!job->busy_frames &&
++			    job->start_line > de33_wb_quick_start_line_max)
++				de33_wb_quick_start_line_max = job->start_line;
++			if (job->replaced) {
++				/* may hold the later snapshot's picture */
++				status = -EIO;
++				de33_wb_replaced++;
++				de33_wb_lost++;
++			}
+ 		} else if (sts & (SUN50I_WB_STATUS_OVERFLOW |
+ 				  SUN50I_WB_STATUS_TIMEOUT)) {
+ 			status = -EIO;
+@@ -578,7 +602,20 @@
+ 		} else if (++job->busy_frames > SUN50I_WB_MAX_BUSY_FRAMES) {
+ 			status = -ETIMEDOUT;
+ 		} else {
+-			/* the previous frame's write-out is not done yet */
++			/*
++			 * Not done: the write-out is slow, or the capture began
++			 * a frame after its start (seen under VE + DRAM load,
++			 * runner job 60: such a job recorded the next commit's
++			 * picture). From here on it may be recording the frame
++			 * now starting, so it is its own only while that frame
++			 * is still its snapshot.
++			 */
++			if (job->busy_frames == 1 &&
++			    (de33_wb_busy_start_line_min < 0 ||
++			     job->start_line < de33_wb_busy_start_line_min))
++				de33_wb_busy_start_line_min = job->start_line;
++			if (flushed != job->latch_seq)
++				job->replaced = true;
+ 			de33_wb_busy_frames++;
+ 			job = NULL;
+ 		}
+@@ -588,7 +625,8 @@
+ 				       wb->regs + SUN50I_WB_STATUS);
+ 			sun50i_wb_stop(wb);
+ 			wb->running = NULL;
+-			if (status == -EIO && job->tries < SUN50I_WB_MAX_TRIES) {
++			if (status == -EIO && !job->replaced &&
++			    job->tries < SUN50I_WB_MAX_TRIES) {
+ 				/* again, from the head of the queue, below */
+ 				job->busy_frames = 0;
+ 				list_add(&job->list, &wb->pending);
+@@ -633,6 +671,8 @@
+ 		list_del(&job->list);
+ 		wb->running = job;
+ 		job->tries++;
++		job->start_line = cur_line;
++		job->busy_frames = 0;
+ 		if ((int)cur_line > de33_wb_start_line_max)
+ 			de33_wb_start_line_max = cur_line;
+ 		sun50i_wb_start(wb, job);
