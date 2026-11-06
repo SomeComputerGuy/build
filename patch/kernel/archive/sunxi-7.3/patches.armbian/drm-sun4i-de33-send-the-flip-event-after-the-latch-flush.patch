@@ -14,7 +14,11 @@ Three holes in the DE33 vblank register latch:
   the event (new sunxi_engine_ops.hold_event) and sends it right after
   the flush that writes its commit, with that vblank's count and time.
   A new drain op writes out and sends what is left when the CRTC goes
-  off.
+  off. sun4i_crtc_atomic_begin() moves the event to scrtc->event for
+  sun4i_tcon_finish_page_flip(), which also runs before the
+  vblank_quirk: it leaves the event in the state for an engine that
+  holds events, so every flip event (atomic, legacy page_flip and the
+  helper's internal one) reaches atomic_flush.
 
 - The snapshot (process context) took the planes and the blender shadow
   one after the other outside the latch lock, the flush (vblank IRQ) the
@@ -47,7 +51,23 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
 --- a/drivers/gpu/drm/sun4i/sun4i_crtc.c
 +++ b/drivers/gpu/drm/sun4i/sun4i_crtc.c
-@@ -96,12 +96,25 @@
+@@ -70,7 +70,14 @@
+ 	struct sunxi_engine *engine = scrtc->engine;
+ 	unsigned long flags;
+ 
+-	if (crtc->state->event) {
++	/*
++	 * The TCON interrupt sends this event (sun4i_tcon_finish_page_flip())
++	 * before the engine's vblank_quirk. An engine that writes its
++	 * registers out from that quirk (DE33 latch) takes the event in
++	 * atomic_flush instead, with the snapshot of this commit, and sends
++	 * it after the write: leave it in the state for atomic_flush.
++	 */
++	if (crtc->state->event && !sunxi_engine_holds_events(engine)) {
+ 		WARN_ON(drm_crtc_vblank_get(crtc) != 0);
+ 
+ 		spin_lock_irqsave(&dev->event_lock, flags);
+@@ -96,12 +103,25 @@
  	if (event) {
  		crtc->state->event = NULL;
  
@@ -78,7 +98,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	}
  
  	if (crtc->state->color_mgmt_changed) {
-@@ -129,6 +142,9 @@
+@@ -129,6 +149,9 @@
  
  	sun4i_tcon_set_status(scrtc->tcon, encoder, false);
  
@@ -462,7 +482,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  };
  
  /**
-@@ -164,6 +192,34 @@
+@@ -164,6 +192,46 @@
  }
  
  /**
@@ -480,6 +500,18 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +	if (engine->ops && engine->ops->hold_event)
 +		return engine->ops->hold_event(engine, crtc, event);
 +	return false;
++}
++
++/**
++ * sunxi_engine_holds_events() - does the engine send the vblank events itself
++ * @engine:	pointer to the engine
++ *
++ * Returns: true if atomic_flush hands the commit's event to @hold_event.
++ */
++static inline bool
++sunxi_engine_holds_events(struct sunxi_engine *engine)
++{
++	return engine->ops && engine->ops->hold_event;
 +}
 +
 +/**
