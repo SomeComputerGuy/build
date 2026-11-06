@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 08:10:00 +0000
+Subject: [PATCH] media: cedrus: enc: put at most 24 bits at a time
+
+Every stream of the first H616 encodes that completed (runner job 35,
+kernel c31) was undecodable: no Annex B start code anywhere, and an SPS
+that ended right after timing_info_present_flag. Both are 32-bit puts:
+the core writes the start code as one u(32) and num_units_in_tick and
+time_scale as u(32) each, and the engine's bit writer drops a 32-bit put
+without a trace. Everything else was intact: with the start codes and the
+two timing fields put back on the host, all four streams decode with
+ffmpeg (30 I pictures at 1280x720: PSNR-Y 49.2 dB; I+P at 1280x720:
+47.6 dB; 1920x1080 I: 53.9 dB, I+P: 44.4 dB).
+
+The vendor library and the older drivers (jemk's H3 encoder, the T527
+driver) never put more than 24 bits at once; Bootlin's V3s driver puts a
+32-bit value byte by byte. Split every put into pieces of at most 24 bits,
+most significant first, and mask each piece to its width.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -77,29 +77,48 @@
+ 	h264_ctx->eptb_disabled = disable;
+ }
+ 
++/*
++ * The most bits the bit writer takes in one put. A put of 32 bits is
++ * dropped without a trace (the Annex B start codes and the u(32) VUI timing
++ * fields were missing from every stream of job 35, the rest was intact);
++ * the vendor library and the older drivers never put more than 24 at once
++ * (a start code is 24 zero bits, then 0x100 and the NAL header in 16).
++ */
++#define CEDRUS_ENC_PUT_BITS_MAX		24
++
+ static int cedrus_enc_h264_put_bits(struct v4l2_h264_enc_rbsp *rbsp,
+ 				    u32 value, unsigned char bits_count)
+ {
+ 	struct cedrus_ctx *ctx = rbsp->private_data;
+ 	struct cedrus_dev *dev = ctx->dev;
++	unsigned int chunk;
+ 	int ret;
+ 
+ 	if (bits_count > 32)
+ 		return -EINVAL;
+ 
+-	ret = cedrus_enc_poll(dev, VE_ENC_AVC_STATUS,
+-			      VE_ENC_AVC_STATUS_PUT_BITS_READY);
+-	if (ret)
+-		return ret;
+-
+-	cedrus_write(dev, VE_ENC_AVC_PUTBITSDATA, value);
+-	cedrus_write(dev, VE_ENC_AVC_STARTTRIG,
+-		     VE_ENC_AVC_STARTTRIG_ENCODE_MODE_H264 |
+-		     VE_ENC_AVC_STARTTRIG_NUM_BITS(bits_count) |
+-		     VE_ENC_AVC_STARTTRIG_TYPE_PUT_BITS);
++	/* Most significant bits first, in puts of at most 24 bits. */
++	while (bits_count) {
++		chunk = min_t(unsigned int, bits_count,
++			      CEDRUS_ENC_PUT_BITS_MAX);
++		bits_count -= chunk;
++
++		ret = cedrus_enc_poll(dev, VE_ENC_AVC_STATUS,
++				      VE_ENC_AVC_STATUS_PUT_BITS_READY);
++		if (ret)
++			return ret;
++
++		cedrus_write(dev, VE_ENC_AVC_PUTBITSDATA,
++			     (value >> bits_count) & GENMASK(chunk - 1, 0));
++		cedrus_write(dev, VE_ENC_AVC_STARTTRIG,
++			     VE_ENC_AVC_STARTTRIG_ENCODE_MODE_H264 |
++			     VE_ENC_AVC_STARTTRIG_NUM_BITS(chunk) |
++			     VE_ENC_AVC_STARTTRIG_TYPE_PUT_BITS);
++
++		/* The core leaves the accounting to the operation. */
++		rbsp->bits_count += chunk;
++	}
+ 
+-	/* The core leaves the accounting to the operation. */
+-	rbsp->bits_count += bits_count;
+ 	rbsp->bit_offset = rbsp->bits_count % 8;
+ 
+ 	return 0;
