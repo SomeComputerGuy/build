@@ -244,6 +244,13 @@ function artifact_kernel_prepare_version() {
 		[[ -n "${common_version_suffix}" ]] && artifact_version+="-${common_version_suffix}"
 	fi
 
+	# Optional "<mainline>+<board>.<rev>" package version (e.g. 7.3.1+opiz2.1) instead of the
+	# Armbian REVISION, for boards that ship their own kernel series. Set KERNEL_PACKAGE_VERSION_TAG
+	# (e.g. "opiz2.1") in the build config; unset keeps the standard Armbian versioning.
+	if [[ -n "${KERNEL_PACKAGE_VERSION_TAG}" && -n "${GIT_INFO_KERNEL[MAKEFILE_VERSION]}" ]]; then
+		artifact_final_version_reversioned="${GIT_INFO_KERNEL[MAKEFILE_VERSION]}+${KERNEL_PACKAGE_VERSION_TAG}" # outer scope
+	fi
+
 	declare -a reasons=(
 		"version \"${GIT_INFO_KERNEL[MAKEFILE_FULL_VERSION]}\""
 		"git revision \"${GIT_INFO_KERNEL[SHA1]}\""
