@@ -1,0 +1,253 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 18:00:00 +0000
+Subject: drm/sun4i: de33 writeback: Repeat a capture that lost data to memory
+
+A capture ends with the OVERFLOW or TIMEOUT status bit set when the
+unit could not write its output to DRAM in time: it shares the memory
+with the scan-out and the other masters, and a 4K H.265 decode into
+linear NV12 running beside it was enough to make it drop the odd frame
+(writeback fence -EIO on 2-3 of 12 captures, never on the next one).
+The picture is fine, only its copy is incomplete, and the job was
+failed.
+
+While the registers on screen are still those of the job's snapshot
+(no other snapshot written out since), the next frame is the same
+picture: start the job again at that vblank instead, up to four
+captures. A job whose picture was replaced in the meantime fails with
+-EIO as before.
+
+Also do not start a capture when the vblank interrupt is serviced so
+late that the beam is already in active video (the same condition as
+de33_latch_flushes_late): postpone it by a frame, at most four times,
+so the unit is not started in the middle of a frame.
+
+New read-only counters tell the cases apart: de33_wb_overflow,
+de33_wb_timeout, de33_wb_status_fail (status of the last failed
+capture), de33_wb_retries, de33_wb_deferred, de33_wb_lost and
+de33_wb_start_line_max.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/gpu/drm/sun4i/sun50i_wb.c
++++ b/drivers/gpu/drm/sun4i/sun50i_wb.c
+@@ -140,6 +140,8 @@
+ #define SUN50I_WB_MAX_MIXERS		2
+ /* vblanks a started capture may stay busy before the job is failed */
+ #define SUN50I_WB_MAX_BUSY_FRAMES	4
++/* captures of a job that may end in OVERFLOW/TIMEOUT before it fails */
++#define SUN50I_WB_MAX_TRIES		4
+ 
+ /* Lanczos2 scaler phases, vendor wb_lan2coefftab16 / wb_lan2coefftab16_down */
+ static const u32 sun50i_wb_coeff_up[SUN50I_WB_SCALER_PHASES] = {
+@@ -198,6 +200,16 @@
+ 	/* the mixer snapshot holding this job's commit (sun50i_wb_arm()) */
+ 	bool			armed;
+ 	unsigned int		latch_seq;
++	/*
++	 * The snapshot on screen when the job could first start: a capture
++	 * postponed or repeated later records the same picture only while
++	 * no other snapshot has been written out since.
++	 */
++	bool			eligible;
++	unsigned int		frame_seq;
++	unsigned int		tries;		/* captures started */
++	unsigned int		deferred;	/* starts postponed */
++	int			status;
+ };
+ 
+ struct sun50i_wb {
+@@ -218,18 +230,37 @@
+  * Read-only diagnostics, /sys/module/sun8i_mixer/parameters/de33_wb_*:
+  * jobs queued, completed (FINISH), failed (overflow/timeout/never finished
+  * or cancelled), vblanks at which a started capture was not finished yet,
+- * and the last status word read.
++ * and the last status word read. Per capture attempt: captures that ended
++ * with OVERFLOW / TIMEOUT set (and the last such status word), captures
++ * repeated on the next frame after one, starts postponed because the vblank
++ * interrupt came with the beam already in active video (and the latest TCON
++ * line seen at a start), and jobs failed because the picture they were to
++ * capture had been replaced before a capture could succeed.
+  */
+ static unsigned int de33_wb_jobs;
+ static unsigned int de33_wb_done;
+ static unsigned int de33_wb_failed;
+ static unsigned int de33_wb_busy_frames;
+ static unsigned int de33_wb_status_last;
++static unsigned int de33_wb_overflow;
++static unsigned int de33_wb_timeout;
++static unsigned int de33_wb_status_fail;
++static unsigned int de33_wb_retries;
++static unsigned int de33_wb_deferred;
++static unsigned int de33_wb_lost;
++static int de33_wb_start_line_max = -1;
+ module_param(de33_wb_jobs, uint, 0444);
+ module_param(de33_wb_done, uint, 0444);
+ module_param(de33_wb_failed, uint, 0444);
+ module_param(de33_wb_busy_frames, uint, 0444);
+ module_param(de33_wb_status_last, uint, 0444);
++module_param(de33_wb_overflow, uint, 0444);
++module_param(de33_wb_timeout, uint, 0444);
++module_param(de33_wb_status_fail, uint, 0444);
++module_param(de33_wb_retries, uint, 0444);
++module_param(de33_wb_deferred, uint, 0444);
++module_param(de33_wb_lost, uint, 0444);
++module_param(de33_wb_start_line_max, int, 0444);
+ 
+ static inline struct sun50i_wb *
+ connector_to_sun50i_wb(struct drm_connector *connector)
+@@ -497,21 +528,48 @@
+ 	kfree(job);
+ }
+ 
++/* A job leaves the driver's queue with @status; completed by the caller. */
++static void sun50i_wb_job_end(struct list_head *done,
++			      struct sun50i_wb_job *job, int status)
++{
++	job->status = status;
++	list_add_tail(&job->list, done);
++	if (status)
++		de33_wb_failed++;
++	else
++		de33_wb_done++;
++}
++
+ /*
+  * The mixer's TCON vblank interrupt, after the mixer wrote the frame's
+- * registers (sun50i_mixer_vblank_quirk()). Hard IRQ context.
++ * registers (sun50i_mixer_vblank_quirk()), with the TCON scan line at
++ * which it runs. Hard IRQ context.
++ *
++ * A capture that ends with OVERFLOW or TIMEOUT lost data on its way to
++ * memory (the unit's output competes for DRAM with the scan-out and the
++ * other masters, e.g. a 4K video decode), the picture itself is fine. While
++ * the registers on screen are still those of the job's snapshot, the next
++ * frame is the same picture: capture that one instead of failing the job.
++ * Likewise a start is postponed when the interrupt is serviced so late that
++ * the beam is already in active video, so the unit is not started in the
++ * middle of a frame.
+  */
+-void sun50i_wb_vblank(struct sun50i_wb *wb, struct sun8i_mixer *mixer)
++void sun50i_wb_vblank(struct sun50i_wb *wb, struct sun8i_mixer *mixer,
++		      unsigned int cur_line)
+ {
+-	struct sun50i_wb_job *done = NULL, *job;
++	unsigned int flushed = READ_ONCE(mixer->latch_flushed_seq);
++	/* as de33_latch_flushes_late: the IRQ normally runs at line 1-8 */
++	bool late = mixer->line_active && cur_line >= mixer->line_active;
++	struct sun50i_wb_job *job, *n;
+ 	unsigned long flags;
+-	int status = 0;
++	LIST_HEAD(done);
+ 
+ 	spin_lock_irqsave(&wb->lock, flags);
+ 
+ 	job = wb->running;
+ 	if (job && job->mixer == mixer) {
+ 		u32 sts = readl(wb->regs + SUN50I_WB_STATUS);
++		int status;
+ 
+ 		de33_wb_status_last = sts;
+ 		if (sts & SUN50I_WB_STATUS_FINISH) {
+@@ -519,6 +577,11 @@
+ 		} else if (sts & (SUN50I_WB_STATUS_OVERFLOW |
+ 				  SUN50I_WB_STATUS_TIMEOUT)) {
+ 			status = -EIO;
++			de33_wb_status_fail = sts;
++			if (sts & SUN50I_WB_STATUS_OVERFLOW)
++				de33_wb_overflow++;
++			if (sts & SUN50I_WB_STATUS_TIMEOUT)
++				de33_wb_timeout++;
+ 		} else if (++job->busy_frames > SUN50I_WB_MAX_BUSY_FRAMES) {
+ 			status = -ETIMEDOUT;
+ 		} else {
+@@ -532,11 +595,14 @@
+ 				       wb->regs + SUN50I_WB_STATUS);
+ 			sun50i_wb_stop(wb);
+ 			wb->running = NULL;
+-			done = job;
+-			if (status)
+-				de33_wb_failed++;
+-			else
+-				de33_wb_done++;
++			if (status == -EIO && job->tries < SUN50I_WB_MAX_TRIES) {
++				/* again, from the head of the queue, below */
++				job->busy_frames = 0;
++				list_add(&job->list, &wb->pending);
++				de33_wb_retries++;
++			} else {
++				sun50i_wb_job_end(&done, job, status);
++			}
+ 		}
+ 	}
+ 
+@@ -549,18 +615,38 @@
+ 		 * capture the previous frame.
+ 		 */
+ 		if (job->mixer == mixer && job->armed &&
+-		    (int)(READ_ONCE(mixer->latch_flushed_seq) -
+-			  job->latch_seq) >= 0) {
+-			list_del(&job->list);
+-			wb->running = job;
+-			sun50i_wb_start(wb, job);
++		    (int)(flushed - job->latch_seq) >= 0) {
++			if (!job->eligible) {
++				job->eligible = true;
++				job->frame_seq = flushed;
++			}
++
++			if (flushed != job->frame_seq) {
++				/* the job's picture is no longer on screen */
++				list_del(&job->list);
++				de33_wb_lost++;
++				sun50i_wb_job_end(&done, job, -EIO);
++			} else if (late &&
++				   job->deferred < SUN50I_WB_MAX_BUSY_FRAMES) {
++				job->deferred++;
++				de33_wb_deferred++;
++			} else {
++				list_del(&job->list);
++				wb->running = job;
++				job->tries++;
++				if ((int)cur_line > de33_wb_start_line_max)
++					de33_wb_start_line_max = cur_line;
++				sun50i_wb_start(wb, job);
++			}
+ 		}
+ 	}
+ 
+ 	spin_unlock_irqrestore(&wb->lock, flags);
+ 
+-	if (done)
+-		sun50i_wb_job_complete(wb, done, status);
++	list_for_each_entry_safe(job, n, &done, list) {
++		list_del(&job->list);
++		sun50i_wb_job_complete(wb, job, job->status);
++	}
+ }
+ 
+ /*
+--- a/drivers/gpu/drm/sun4i/sun50i_wb.h
++++ b/drivers/gpu/drm/sun4i/sun50i_wb.h
+@@ -12,7 +12,8 @@
+ struct sun50i_wb;
+ struct sun8i_mixer;
+ 
+-void sun50i_wb_vblank(struct sun50i_wb *wb, struct sun8i_mixer *mixer);
++void sun50i_wb_vblank(struct sun50i_wb *wb, struct sun8i_mixer *mixer,
++		      unsigned int cur_line);
+ void sun50i_wb_arm(struct sun50i_wb *wb, struct sun8i_mixer *mixer,
+ 		   unsigned int latch_seq);
+ 
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -446,7 +446,7 @@
+ 	 */
+ 	wb = READ_ONCE(mixer->wb);
+ 	if (wb)
+-		sun50i_wb_vblank(wb, mixer);
++		sun50i_wb_vblank(wb, mixer, cur_line);
+ }
+ 
+ static void sun8i_mixer_commit(struct sunxi_engine *engine,
