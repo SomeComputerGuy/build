@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 09:30:00 +0000
+Subject: arm64: dts: allwinner: h616: orangepi-zero: add i2c aliases
+
+The I2C core numbers adapters after the "i2cN" aliases and hands out
+dynamic numbers in probe order to adapters without one. The Orange Pi
+Zero2/Zero3 DT declares no i2c aliases, so a TWI enabled by an overlay
+gets whatever number is free when it probes (the DesignWare HDMI DDC
+adapter takes one too): TWI3 on header pins 3/5 does not show up as
+/dev/i2c-3, and the bus number changes with the set of enabled buses.
+Scripts, the overlay documentation and the vendor manual all name the
+buses i2c-0..i2c-5 after the controller.
+
+Pin the numbering as the vendor BSP does (sun50iw9p1.dtsi twi0..twi5,
+twi5 = R_TWI): i2c0..i2c4 = TWI0..TWI4, i2c5 = R_TWI. Disabled nodes
+get no adapter, so nothing changes for buses that stay off; the HDMI
+DDC adapter now numbers from 6.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero.dtsi | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero.dtsi b/arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero.dtsi
+index 111111111111..222222222222 100644
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero.dtsi
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h616-orangepi-zero.dtsi
+@@ -15,6 +15,12 @@
+ / {
+ 	aliases {
+ 		ethernet0 = &emac0;
++		i2c0 = &i2c0;
++		i2c1 = &i2c1;
++		i2c2 = &i2c2;
++		i2c3 = &i2c3;
++		i2c4 = &i2c4;
++		i2c5 = &r_i2c;
+ 		mmc0 = &mmc0; /* microSD slot */
+ 		mmc1 = &mmc1; /* SDIO WiFi/BT module */
+ 		serial0 = &uart0;
+-- 
+Armbian
+
