@@ -1,0 +1,212 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 23:00:00 +0000
+Subject: drm/sun4i: de33 writeback: Stop a capture overtaken by the next
+ snapshot, give every failure a reason
+
+A capture still busy at a vblank at which the next snapshot went on
+screen is failed (it may be recording that snapshot's frame), but it
+was only failed once the unit had finished it, a frame later. By then
+the next snapshot was gone too, so its job, which could not start while
+the unit was busy, failed as well: one late begin cost two captures
+(runner job 61: ve-rand 3 such pairs plus one repeat after OVERFLOW
+that found its picture gone, vemem-rand2 3 pairs, vemem-rand3 2).
+
+Stop such a capture at that vblank and start the next job in the same
+blanking, as after a normal end.
+
+Give every failed job exactly one reason, as the error of its out-fence
+and as a counter, so that de33_wb_failed is their sum and a client can
+tell for each frame why it has no capture: -EIO lost data that could
+not be captured again (de33_wb_fail_error), -ENODATA picture gone
+before the capture could start (de33_wb_fail_missed), -ESTALE stopped
+when the next snapshot went on screen (de33_wb_replaced), -ETIMEDOUT
+never finished (de33_wb_fail_timeout), -ECANCELED CRTC off or modeset
+(de33_wb_fail_cancelled). de33_wb_lost stays missed + replaced.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/gpu/drm/sun4i/sun50i_wb.c
++++ b/drivers/gpu/drm/sun4i/sun50i_wb.c
+@@ -200,11 +200,6 @@
+ 	/* the mixer snapshot holding this job's commit (sun50i_wb_arm()) */
+ 	bool			armed;
+ 	unsigned int		latch_seq;
+-	/*
+-	 * Another snapshot was on screen at a vblank at which the running
+-	 * capture was not finished: the unit may be recording that frame.
+-	 */
+-	bool			replaced;
+ 	int			start_line;	/* TCON line at the start */
+ 	unsigned int		tries;		/* captures started */
+ 	unsigned int		deferred;	/* starts postponed */
+@@ -233,11 +228,25 @@
+  * with OVERFLOW / TIMEOUT set (and the last such status word), captures
+  * repeated on the next frame after one, starts postponed because the vblank
+  * interrupt came with the beam already in active video (and the latest TCON
+- * line seen at a start), and jobs failed because the picture they were to
+- * capture had been replaced before a capture could succeed (also counted:
+- * de33_wb_replaced, the captures among them that were running while
+- * another snapshot went on screen). Start lines: the lowest of captures
+- * still busy at the next vblank, the highest of captures finished there.
++ * line seen at a start). Start lines: the lowest of captures still busy at
++ * the next vblank, the highest of captures finished there.
++ *
++ * Every failed job has exactly one reason, which is also the error of its
++ * out-fence, so that a client can tell for each frame why it has no capture
++ * and de33_wb_failed is the sum of these:
++ *   de33_wb_fail_error     -EIO        the capture lost data to memory
++ *                                      (OVERFLOW/TIMEOUT) and could not be
++ *                                      repeated: tries used up, or the
++ *                                      picture was gone by the repeat
++ *   de33_wb_fail_missed    -ENODATA    the picture was gone before the
++ *                                      capture could start (start postponed,
++ *                                      commit coalesced with the next one)
++ *   de33_wb_replaced       -ESTALE     the capture was not finished at a
++ *                                      vblank at which the next snapshot
++ *                                      went on screen (stopped there)
++ *   de33_wb_fail_timeout   -ETIMEDOUT  never finished
++ *   de33_wb_fail_cancelled -ECANCELED  CRTC turned off or modeset
++ * de33_wb_lost = de33_wb_fail_missed + de33_wb_replaced.
+  */
+ static unsigned int de33_wb_jobs;
+ static unsigned int de33_wb_done;
+@@ -254,6 +263,10 @@
+ static unsigned int de33_wb_replaced;
+ static int de33_wb_busy_start_line_min = -1;
+ static int de33_wb_quick_start_line_max = -1;
++static unsigned int de33_wb_fail_error;
++static unsigned int de33_wb_fail_missed;
++static unsigned int de33_wb_fail_timeout;
++static unsigned int de33_wb_fail_cancelled;
+ module_param(de33_wb_jobs, uint, 0444);
+ module_param(de33_wb_done, uint, 0444);
+ module_param(de33_wb_failed, uint, 0444);
+@@ -269,6 +282,10 @@
+ module_param(de33_wb_replaced, uint, 0444);
+ module_param(de33_wb_busy_start_line_min, int, 0444);
+ module_param(de33_wb_quick_start_line_max, int, 0444);
++module_param(de33_wb_fail_error, uint, 0444);
++module_param(de33_wb_fail_missed, uint, 0444);
++module_param(de33_wb_fail_timeout, uint, 0444);
++module_param(de33_wb_fail_cancelled, uint, 0444);
+ 
+ static inline struct sun50i_wb *
+ connector_to_sun50i_wb(struct drm_connector *connector)
+@@ -542,10 +559,27 @@
+ {
+ 	job->status = status;
+ 	list_add_tail(&job->list, done);
+-	if (status)
+-		de33_wb_failed++;
+-	else
++	if (!status) {
+ 		de33_wb_done++;
++		return;
++	}
++	de33_wb_failed++;
++	switch (status) {
++	case -EIO:
++		de33_wb_fail_error++;
++		break;
++	case -ENODATA:
++		de33_wb_fail_missed++;
++		de33_wb_lost++;
++		break;
++	case -ESTALE:
++		de33_wb_replaced++;
++		de33_wb_lost++;
++		break;
++	default:
++		de33_wb_fail_timeout++;
++		break;
++	}
+ }
+ 
+ /*
+@@ -585,12 +619,6 @@
+ 			if (!job->busy_frames &&
+ 			    job->start_line > de33_wb_quick_start_line_max)
+ 				de33_wb_quick_start_line_max = job->start_line;
+-			if (job->replaced) {
+-				/* may hold the later snapshot's picture */
+-				status = -EIO;
+-				de33_wb_replaced++;
+-				de33_wb_lost++;
+-			}
+ 		} else if (sts & (SUN50I_WB_STATUS_OVERFLOW |
+ 				  SUN50I_WB_STATUS_TIMEOUT)) {
+ 			status = -EIO;
+@@ -608,16 +636,22 @@
+ 			 * runner job 60: such a job recorded the next commit's
+ 			 * picture). From here on it may be recording the frame
+ 			 * now starting, so it is its own only while that frame
+-			 * is still its snapshot.
++			 * is still its snapshot. If another snapshot went on
++			 * screen at this vblank, whatever it ends with is not
++			 * known to be the job's picture: stop it now, so that
++			 * the job of that snapshot can still start in this
++			 * blanking (waiting for the end would make that job
++			 * miss its own snapshot too, runner job 61).
+ 			 */
+ 			if (job->busy_frames == 1 &&
+ 			    (de33_wb_busy_start_line_min < 0 ||
+ 			     job->start_line < de33_wb_busy_start_line_min))
+ 				de33_wb_busy_start_line_min = job->start_line;
+-			if (flushed != job->latch_seq)
+-				job->replaced = true;
+ 			de33_wb_busy_frames++;
+-			job = NULL;
++			if (flushed != job->latch_seq)
++				status = -ESTALE;
++			else
++				job = NULL;
+ 		}
+ 
+ 		if (job) {
+@@ -625,8 +659,7 @@
+ 				       wb->regs + SUN50I_WB_STATUS);
+ 			sun50i_wb_stop(wb);
+ 			wb->running = NULL;
+-			if (status == -EIO && !job->replaced &&
+-			    job->tries < SUN50I_WB_MAX_TRIES) {
++			if (status == -EIO && job->tries < SUN50I_WB_MAX_TRIES) {
+ 				/* again, from the head of the queue, below */
+ 				job->busy_frames = 0;
+ 				list_add(&job->list, &wb->pending);
+@@ -642,7 +675,7 @@
+ 	 * wrote its commit's registers: started earlier it would capture the
+ 	 * previous frame. It captures its own picture only while snapshot
+ 	 * latch_seq is the one on screen: a job that could not start at that
+-	 * vblank (the unit still writing out the previous capture, a start
++	 * vblank (the unit busy with another CRTC's capture, a start
+ 	 * postponed, a repeat after OVERFLOW) or whose commit was coalesced
+ 	 * with the next one would record a later commit's picture as its
+ 	 * own. Such a job fails, and the next one is looked at.
+@@ -655,10 +688,14 @@
+ 			break;
+ 
+ 		if (flushed != job->latch_seq) {
+-			/* the job's picture is no longer on screen */
++			/*
++			 * The job's picture is no longer on screen: a repeat
++			 * after lost data fails with the data error, a job
++			 * that never started as missed.
++			 */
+ 			list_del(&job->list);
+-			de33_wb_lost++;
+-			sun50i_wb_job_end(&done, job, -EIO);
++			sun50i_wb_job_end(&done, job,
++					  job->tries ? -EIO : -ENODATA);
+ 			continue;
+ 		}
+ 
+@@ -734,6 +771,7 @@
+ 	list_for_each_entry_safe(job, n, &list, list) {
+ 		list_del(&job->list);
+ 		de33_wb_failed++;
++		de33_wb_fail_cancelled++;
+ 		sun50i_wb_job_complete(wb, job, -ECANCELED);
+ 	}
+ }

@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 23:00:00 +0000
+Subject: drm/sun4i: de33: Record the vblank and time of each latch snapshot
+
+A flip that misses the vblank it was meant for either came too late
+for it (the commit reached atomic_flush after that vblank) or was held
+back by the latch (de33_latch_deferred). The counters cannot tell the
+first case from a flip lost in the driver. Count the vblank interrupts
+under the latch lock and export, for the last snapshot, the count when
+it was taken and when it was written out and the CLOCK_MONOTONIC time it
+was taken (de33_latch_snap_vbl, de33_latch_flush_vbl,
+de33_latch_snap_ns), so a client reading them at each flip event can
+account for every vblank between two flips. The vblank interrupt now
+always takes the latch lock, also with nothing pending.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+@@ -297,6 +297,7 @@
+ 	/* last TCON line at which a flush still ends inside the blanking */
+ 	unsigned int			line_deadline;
+ 	unsigned int			latch_deferred;	/* vblanks this snapshot waited */
++	unsigned int			latch_vblanks;	/* vblank interrupts seen */
+ 	bool				latch_defer_off; /* last flush forced: don't wait */
+ 	/* page-flip events of the pending snapshot (sun50i_mixer_hold_event()) */
+ 	struct list_head		latch_events;
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -306,6 +306,22 @@
+  * The counters are read-only diagnostics: a frame-coherent update needs
+  * de33_latch_flushes_late == 0 and de33_latch_line_max < de33_latch_line_active.
+  */
++/*
++ * Per snapshot, for a client that wants to tell why a flip missed the
++ * vblank it was meant for: the count of vblank interrupts (of the mixer's
++ * TCON, kept under latch_lock) when the last snapshot was taken and when it
++ * was written out, and the CLOCK_MONOTONIC time it was taken. A flip i made
++ * after flip i-1 then has snap_vbl(i) - flush_vbl(i-1) vblanks that passed
++ * before its commit reached the hardware snapshot (the commit was late) and
++ * flush_vbl(i) - snap_vbl(i) - 1 vblanks it was held back (deferred).
++ */
++static unsigned int de33_latch_snap_vbl;
++static unsigned int de33_latch_flush_vbl;
++static unsigned long de33_latch_snap_ns;
++module_param(de33_latch_snap_vbl, uint, 0444);
++module_param(de33_latch_flush_vbl, uint, 0444);
++module_param(de33_latch_snap_ns, ulong, 0444);
++
+ #define LATCH_MAX_DEFER		2
+ #define LATCH_FLUSH_BUDGET_NS	50000	/* flush ns_max is ~16 us (job 19) */
+ 
+@@ -409,6 +425,8 @@
+ 	u64 ns;
+ 
+ 	spin_lock_irqsave(&mixer->latch_lock, flags);
++	if (cur_line >= 0)
++		mixer->latch_vblanks++;
+ 	if (!mixer->latch_pending) {
+ 		spin_unlock_irqrestore(&mixer->latch_lock, flags);
+ 		return;
+@@ -440,6 +458,7 @@
+ 
+ 	mixer->latch_pending = false;
+ 	WRITE_ONCE(mixer->latch_flushed_seq, mixer->latch_seq);
++	de33_latch_flush_vbl = mixer->latch_vblanks;
+ 	if (mixer->latch_vblank_ref) {
+ 		mixer->latch_vblank_ref = false;
+ 		crtc = mixer->latch_crtc;
+@@ -496,6 +515,8 @@
+ 	mixer->latch_pending = true;
+ 	mixer->latch_crtc = crtc;
+ 	mixer->latch_seq++;
++	de33_latch_snap_vbl = mixer->latch_vblanks;
++	de33_latch_snap_ns = ktime_get_ns();
+ 
+ 	/*
+ 	 * A write-back job of this commit was queued before its planes were
+@@ -582,8 +603,8 @@
+ 	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
+ 	struct sun50i_wb *wb;
+ 
+-	if (READ_ONCE(mixer->latch_pending))
+-		sun50i_mixer_latch_flush(mixer, cur_line);
++	/* also counts the vblank (latch_vblanks) when nothing is pending */
++	sun50i_mixer_latch_flush(mixer, cur_line);
+ 
+ 	/*
+ 	 * The frame's registers are written: a queued write-back capture of
