@@ -28,8 +28,9 @@ latched registers for the frame, in the same blanking, so the capture
 covers the first frame scanned out with the committed state. The next
 vblank reads the FINISH status, signals the job's fence and starts the
 next queued job; a start that does not finish within four frames fails
-with -ETIMEDOUT, and the jobs of a CRTC that is turned off fail with
--ECANCELED. After each capture the unit is stopped and reset, as the
+with -ETIMEDOUT, and the jobs of a CRTC that is turned off or re-modeset fail
+with -ECANCELED (encoder atomic_disable). After each capture the unit is
+stopped and reset, as the
 vendor driver does (an idle unit left attached to the blender can stall
 the mixer).
 
@@ -228,8 +229,8 @@ diff -ruN a/drivers/gpu/drm/sun4i/sun4i_drv.c b/drivers/gpu/drm/sun4i/sun4i_drv.
  						       &sun4i_drv_master_ops,
 diff -ruN a/drivers/gpu/drm/sun4i/sun50i_wb.c b/drivers/gpu/drm/sun4i/sun50i_wb.c
 --- a/drivers/gpu/drm/sun4i/sun50i_wb.c	1970-01-01 00:00:00.000000000 +0000
-+++ b/drivers/gpu/drm/sun4i/sun50i_wb.c	2026-11-06 00:22:27.538995612 +0000
-@@ -0,0 +1,896 @@
++++ b/drivers/gpu/drm/sun4i/sun50i_wb.c	2026-11-06 00:32:37.581855865 +0000
+@@ -0,0 +1,915 @@
 +// SPDX-License-Identifier: GPL-2.0-or-later
 +/*
 + * Allwinner H616 DE33 real-time write-back unit (RT-WB) as a DRM writeback
@@ -261,6 +262,7 @@ diff -ruN a/drivers/gpu/drm/sun4i/sun50i_wb.c b/drivers/gpu/drm/sun4i/sun50i_wb.
 +
 +#include <linux/clk.h>
 +#include <linux/component.h>
++#include <linux/delay.h>
 +#include <linux/io.h>
 +#include <linux/list.h>
 +#include <linux/math64.h>
@@ -423,7 +425,7 @@ diff -ruN a/drivers/gpu/drm/sun4i/sun50i_wb.c b/drivers/gpu/drm/sun4i/sun50i_wb.
 +	u32			bypass;
 +	const u32		*y_coeff;	/* NULL: scaler coefficients untouched */
 +	const u32		*c_coeff;
-+	bool			csc;
++	bool			csc;		/* csc_coeff programmed */
 +	u32			csc_coeff[SUN50I_WB_CSC_COEFF_NUM];
 +	unsigned int		busy_frames;
 +};
@@ -580,9 +582,6 @@ diff -ruN a/drivers/gpu/drm/sun4i/sun50i_wb.c b/drivers/gpu/drm/sun4i/sun50i_wb.
 +	return 0;
 +}
 +
-+static const struct drm_encoder_helper_funcs sun50i_wb_encoder_helper_funcs = {
-+	.atomic_check	= sun50i_wb_encoder_atomic_check,
-+};
 +
 +/* Coarse (integer, > 2:1) then fine (Lanczos2) down-scaling, as the vendor. */
 +static void sun50i_wb_job_scaler(struct sun50i_wb_job *job,
@@ -669,8 +668,10 @@ diff -ruN a/drivers/gpu/drm/sun4i/sun50i_wb.c b/drivers/gpu/drm/sun4i/sun50i_wb.
 +			   SUN50I_DE33_RTWB_MUX_MASK | SUN50I_DE33_RTWB_START |
 +			   SUN50I_DE33_RTWB_SELF_TIMING, mux);
 +
-+	/* out of soft reset */
-+	writel_relaxed(SUN50I_WB_GCTRL_AUTO_GATE, regs + SUN50I_WB_GCTRL);
++	/* out of the soft reset the last stop left it in */
++	writel(SUN50I_WB_GCTRL_AUTO_GATE, regs + SUN50I_WB_GCTRL);
++	readl(regs + SUN50I_WB_GCTRL);
++	udelay(1);
 +
 +	writel_relaxed(job->size, regs + SUN50I_WB_SIZE);
 +	writel_relaxed(0, regs + SUN50I_WB_CROP_COORD);
@@ -787,12 +788,13 @@ diff -ruN a/drivers/gpu/drm/sun4i/sun50i_wb.c b/drivers/gpu/drm/sun4i/sun50i_wb.
 +}
 +
 +/*
-+ * A CRTC is being turned off (sun8i_mixer_commit() with the CRTC inactive):
-+ * fail every job. All of them, not only this
-+ * mixer's: drm_writeback_signal_completion() completes the connector's
-+ * oldest job, so the driver's queue must be cut in the same order.
++ * The CRTC the connector is attached to is turned off or re-modeset: its
++ * vblank interrupt stops, so captures still queued or running could never
++ * complete. Fail every job, not only this CRTC's:
++ * drm_writeback_signal_completion() completes the connector's oldest job,
++ * so the driver's queue must be cut in the same order.
 + */
-+void sun50i_wb_cancel(struct sun50i_wb *wb)
++static void sun50i_wb_cancel(struct sun50i_wb *wb)
 +{
 +	struct sun50i_wb_job *job, *n;
 +	unsigned long flags;
@@ -815,6 +817,23 @@ diff -ruN a/drivers/gpu/drm/sun4i/sun50i_wb.c b/drivers/gpu/drm/sun4i/sun50i_wb.
 +		sun50i_wb_job_complete(wb, job, -ECANCELED);
 +	}
 +}
++
++/*
++ * drm_atomic_helper_commit_modeset_disables(): the CRTC this connector is
++ * attached to goes inactive or through a modeset, before the CRTC itself
++ * is disabled. Jobs of this commit, if any, are queued later, after the
++ * enables.
++ */
++static void sun50i_wb_encoder_atomic_disable(struct drm_encoder *encoder,
++					     struct drm_atomic_commit *state)
++{
++	sun50i_wb_cancel(encoder_to_sun50i_wb(encoder));
++}
++
++static const struct drm_encoder_helper_funcs sun50i_wb_encoder_helper_funcs = {
++	.atomic_check	= sun50i_wb_encoder_atomic_check,
++	.atomic_disable	= sun50i_wb_encoder_atomic_disable,
++};
 +
 +/*
 + * drm_atomic_helper_commit_writebacks(): the planes of this commit are
@@ -866,9 +885,8 @@ diff -ruN a/drivers/gpu/drm/sun4i/sun50i_wb.c b/drivers/gpu/drm/sun4i/sun50i_wb.
 +	if (fb->format->num_planes > 1)
 +		job->pitch[1] = fb->pitches[1];
 +
-+	if (fb->format->format != DRM_FORMAT_XRGB2101010)
-+		sun50i_wb_job_scaler(job, fb->format, mode->hdisplay,
-+				     mode->vdisplay, fb->width, fb->height);
++	sun50i_wb_job_scaler(job, fb->format, mode->hdisplay, mode->vdisplay,
++			     fb->width, fb->height);
 +	sun50i_wb_job_csc(job, fb->format);
 +
 +	/*
@@ -979,8 +997,10 @@ diff -ruN a/drivers/gpu/drm/sun4i/sun50i_wb.c b/drivers/gpu/drm/sun4i/sun50i_wb.
 +					   ARRAY_SIZE(sun50i_wb_formats),
 +					   possible_crtcs);
 +	if (ret) {
-+		dev_err(dev, "Couldn't create the writeback connector\n");
-+		return ret;
++		/* the display output does not depend on the extra connector */
++		dev_warn(dev, "Couldn't create the writeback connector (%d), writeback unused\n",
++			 ret);
++		return 0;
 +	}
 +
 +	sun50i_wb_setup_clones(drm, &wb->connector.encoder);
@@ -1128,8 +1148,8 @@ diff -ruN a/drivers/gpu/drm/sun4i/sun50i_wb.c b/drivers/gpu/drm/sun4i/sun50i_wb.
 +MODULE_LICENSE("GPL");
 diff -ruN a/drivers/gpu/drm/sun4i/sun50i_wb.h b/drivers/gpu/drm/sun4i/sun50i_wb.h
 --- a/drivers/gpu/drm/sun4i/sun50i_wb.h	1970-01-01 00:00:00.000000000 +0000
-+++ b/drivers/gpu/drm/sun4i/sun50i_wb.h	2026-11-06 00:16:49.248314447 +0000
-@@ -0,0 +1,18 @@
++++ b/drivers/gpu/drm/sun4i/sun50i_wb.h	2026-11-06 00:32:37.592210213 +0000
+@@ -0,0 +1,17 @@
 +/* SPDX-License-Identifier: GPL-2.0-or-later */
 +/*
 + * Allwinner H616 DE33 real-time write-back unit (RT-WB) as a DRM writeback
@@ -1145,7 +1165,6 @@ diff -ruN a/drivers/gpu/drm/sun4i/sun50i_wb.h b/drivers/gpu/drm/sun4i/sun50i_wb.
 +struct sun8i_mixer;
 +
 +void sun50i_wb_vblank(struct sun50i_wb *wb, struct sun8i_mixer *mixer);
-+void sun50i_wb_cancel(struct sun50i_wb *wb);
 +
 +#endif /* _SUN50I_WB_H_ */
 diff -ruN a/drivers/gpu/drm/sun4i/sun8i_csc.c b/drivers/gpu/drm/sun4i/sun8i_csc.c
@@ -1229,7 +1248,7 @@ diff -ruN a/drivers/gpu/drm/sun4i/sun8i_csc.h b/drivers/gpu/drm/sun4i/sun8i_csc.
  #endif
 diff -ruN a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
 --- a/drivers/gpu/drm/sun4i/sun8i_mixer.c	2026-11-06 00:12:23.375487965 +0000
-+++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c	2026-11-06 00:21:10.323000954 +0000
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c	2026-11-06 00:32:37.602870435 +0000
 @@ -32,6 +32,7 @@
  #include "sun4i_drv.h"
  #include "sun50i_planes.h"
@@ -1258,21 +1277,6 @@ diff -ruN a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mi
  }
  
  static void sun8i_mixer_commit(struct sunxi_engine *engine,
-@@ -547,6 +558,14 @@
- 			     SUN8I_MIXER_GLOBAL_DBUFF_ENABLE);
- 	else if (mixer->shadow)
- 		sun50i_mixer_latch_commit(mixer, crtc);
-+
-+	/*
-+	 * The CRTC was turned off in this commit: its vblank interrupt is
-+	 * gone, so write-back captures still queued or running can't
-+	 * complete. Fail them now rather than leave their fences hanging.
-+	 */
-+	if (mixer->wb && !crtc->state->active)
-+		sun50i_wb_cancel(mixer->wb);
- }
- 
- static struct drm_plane **sun8i_layers_init(struct drm_device *drm,
 diff -ruN a/drivers/gpu/drm/sun4i/sun8i_mixer.h b/drivers/gpu/drm/sun4i/sun8i_mixer.h
 --- a/drivers/gpu/drm/sun4i/sun8i_mixer.h	2026-11-06 00:12:23.375570115 +0000
 +++ b/drivers/gpu/drm/sun4i/sun8i_mixer.h	2026-11-06 00:21:10.322694927 +0000
