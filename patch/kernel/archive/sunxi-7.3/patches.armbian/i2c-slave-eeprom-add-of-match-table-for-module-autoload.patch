@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 11:00:00 +0000
+Subject: i2c: slave-eeprom: add an OF match table for module autoload
+
+A backend instantiated from the device tree (compatible "slave-24c02",
+reg = <(I2C_OWN_SLAVE_ADDRESS | 0x64)>) gets an i2c client, but the
+uevent of a client with an of_node carries an of: modalias
+(of:N...Cslave-24c02). The module only declares i2c: aliases, so udev
+never loads it and the client stays unbound: no slave-eeprom file and
+no target registered, with nothing in the log. Only the sysfs
+new_device path (i2c: modalias) or a manual modprobe worked.
+
+Declare the same names as an OF table and export it, so the module
+autoloads for DT and overlay clients. Matching and probe are
+unchanged: the client name is the compatible without a vendor prefix,
+so i2c_client_get_device_id() still finds the size and flags.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/i2c/i2c-slave-eeprom.c | 20 ++++++++++++++++++++
+ 1 file changed, 20 insertions(+)
+
+--- a/drivers/i2c/i2c-slave-eeprom.c
++++ b/drivers/i2c/i2c-slave-eeprom.c
+@@ -20,6 +20,7 @@
+ #include <linux/firmware.h>
+ #include <linux/i2c.h>
+ #include <linux/init.h>
++#include <linux/mod_devicetable.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/slab.h>
+@@ -203,9 +204,29 @@
+ };
+ MODULE_DEVICE_TABLE(i2c, i2c_slave_eeprom_id);
+ 
++/*
++ * Firmware instantiates a backend with the I2C id as compatible and
++ * I2C_OWN_SLAVE_ADDRESS in reg (i2c-controller.yaml in dtschema).
++ * Such a client announces an of: modalias, so without this table the
++ * module never autoloads for it.
++ */
++static const struct of_device_id i2c_slave_eeprom_of_match[] = {
++	{ .compatible = "slave-24c02" },
++	{ .compatible = "slave-24c02ro" },
++	{ .compatible = "slave-24c32" },
++	{ .compatible = "slave-24c32ro" },
++	{ .compatible = "slave-24c64" },
++	{ .compatible = "slave-24c64ro" },
++	{ .compatible = "slave-24c512" },
++	{ .compatible = "slave-24c512ro" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, i2c_slave_eeprom_of_match);
++
+ static struct i2c_driver i2c_slave_eeprom_driver = {
+ 	.driver = {
+ 		.name = "i2c-slave-eeprom",
++		.of_match_table = i2c_slave_eeprom_of_match,
+ 	},
+ 	.probe = i2c_slave_eeprom_probe,
+ 	.remove = i2c_slave_eeprom_remove,
+-- 
+2.43.0
