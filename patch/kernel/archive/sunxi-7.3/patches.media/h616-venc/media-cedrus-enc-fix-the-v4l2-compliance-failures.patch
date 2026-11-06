@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 07:35:00 +0000
+Subject: [PATCH] media: cedrus: enc: fix the v4l2-compliance failures
+
+v4l2-compliance 1.32 on the encoder node (runner job 34) failed four
+tests:
+
+- VIDIOC_TRY_FMT and VIDIOC_S_FMT on the CAPTURE queue: the tool sends a
+  format of all ones and the coded size 0xffffffff, aligned up to 256,
+  wrapped to 0 ("!pix.sizeimage"). Clamp the coded size to 64 MiB, which
+  also keeps the stream size in bits that the engine takes within 32 bits.
+
+- VIDIOC_(UN)SUBSCRIBE_EVENT: V4L2_CID_MIN_BUFFERS_FOR_OUTPUT is only
+  defined for stateful encoders; nothing reads it here, so drop it. The
+  encoder has 20 controls.
+
+- VIDIOC_G/S_PARM: the tool allows the frame rate ioctls on an M2M node
+  only for stateful encoders. The stateless encode uAPI relies on them for
+  the frame rate the core puts in the SPS and uses for its rate control,
+  like the Hantro encoder of the same series; the tool predates that uAPI.
+  Keep them, documented, as the one expected failure.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a2/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
++++ b2/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+@@ -238,16 +238,6 @@
+ 		},
+ 		.capabilities	= CEDRUS_CAPABILITY_H264_ENC,
+ 	},
+-	{
+-		.cfg = {
+-			.id	= V4L2_CID_MIN_BUFFERS_FOR_OUTPUT,
+-			.min	= 1,
+-			.max	= 32,
+-			.step	= 1,
+-			.def	= 1,
+-		},
+-		.capabilities	= CEDRUS_CAPABILITY_H264_ENC,
+-	},
+ };
+ 
+ const unsigned int cedrus_enc_controls_count = ARRAY_SIZE(cedrus_enc_controls);
+@@ -304,7 +294,8 @@
+ 	if (!sizeimage)
+ 		sizeimage = raw_fmt->bytesperline * raw_fmt->height * 3 / 2;
+ 
+-	sizeimage = max_t(unsigned int, sizeimage, CEDRUS_ENC_CODED_MIN_SIZE);
++	sizeimage = clamp_t(unsigned int, sizeimage, CEDRUS_ENC_CODED_MIN_SIZE,
++			    CEDRUS_ENC_CODED_MAX_SIZE);
+ 	pix_fmt->sizeimage = ALIGN(sizeimage, CEDRUS_ENC_CODED_ALIGN);
+ 
+ 	pix_fmt->field = V4L2_FIELD_NONE;
+@@ -459,7 +450,13 @@
+ 	return 0;
+ }
+ 
+-/* The frame rate goes to the VUI timing info of the SPS. */
++/*
++ * The frame rate goes to the VUI timing info of the SPS and to the encode
++ * core's rate control, as the stateless encode uAPI asks (the Hantro
++ * encoder of the same series does the same). v4l2-compliance up to 1.32
++ * predates that uAPI and reports G/S_PARM on a node it does not classify
++ * as a stateful encoder as a failure: that one is expected.
++ */
+ static int cedrus_enc_g_parm(struct file *file, void *priv,
+ 			     struct v4l2_streamparm *parm)
+ {
+--- a2/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
++++ b2/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
+@@ -47,6 +47,8 @@
+ #define CEDRUS_ENC_CODED_ALIGN			256
+ /* The stream size register counts in units of 65536 bits (0x12011). */
+ #define CEDRUS_ENC_CODED_MIN_SIZE		SZ_64K
++/* Keeps the stream size in bits (VE_ENC_AVC_STM_BIT_MAX) within 32 bits. */
++#define CEDRUS_ENC_CODED_MAX_SIZE		SZ_64M
+ 
+ /* P pictures narrower than 13 macroblocks never finish on the H616. */
+ #define CEDRUS_ENC_INTER_MIN_WIDTH_MBS		13
