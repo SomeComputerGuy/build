@@ -1,0 +1,268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 04:10:00 +0000
+Subject: [PATCH] drm/panfrost: Hard-stop a job that does not soft-stop and
+ never resume a job across a reset
+
+A job that is still active when the 500 ms watchdog fires is soft-stopped
+and resumed from JS_TAIL instead of resetting the GPU under it. The slots
+got 100 ms to stop. That is far too short: a soft-stop takes effect at a
+task boundary only, after the tasks already issued (a compute job's
+work-groups, a fragment job's tiles) have run to completion, and a heavy
+shader needs seconds for that. On a Mali-G31 the dEQP-VK spirv_assembly
+vec4 i8/u64 bit_field_insert count64 fragment cases never reached one:
+every 600 ms the log said "Soft-stop failed", the GPU was reset and the
+job restarted from its head, so it made no progress at all and the cases
+ran into their 200 s limit. The Arm driver gives a job 5 s to stop
+(JS_SOFT_STOP_TICKS = 1 tick of 100 ms, JS_HARD_STOP_TICKS_SS = 50
+ticks), then hard-stops it, and resets the GPU only if the hard stop has
+not taken effect 0.5 s later (JS_RESET_TICKS_SS = 55).
+
+The reset that followed a failed soft-stop was also a correctness hole:
+the jobs on the other slots had stopped at a task boundary, and after the
+reset they were resumed from JS_TAIL with their progress (the resume
+state in the job header and the results of the finished tasks, both
+still in the L2) thrown away, so they completed with stale data and no
+error. The Arm driver fails every atom that was on the hardware when the
+GPU was reset.
+
+Follow it:
+ - a slot whose job was active gets JOB_SOFT_STOP_TIMEOUT_MS (5 s) to go
+   idle, idle or faulted slots keep the 10 ms;
+ - slots still active after that are hard-stopped, which terminates the
+   job at once and fails it with -ECANCELED (TERMINATED in
+   panfrost_job_handle_err()); the stopped jobs on the other slots are
+   resumed as before and nothing is reset;
+ - the GPU is reset only when the hard stop has not taken effect after
+   JOB_HARD_STOP_TIMEOUT_MS (0.5 s), and the job still running on that
+   slot is then failed instead of restarted from scratch, which would only
+   time out and reset again;
+ - every GPU reset bumps pfdev->reset.count. A job records the count when
+   it is soft-stopped (jc moved to JS_TAIL) and panfrost_job_run() fails
+   it with -ECANCELED if the GPU was reset since, instead of resuming it;
+ - the no-reset path releases the address space reference of the jobs
+   that were waiting in _NEXT when it was cancelled. The reset path has
+   panfrost_mmu_reset() wipe those; without a reset they leaked one
+   as_count per cycle, which keeps the address space from ever being
+   reassigned;
+ - the failure messages carry the status of every slot.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/panfrost/panfrost_device.h |    5 +
+ drivers/gpu/drm/panfrost/panfrost_job.c    |  122 +++++++++++++++++++++++-----
+ drivers/gpu/drm/panfrost/panfrost_job.h    |    8 ++
+ 3 files changed, 114 insertions(+), 21 deletions(-)
+
+--- a/drivers/gpu/drm/panfrost/panfrost_device.h
++++ b/drivers/gpu/drm/panfrost/panfrost_device.h
+@@ -166,6 +166,11 @@
+ 		struct workqueue_struct *wq;
+ 		struct work_struct work;
+ 		atomic_t pending;
++		/* Bumped by every GPU reset. A soft-stopped job may only be
++		 * resumed while this still reads what it did when the job was
++		 * stopped (see panfrost_job_run()).
++		 */
++		unsigned int count;
+ 	} reset;
+ 
+ 	struct mutex shrinker_lock;
+--- a/drivers/gpu/drm/panfrost/panfrost_job.c
++++ b/drivers/gpu/drm/panfrost/panfrost_job.c
+@@ -25,6 +25,19 @@
+ #define MAX_JM_CTX_PER_FILE 64
+ #define JOB_TIMEOUT_MS 500
+ 
++/* How long a soft-stopped slot gets to reach a task boundary before its job is
++ * hard-stopped, and how long the hard stop gets before the GPU is reset. These
++ * follow the Arm driver's job slot policy (mali_kbase_config_defaults.h): a job
++ * is soft-stopped after its 100 ms time slice (JS_SOFT_STOP_TICKS = 1 tick),
++ * hard-stopped when it has not stopped by tick 50 (JS_HARD_STOP_TICKS_SS, 5 s)
++ * and the GPU is reset at tick 55 (JS_RESET_TICKS_SS, 5.5 s). A soft-stop
++ * takes effect at a task boundary only, after the tasks already issued (a
++ * compute job's work-groups, a fragment job's tiles) have run to completion,
++ * and a heavy shader needs seconds for that.
++ */
++#define JOB_SOFT_STOP_TIMEOUT_MS 5000
++#define JOB_HARD_STOP_TIMEOUT_MS 500
++
+ #define job_write(dev, reg, data) writel(data, dev->iomem + (reg))
+ #define job_read(dev, reg) readl(dev->iomem + (reg))
+ 
+@@ -418,6 +431,17 @@
+ 	if (!job->jc)
+ 		return NULL;
+ 
++	/* A soft-stopped job carries its progress in the job header and the
++	 * GPU caches, which a GPU reset throws away. Resumed from JS_TAIL after
++	 * a reset it would complete with the results of the tasks since the
++	 * last cache write-back missing, and no error. Fail it instead, as the
++	 * Arm driver fails every atom that was on the hardware at a reset.
++	 */
++	if (job->stopped && job->stop_reset_count != pfdev->reset.count) {
++		dma_fence_set_error(&job->base.s_fence->finished, -ECANCELED);
++		return NULL;
++	}
++
+ 	fence = panfrost_fence_create(pfdev, slot);
+ 	if (IS_ERR(fence))
+ 		return fence;
+@@ -478,6 +502,8 @@
+ 		/* Update the job head so we can resume */
+ 		job->jc = job_read(pfdev, JS_TAIL_LO(js)) |
+ 			  ((u64)job_read(pfdev, JS_TAIL_HI(js)) << 32);
++		job->stopped = true;
++		job->stop_reset_count = pfdev->reset.count;
+ 
+ 		/* The job will be resumed, don't signal the fence */
+ 		signal_fence = false;
+@@ -707,20 +733,49 @@
+ 		job_write(pfdev, JS_COMMAND(i), JS_COMMAND_SOFT_STOP);
+ 	}
+ 
+-	/* Wait at most 10ms for soft-stops to complete. A job that was still
+-	 * active gets 100ms: the soft-stop lets the tasks already issued run
+-	 * to completion, and a long compute kernel has hundreds in flight.
+-	 * Every slot must have gone idle before we touch the queues: a job
++	/* Every slot must have gone idle before we touch the queues: a job
+ 	 * that is still stopping (or finishing) raises its interrupt later,
+ 	 * when its entry in pfdev->jobs[] is gone or belongs to its own
+ 	 * resubmission, and the second start of that job then runs on a slot
+ 	 * we have no job for.
+-	 */
+-	ret = read_poll_timeout(panfrost_slots_idle, idle, idle, 10,
+-				job_active ? 100000 : 10000, false, pfdev);
++	 *
++	 * A slot that was idle or faulted gets 10 ms. A job that was still
++	 * active gets the time the Arm driver gives it to reach a task
++	 * boundary (JOB_SOFT_STOP_TIMEOUT_MS). If it has not stopped by then
++	 * it is hard-stopped, which terminates it at once and fails it
++	 * (TERMINATED, see panfrost_job_handle_err()), instead of resetting
++	 * the GPU under every job on it; the GPU is reset only when the hard
++	 * stop does not take effect either.
++	 */
++	ret = read_poll_timeout(panfrost_slots_idle, idle, idle,
++				job_active ? 200 : 10,
++				job_active ? JOB_SOFT_STOP_TIMEOUT_MS * 1000 : 10000,
++				false, pfdev);
++
++	if (ret && job_active) {
++		dev_err(pfdev->base.dev,
++			"Soft-stop failed after %u ms (js status 0x%x 0x%x 0x%x), hard-stopping the active slots\n",
++			JOB_SOFT_STOP_TIMEOUT_MS,
++			job_read(pfdev, JS_STATUS(0)), job_read(pfdev, JS_STATUS(1)),
++			job_read(pfdev, JS_STATUS(2)));
++
++		for (i = 0; i < NUM_JOB_SLOTS; i++) {
++			if (job_read(pfdev, JS_STATUS(i)) ==
++			    DRM_PANFROST_EXCEPTION_ACTIVE)
++				job_write(pfdev, JS_COMMAND(i), JS_COMMAND_HARD_STOP);
++		}
++
++		ret = read_poll_timeout(panfrost_slots_idle, idle, idle, 200,
++					JOB_HARD_STOP_TIMEOUT_MS * 1000, false,
++					pfdev);
++	}
+ 
+ 	if (ret) {
+-		dev_err(pfdev->base.dev, "Soft-stop failed\n");
++		dev_err(pfdev->base.dev,
++			"%s failed (js status 0x%x 0x%x 0x%x), resetting the GPU\n",
++			job_active ? "Hard-stop" : "Soft-stop",
++			job_read(pfdev, JS_STATUS(0)), job_read(pfdev, JS_STATUS(1)),
++			job_read(pfdev, JS_STATUS(2)));
+ 		job_active = false;
+ 	}
+ 
+@@ -728,32 +783,57 @@
+ 	panfrost_jm_handle_irqs(pfdev);
+ 
+ 	/* Remaining interrupts have been handled, but we might still have
+-	 * stuck jobs. Let's make sure the PM counters stay balanced by
++	 * stuck jobs, and jobs that were waiting in _NEXT when it was
++	 * cancelled. Let's make sure the PM counters stay balanced by
+ 	 * manually calling pm_runtime_put_noidle() and
+-	 * panfrost_devfreq_record_idle() for each stuck job.
++	 * panfrost_devfreq_record_idle() for each of them.
+ 	 * Let's also make sure the cycle counting register's refcnt is
+-	 * kept balanced to prevent it from running forever
++	 * kept balanced to prevent it from running forever.
+ 	 */
+ 	spin_lock(&pfdev->js->job_lock);
+ 	for (i = 0; i < NUM_JOB_SLOTS; i++) {
+ 		for (j = 0; j < ARRAY_SIZE(pfdev->jobs[0]) && pfdev->jobs[i][j]; j++) {
+-			if (pfdev->jobs[i][j]->requirements & PANFROST_JD_REQ_CYCLE_COUNT ||
+-			    pfdev->jobs[i][j]->is_profiled)
+-				panfrost_cycle_counter_put(pfdev->jobs[i][j]->pfdev);
++			struct panfrost_job *job = pfdev->jobs[i][j];
++
++			if (job->requirements & PANFROST_JD_REQ_CYCLE_COUNT ||
++			    job->is_profiled)
++				panfrost_cycle_counter_put(job->pfdev);
+ 			pm_runtime_put_noidle(pfdev->base.dev);
+ 			panfrost_devfreq_record_idle(&pfdev->pfdevfreq);
++
++			/* The GPU reset wipes the address space assignments;
++			 * without one, release the reference the submission
++			 * took, or the address space can never be reassigned.
++			 */
++			if (job_active)
++				panfrost_mmu_as_put(pfdev, job->mmu);
++
++			/* The job still running on a slot that neither stop
++			 * took effect on is what forces the reset. Fail it,
++			 * as the Arm driver fails every atom on the hardware
++			 * at a reset: restarted from scratch it would hit the
++			 * timeout and the reset again.
++			 */
++			if (!job_active && j == 0 &&
++			    job_read(pfdev, JS_STATUS(i)) ==
++			    DRM_PANFROST_EXCEPTION_ACTIVE)
++				dma_fence_set_error(&job->base.s_fence->finished,
++						    -ECANCELED);
+ 		}
+ 	}
++	if (!job_active)
++		pfdev->reset.count++;
+ 	memset(pfdev->jobs, 0, sizeof(pfdev->jobs));
+ 	spin_unlock(&pfdev->js->job_lock);
+ 
+-	/* Proceed with reset now, unless the slot was simply busy with a long
+-	 * job. That job stopped at a task boundary and will be resumed from
+-	 * JS_TAIL (see panfrost_job_handle_err()). The hardware keeps its
+-	 * resume state in the job header and the results of the tasks that
+-	 * already finished in the L2: a soft reset throws both away, and the
+-	 * job then completes with stale data in the buffers it had still to
+-	 * write and no error reported.
++	/* Proceed with reset now, unless the slots were simply busy with long
++	 * jobs that stopped at a task boundary (or a hard stop ended the one
++	 * that did not). The stopped jobs will be resumed from JS_TAIL (see
++	 * panfrost_job_handle_err()). The hardware keeps their resume state in
++	 * the job header and the results of the tasks that already finished
++	 * in the L2: a soft reset throws both away, and a job resumed after it
++	 * completes with stale data in the buffers it had still to write and
++	 * no error reported (panfrost_job_run() fails such a job instead).
+ 	 */
+ 	if (!job_active)
+ 		panfrost_device_reset(pfdev, false);
+--- a/drivers/gpu/drm/panfrost/panfrost_job.h
++++ b/drivers/gpu/drm/panfrost/panfrost_job.h
+@@ -27,6 +27,14 @@
+ 	__u32 requirements;
+ 	__u32 flush_id;
+ 
++	/* Set once the job has been soft-stopped: jc then points into a partly
++	 * executed chain whose progress lives in the job header and the GPU
++	 * caches, and is only valid while the GPU has not been reset since
++	 * (pfdev->reset.count at the time of the stop).
++	 */
++	bool stopped;
++	unsigned int stop_reset_count;
++
+ 	struct panfrost_gem_mapping **mappings;
+ 	struct drm_gem_object **bos;
+ 	u32 bo_count;
+-- 
+2.43.0
