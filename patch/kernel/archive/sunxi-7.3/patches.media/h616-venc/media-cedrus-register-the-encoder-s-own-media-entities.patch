@@ -1,0 +1,256 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 06:40:00 +0000
+Subject: [PATCH] media: cedrus: register the encoder's own media entities
+
+The encoder is a second video device on the decoder's M2M device so that
+the jobs of both are serialised on the engine. Its media controller
+entities were registered with a second v4l2_m2m_register_media_controller()
+call on that M2M device. The helper keeps one set of sink and proc entities
+per M2M device, so the second call re-registered the decoder's: WARN_ON()
+in media_device_register_entity() twice at probe, and, because
+media_entity_pads_init() and media_device_register_entity() both add the
+pads of an already registered entity to the media device's pad list, the
+list ends with the sink pad linked to itself. From then on every
+MEDIA_IOC_G_TOPOLOGY (v4l2-ctl -D/--all, v4l2-compliance, any media-aware
+client, on either video node) loops forever in media_device_get_topology()
+with the graph mutex held: the task cannot be killed, nothing on the
+engine can be used, and a reboot waits out the stop timeouts.
+
+Give the encoder its own source, proc and sink entities, pads and
+interface node, created the way the helper creates the decoder's, on the
+same media device, and remove them with the device.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/staging/media/sunxi/cedrus/cedrus.c | 145 +++++++++++++++++++++---
+ drivers/staging/media/sunxi/cedrus/cedrus.h | 7 +++++++
+ 2 files changed, 144 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -919,6 +919,157 @@
+ 	.req_queue	= v4l2_m2m_request_queue,
+ };
+ 
++/*
++ * The encoder is a second video device on the decoder's M2M device, so that
++ * the jobs of both are serialised on the engine. The M2M helper registers one
++ * set of media entities per M2M device, and the decoder's are registered
++ * through it: calling it a second time for the encoder re-registers the
++ * helper's sink and proc entities and their pads (WARN_ON in
++ * media_device_register_entity()), which leaves the media device's pad list
++ * with a pad linked to itself. MEDIA_IOC_G_TOPOLOGY (v4l2-ctl, v4l2-compliance,
++ * every media-aware client) then loops forever with the graph mutex held,
++ * unkillable, and nothing on the engine can be used or shut down.
++ * The encoder gets its own entities, pads and interface here, shaped like the
++ * helper's.
++ */
++static int cedrus_enc_register_entity(struct cedrus_dev *dev,
++				      struct media_entity *entity,
++				      struct media_pad *pads,
++				      unsigned int num_pads,
++				      const char *suffix, u32 function,
++				      bool devnode)
++{
++	struct video_device *vdev = &dev->vfd_enc;
++	int ret;
++
++	entity->obj_type = MEDIA_ENTITY_TYPE_BASE;
++	if (devnode) {
++		entity->info.dev.major = VIDEO_MAJOR;
++		entity->info.dev.minor = vdev->minor;
++	}
++	entity->name = kasprintf(GFP_KERNEL, "%s-%s", vdev->name, suffix);
++	if (!entity->name)
++		return -ENOMEM;
++	entity->function = function;
++
++	ret = media_entity_pads_init(entity, num_pads, pads);
++	if (!ret)
++		ret = media_device_register_entity(&dev->mdev, entity);
++	if (ret) {
++		kfree(entity->name);
++		entity->name = NULL;
++	}
++
++	return ret;
++}
++
++static int cedrus_enc_register_media(struct cedrus_dev *dev)
++{
++	struct media_entity *source = &dev->vfd_enc.entity;
++	const u32 flags = MEDIA_LNK_FL_IMMUTABLE | MEDIA_LNK_FL_ENABLED;
++	struct media_link *link;
++	int ret;
++
++	dev->enc_source_pad.flags = MEDIA_PAD_FL_SOURCE;
++	dev->enc_proc_pads[0].flags = MEDIA_PAD_FL_SINK;
++	dev->enc_proc_pads[1].flags = MEDIA_PAD_FL_SOURCE;
++	dev->enc_sink_pad.flags = MEDIA_PAD_FL_SINK;
++
++	ret = cedrus_enc_register_entity(dev, source, &dev->enc_source_pad, 1,
++					 "source", MEDIA_ENT_F_IO_V4L, true);
++	if (ret)
++		return ret;
++
++	ret = cedrus_enc_register_entity(dev, &dev->enc_proc,
++					 dev->enc_proc_pads, 2, "proc",
++					 MEDIA_ENT_F_PROC_VIDEO_ENCODER, false);
++	if (ret)
++		goto err_source;
++
++	ret = cedrus_enc_register_entity(dev, &dev->enc_sink,
++					 &dev->enc_sink_pad, 1, "sink",
++					 MEDIA_ENT_F_IO_V4L, true);
++	if (ret)
++		goto err_proc;
++
++	ret = media_create_pad_link(source, 0, &dev->enc_proc, 0, flags);
++	if (ret)
++		goto err_sink;
++
++	ret = media_create_pad_link(&dev->enc_proc, 1, &dev->enc_sink, 0,
++				    flags);
++	if (ret)
++		goto err_links;
++
++	dev->enc_intf_devnode = media_devnode_create(&dev->mdev,
++						     MEDIA_INTF_T_V4L_VIDEO, 0,
++						     VIDEO_MAJOR,
++						     dev->vfd_enc.minor);
++	if (!dev->enc_intf_devnode) {
++		ret = -ENOMEM;
++		goto err_links;
++	}
++
++	link = media_create_intf_link(source, &dev->enc_intf_devnode->intf,
++				      flags);
++	if (!link) {
++		ret = -ENOMEM;
++		goto err_devnode;
++	}
++
++	link = media_create_intf_link(&dev->enc_sink,
++				      &dev->enc_intf_devnode->intf, flags);
++	if (!link) {
++		ret = -ENOMEM;
++		goto err_intf_links;
++	}
++
++	return 0;
++
++err_intf_links:
++	media_remove_intf_links(&dev->enc_intf_devnode->intf);
++err_devnode:
++	media_devnode_remove(dev->enc_intf_devnode);
++	dev->enc_intf_devnode = NULL;
++err_links:
++	media_entity_remove_links(source);
++	media_entity_remove_links(&dev->enc_proc);
++	media_entity_remove_links(&dev->enc_sink);
++err_sink:
++	media_device_unregister_entity(&dev->enc_sink);
++	kfree(dev->enc_sink.name);
++err_proc:
++	media_device_unregister_entity(&dev->enc_proc);
++	kfree(dev->enc_proc.name);
++err_source:
++	media_device_unregister_entity(source);
++	kfree(source->name);
++
++	return ret;
++}
++
++static void cedrus_enc_unregister_media(struct cedrus_dev *dev)
++{
++	struct media_entity *source = &dev->vfd_enc.entity;
++
++	if (!dev->enc_intf_devnode)
++		return;
++
++	media_remove_intf_links(&dev->enc_intf_devnode->intf);
++	media_devnode_remove(dev->enc_intf_devnode);
++	dev->enc_intf_devnode = NULL;
++
++	media_entity_remove_links(source);
++	media_entity_remove_links(&dev->enc_sink);
++	media_entity_remove_links(&dev->enc_proc);
++	media_device_unregister_entity(source);
++	media_device_unregister_entity(&dev->enc_sink);
++	media_device_unregister_entity(&dev->enc_proc);
++	kfree(source->name);
++	kfree(dev->enc_sink.name);
++	kfree(dev->enc_proc.name);
++}
++
+ static int cedrus_probe(struct platform_device *pdev)
+ {
+ 	struct cedrus_dev *dev;
+@@ -996,9 +1147,6 @@
+ 	/*
+ 	 * The encoder is a second video device on the same M2M device, so
+ 	 * that its jobs and the decoding jobs are serialised on the engine.
+-	 * Its media controller entities are created by the same helper,
+-	 * whose bookkeeping only knows one set: the decoder's entities are
+-	 * then released with the media device.
+ 	 */
+ 	if (dev->capabilities & CEDRUS_CAPABILITY_H264_ENC) {
+ 		dev->vfd_enc = cedrus_enc_video_device;
+@@ -1017,9 +1165,7 @@
+ 			  "Encoder registered as /dev/video%d\n",
+ 			  dev->vfd_enc.num);
+ 
+-		ret = v4l2_m2m_register_media_controller(dev->m2m_dev,
+-							 &dev->vfd_enc,
+-							 MEDIA_ENT_F_PROC_VIDEO_ENCODER);
++		ret = cedrus_enc_register_media(dev);
+ 		if (ret) {
+ 			v4l2_err(&dev->v4l2_dev,
+ 				 "Failed to initialize the encoder media controller\n");
+@@ -1030,13 +1176,16 @@
+ 	ret = media_device_register(&dev->mdev);
+ 	if (ret) {
+ 		v4l2_err(&dev->v4l2_dev, "Failed to register media device\n");
+-		goto err_m2m_mc;
++		goto err_enc_mc;
+ 	}
+ 
+ 	return 0;
+ 
++err_enc_mc:
++	cedrus_enc_unregister_media(dev);
+ err_video_enc:
+-	video_unregister_device(&dev->vfd_enc);
++	if (video_is_registered(&dev->vfd_enc))
++		video_unregister_device(&dev->vfd_enc);
+ err_m2m_mc:
+ 	v4l2_m2m_unregister_media_controller(dev->m2m_dev);
+ err_video:
+@@ -1059,6 +1208,7 @@
+ 	cancel_delayed_work_sync(&dev->watchdog_work);
+ 	if (media_devnode_is_registered(dev->mdev.devnode)) {
+ 		media_device_unregister(&dev->mdev);
++		cedrus_enc_unregister_media(dev);
+ 		v4l2_m2m_unregister_media_controller(dev->m2m_dev);
+ 		media_device_cleanup(&dev->mdev);
+ 	}
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -377,6 +377,13 @@
+ 	/* The encoder video device, with CEDRUS_CAPABILITY_H264_ENC. */
+ 	struct video_device	vfd_enc;
+ 	struct media_device	mdev;
++	/* Media controller entities of the encoder (cedrus_enc_register_media()). */
++	struct media_entity	enc_proc;
++	struct media_entity	enc_sink;
++	struct media_pad	enc_source_pad;
++	struct media_pad	enc_sink_pad;
++	struct media_pad	enc_proc_pads[2];
++	struct media_intf_devnode *enc_intf_devnode;
+ 	struct media_pad	pad[2];
+ 	struct platform_device	*pdev;
+ 	struct device		*dev;
