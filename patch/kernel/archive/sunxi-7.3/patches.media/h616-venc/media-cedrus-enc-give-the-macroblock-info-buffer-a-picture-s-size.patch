@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 08:11:00 +0000
+Subject: [PATCH] media: cedrus: enc: give the macroblock info buffer a picture's size
+
+Runner job 35 (kernel c31) encoded 1280x720 and 1920x1080 without a
+fault, then the first 1366x768 picture stalled:
+
+  sun50i-iommu 30f0000.iommu: Page fault for 0x00000000fff83000 (master 3, dir rd, L2 page table, status 0x8)
+  cedrus 1c0e000.video-codec: frame processing timed out!
+
+An L2 fault is an unmapped page inside an otherwise mapped 1 MiB region.
+dma-iommu rounds IOVA ranges below 32 pages up to a power of two and
+aligns them to their size, so a buffer whose end is 0xfff83000 starts at
+0xfff80000 and is 12 KiB: the macroblock info buffer (0xbc0), sized as
+the V3s map says (4 KiB per 32 macroblock columns, 3 pages for 86
+columns), is the only buffer of the encoder that matches. 1280x720 has
+the same 12 KiB with fewer rows; at 1920x1080 the buffer fills its IOVA
+range, so a read past it lands in the next mapping.
+
+How far the engine reads is not documented. Give the buffer a picture's
+size (luma and chroma, 32-aligned width, 128-aligned height), as the T527
+driver, the one encoder of this family that runs behind an IOMMU, does.
+The IOMMU stays on.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -411,8 +411,21 @@
+ 	h264_ctx->width_mbs = DIV_ROUND_UP(ctx->src_fmt.width, 16);
+ 	h264_ctx->height_mbs = DIV_ROUND_UP(ctx->src_fmt.height, 16);
+ 
+-	/* Macroblock information buffer: 4 KiB per 32 macroblock columns. */
+-	h264_ctx->mb_info_size = DIV_ROUND_UP(h264_ctx->width_mbs, 32) * SZ_4K;
++	/*
++	 * Macroblock information buffer (0xbc0). The V3s register map gives
++	 * it 4 KiB per 32 macroblock columns, but the H616 engine reads past
++	 * that: job 35's first 1366x768 picture (86 by 48 macroblocks: 12 KiB
++	 * in a 16 KiB IOVA range) faulted on the first page after it ("Page
++	 * fault for 0xfff83000 ... L2 page table", the end of the only buffer
++	 * of the picture that fits there), 1280x720 (also 12 KiB, fewer rows)
++	 * did not, and at 1920x1080 (16 KiB, no unmapped tail) a read past
++	 * the end lands in the next mapping. How far it reads is not
++	 * documented: give it a picture's size, as the T527 driver (the one
++	 * encoder of this family behind an IOMMU) does.
++	 */
++	h264_ctx->mb_info_size =
++		ALIGN(ALIGN(h264_ctx->width_mbs * 16, 32) *
++		      ALIGN(h264_ctx->height_mbs * 16, 128) * 3 / 2, SZ_4K);
+ 	h264_ctx->mb_info = dma_alloc_attrs(dev, h264_ctx->mb_info_size,
+ 					    &h264_ctx->mb_info_dma, GFP_KERNEL,
+ 					    DMA_ATTR_NO_KERNEL_MAPPING);
