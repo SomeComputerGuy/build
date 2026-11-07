@@ -1,0 +1,133 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 7 Nov 2026 12:00:00 +0000
+Subject: [PATCH] lib: rsa: leave out the ENGINE code when OpenSSL has no
+ ENGINE support
+
+OpenSSL 4.0 removed the ENGINE API. <openssl/engine.h> now only has
+deprecated stubs and <openssl/configuration.h> defines
+OPENSSL_NO_ENGINE, so building the host tools gives 13 warnings like
+
+  lib/rsa/rsa-sign.c:115:9: warning: 'ENGINE_get_id' is deprecated:
+  ENGINE_get_id API symbol is replaced with stub to avoid linker error.
+  [-Wdeprecated-declarations]
+
+and "mkimage -N <engine>" cannot work with such a library anyway.
+
+Build the engine key loaders, rsa_engine_init() and
+rsa_engine_remove() only without OPENSSL_NO_ENGINE. Otherwise
+rsa_engine_init() reports that the engine is not available and returns
+-ENOTSUP, and keys are read from PEM files as before. With an OpenSSL
+that has ENGINE support nothing changes.
+
+The OpenSSL provider API series on the list ("Add support for OpenSSL
+Provider API", v4) is not merged yet; this is the minimal guard until
+it is.
+
+Assisted-by: Claude
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ lib/rsa/rsa-sign.c | 28 ++++++++++++++++++++++++++++
+ 1 file changed, 28 insertions(+)
+
+diff --git a/lib/rsa/rsa-sign.c b/lib/rsa/rsa-sign.c
+index 0e38c9e..b153f85 100644
+--- a/lib/rsa/rsa-sign.c
++++ b/lib/rsa/rsa-sign.c
+@@ -19,7 +19,14 @@
+ #include <openssl/err.h>
+ #include <openssl/ssl.h>
+ #include <openssl/evp.h>
++/*
++ * OpenSSL 4.0 removed the ENGINE API (only deprecated stubs remain) and defines
++ * OPENSSL_NO_ENGINE. Without it, keys can only come from PEM files (-k/-G);
++ * the engine (-N) path is left out instead of calling the stubs.
++ */
++#ifndef OPENSSL_NO_ENGINE
+ #include <openssl/engine.h>
++#endif
+ 
+ static int rsa_err(const char *msg)
+ {
+@@ -89,6 +96,7 @@ err_cert:
+ 	return ret;
+ }
+ 
++#ifndef OPENSSL_NO_ENGINE
+ /**
+  * rsa_engine_get_pub_key() - read a public key from given engine
+  *
+@@ -157,6 +165,7 @@ static int rsa_engine_get_pub_key(const char *keydir, const char *name,
+ 
+ 	return 0;
+ }
++#endif
+ 
+ /**
+  * rsa_get_pub_key() - read a public key
+@@ -170,8 +179,10 @@ static int rsa_engine_get_pub_key(const char *keydir, const char *name,
+ static int rsa_get_pub_key(const char *keydir, const char *name,
+ 			   ENGINE *engine, EVP_PKEY **evpp)
+ {
++#ifndef OPENSSL_NO_ENGINE
+ 	if (engine)
+ 		return rsa_engine_get_pub_key(keydir, name, engine, evpp);
++#endif
+ 	return rsa_pem_get_pub_key(keydir, name, evpp);
+ }
+ 
+@@ -217,6 +228,7 @@ static int rsa_pem_get_priv_key(const char *keydir, const char *name,
+ 	return 0;
+ }
+ 
++#ifndef OPENSSL_NO_ENGINE
+ /**
+  * rsa_engine_get_priv_key() - read a private key from given engine
+  *
+@@ -293,6 +305,7 @@ static int rsa_engine_get_priv_key(const char *keydir, const char *name,
+ 
+ 	return 0;
+ }
++#endif
+ 
+ /**
+  * rsa_get_priv_key() - read a private key
+@@ -306,9 +319,11 @@ static int rsa_engine_get_priv_key(const char *keydir, const char *name,
+ static int rsa_get_priv_key(const char *keydir, const char *name,
+ 			    const char *keyfile, ENGINE *engine, EVP_PKEY **evpp)
+ {
++#ifndef OPENSSL_NO_ENGINE
+ 	if (engine)
+ 		return rsa_engine_get_priv_key(keydir, name, keyfile, engine,
+ 					       evpp);
++#endif
+ 	return rsa_pem_get_priv_key(keydir, name, keyfile, evpp);
+ }
+ 
+@@ -325,6 +340,7 @@ static int rsa_init(void)
+ 	return 0;
+ }
+ 
++#ifndef OPENSSL_NO_ENGINE
+ static int rsa_engine_init(const char *engine_id, ENGINE **pe)
+ {
+ 	const char *key_pass;
+@@ -380,6 +396,18 @@ static void rsa_engine_remove(ENGINE *e)
+ 		ENGINE_free(e);
+ 	}
+ }
++#else
++static int rsa_engine_init(const char *engine_id, ENGINE **pe)
++{
++	fprintf(stderr, "Engine '%s' isn't available: OpenSSL was built without ENGINE support\n",
++		engine_id);
++	return -ENOTSUP;
++}
++
++static void rsa_engine_remove(ENGINE *e)
++{
++}
++#endif
+ 
+ static int rsa_sign_with_key(EVP_PKEY *pkey, struct padding_algo *padding_algo,
+ 			     struct checksum_algo *checksum_algo,
