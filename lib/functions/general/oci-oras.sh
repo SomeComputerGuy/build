@@ -256,8 +256,15 @@ function oras_get_artifact_manifest() {
 	if [[ "${oras_has_manifest}" == "no" ]]; then
 		oras_manifest_error="not_found"
 		if [[ -n "${oras_stderr}" && "${oras_stderr}" != *"not found"* ]]; then
-			oras_manifest_error="error"
-			display_alert "ORAS manifest fetch error" "${oras_stderr}" "wrn"
+			if [[ "${oras_stderr}" == *"denied: requested access to the resource is denied"* ]]; then
+				# ghcr.io answers a manifest fetch from a repository that does not exist (nothing of this
+				# artifact name was ever pushed, e.g. a rootfs of a release or desktop not built by Armbian's CI)
+				# with "denied", not "not found". For a read that is the same cache miss.
+				display_alert "ORAS: no such repository (or not public), cache miss" "${image_full_oci%:*}" "info"
+			else
+				oras_manifest_error="error"
+				display_alert "ORAS manifest fetch error" "${oras_stderr}" "wrn"
+			fi
 		fi
 	fi
 	display_alert "oras_has_manifest after: ${oras_has_manifest}" "ORAS manifest yes/no" "debug"
