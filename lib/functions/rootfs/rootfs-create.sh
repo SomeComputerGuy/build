@@ -244,7 +244,12 @@ function create_new_rootfs_cache_via_debootstrap() {
 	if [[ $BUILD_DESKTOP == "yes" ]]; then
 		display_alert "Installing desktop via armbian-config" "${DESKTOP_ENVIRONMENT} tier=${DESKTOP_TIER:-mid}" "info"
 		chroot_sdcard_apt_get_install armbian-config
-		chroot_sdcard "SUDO_USER= DEBIAN_FRONTEND=noninteractive DIALOG=read armbian-config --api module_desktops install de=${DESKTOP_ENVIRONMENT} tier=${DESKTOP_TIER:-mid} mode=build"
+		# module_desktops runs apt-get itself: run it with the host apt cache dirs bind-mounted at
+		# /var/cache/apt and /var/lib/apt/lists, as chroot_sdcard_apt_get does, so the desktop's .debs and
+		# lists land in the shared cache instead of the rootfs (which made apt_purge_unneeded_packages_and_clean_apt_caches
+		# warn "SDCARD /var/cache/apt is not empty" on every desktop rootfs build).
+		chroot_sdcard_custom_with_apt_logic env "SUDO_USER=" "DIALOG=read" armbian-config --api module_desktops install \
+			"de=${DESKTOP_ENVIRONMENT}" "tier=${DESKTOP_TIER:-mid}" mode=build
 	fi
 
 	# stage: check md5 sum of installed packages. Just in case. @TODO: rpardini: this should also be done when a cache is used, not only when it is created
