@@ -27,6 +27,9 @@ function prepare_rootfs_build_params_and_trap() {
 	# predicting the size of tmpfs is hard/impossible, so would be nice to show the used size at the end so we can tune.
 	declare -i tmpfs_estimated_size=2300                     # MiB - bumped from 2000, empirically
 	[[ $BUILD_DESKTOP == yes ]] && tmpfs_estimated_size=6000 # MiB
+	# A userpatches config with a larger package set can give its measured size ("Actual rootfs size" in the log)
+	# so the tmpfs decision and the size check after the tweaks use the real figure.
+	[[ -n "${ROOTFS_TMPFS_ESTIMATED_SIZE_MIB:-}" ]] && tmpfs_estimated_size="${ROOTFS_TMPFS_ESTIMATED_SIZE_MIB}"
 
 	declare use_tmpfs=no                      # by default
 	if [[ ${FORCE_USE_RAMDISK} == no ]]; then # do not use, even if it fits
