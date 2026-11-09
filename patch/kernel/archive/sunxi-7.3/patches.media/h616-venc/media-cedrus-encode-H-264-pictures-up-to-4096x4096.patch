@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Mon, 9 Nov 2026 23:00:00 +0000
+Subject: [PATCH] media: cedrus: encode H.264 pictures up to 4096x4096
+
+The H616 datasheet gives the encoder 4096x4096. Pictures wider than 2048
+pixels keep the context of a macroblock row in the external line buffer
+of 0xbc4 instead of the engine's own memory; the vendor library of the
+T527 sizes it at 8 bytes per luma column and sets no other register for
+them, the mode register's picture width bits being the decoder's (the
+vendor libraries set them on the decode path only). Every picture
+already gets a line buffer of twice that size, so lift the limit from
+2048x2048 to 4096x4096. The other register fields hold these sizes (the
+input stage size in units of 8 pixels in 11 bits, the stride in
+macroblocks divided by 48 in 4 bits).
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+@@ -31,16 +31,17 @@
+ #include "cedrus_video.h"
+ 
+ /*
+- * Pictures wider than 2048 pixels need the external deblocking line buffer
+- * (VE_ENC_AVC_DEBLK_ADDR) that the vendor library programs on the T527;
+- * it is not known for the H616 yet, so the encoder stops at 2048.
++ * Up to 4096x4096, the encoder's limit in the H616 datasheet. Pictures
++ * wider than 2048 pixels keep the context of a macroblock row in the
++ * external line buffer (VE_ENC_AVC_DEBLK_ADDR, 8 bytes per luma column in
++ * the vendor library of the T527), which every picture gets.
+  */
+ static const struct v4l2_frmsize_stepwise cedrus_enc_frmsize = {
+ 	.min_width	= 16,
+-	.max_width	= 2048,
++	.max_width	= 4096,
+ 	.step_width	= 2,
+ 	.min_height	= 16,
+-	.max_height	= 2048,
++	.max_height	= 4096,
+ 	.step_height	= 2,
+ };
+ 
