@@ -17,6 +17,12 @@ Ciphertext stealing (lengths that are not a multiple of the block size)
 and two 192-bit keys go to the fallback, as do the requests that the
 existing checks already send there.
 
+The engine is much slower than the CPU's ARMv8 AES instructions at XTS
+(about 210 MB/s against 860 MB/s for 64 KiB requests, and 4 to 17 times
+slower for 512-byte to 4 KiB sectors), so it registers below every CPU
+implementation of xts(aes): the CPU stays the default, for dm-crypt too,
+and the engine is used when it is asked for by driver name.
+
 The other variants get CE_ID_NOTSUPP for the new mode, so nothing
 changes for them.
 
@@ -25,8 +31,8 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  .../allwinner/sun8i-ce/sun8i-ce-cipher.c      | 102 +++++++++++++++---
  .../crypto/allwinner/sun8i-ce/sun8i-ce-core.c |  44 ++++++--
- drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h  |  13 ++-
- 3 files changed, 133 insertions(+), 26 deletions(-)
+ drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h  |  21 +++-
+ 3 files changed, 141 insertions(+), 26 deletions(-)
 
 diff --git a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-cipher.c b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-cipher.c
 index 021614b..b87be31 100644
@@ -214,7 +220,7 @@ index 021614b..b87be31 100644
  			 unsigned int keylen)
  {
 diff --git a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c
-index 21762bd..becbb5b 100644
+index 21762bd..a7d7719 100644
 --- a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c
 +++ b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c
 @@ -41,7 +41,7 @@ static const struct ce_variant ce_h3_variant = {
@@ -292,7 +298,7 @@ index 21762bd..becbb5b 100644
 +		.base = {
 +			.cra_name = "xts(aes)",
 +			.cra_driver_name = "xts-aes-sun8i-ce",
-+			.cra_priority = 400,
++			.cra_priority = CE_PRIO_BELOW_CPU,
 +			.cra_blocksize = AES_BLOCK_SIZE,
 +			.cra_flags = CRYPTO_ALG_TYPE_SKCIPHER |
 +				CRYPTO_ALG_ASYNC |
@@ -318,7 +324,7 @@ index 21762bd..becbb5b 100644
  	.type = CRYPTO_ALG_TYPE_SKCIPHER,
  	.ce_algo_id = CE_ID_CIPHER_DES3,
 diff --git a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h
-index 468d99b..06ecba1 100644
+index 468d99b..89689e5 100644
 --- a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h
 +++ b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h
 @@ -46,6 +46,10 @@
@@ -350,7 +356,22 @@ index 468d99b..06ecba1 100644
  
  /* Used in CE registers */
  #define CE_ERR_ALGO_NOTSUP	BIT(0)
-@@ -124,7 +130,8 @@ struct ce_clock {
+@@ -98,6 +104,14 @@
+ 
+ #define MAX_SG 8
+ 
++/*
++ * Priority of the modes that the CPU's own AES instructions run faster than
++ * the engine: below every CPU implementation of them (arm64 CE 300, NEON 250
++ * and 200, AES library 110, generic templates 100), so the CPU stays the
++ * default and the engine is used when it is asked for by driver name.
++ */
++#define CE_PRIO_BELOW_CPU	90
++
+ #define CE_MAX_CLOCKS 4
+ #define CE_DMA_TIMEOUT_MS	3000
+ 
+@@ -124,7 +138,8 @@ struct ce_clock {
   *              coresponding CE_ALG_XXX value
   * @alg_hash:	list of supported hashes. for each CE_ID_ this will give the
   *              corresponding CE_ALG_XXX value
@@ -360,7 +381,7 @@ index 468d99b..06ecba1 100644
   * @cipher_t_dlen_in_bytes:	Does the request size for cipher is in
   *				bytes or words
   * @hash_t_dlen_in_bytes:	Does the request size for hash is in
-@@ -352,6 +359,8 @@ struct sun8i_ce_alg_template {
+@@ -352,6 +367,8 @@ struct sun8i_ce_alg_template {
  
  int sun8i_ce_aes_setkey(struct crypto_skcipher *tfm, const u8 *key,
  			unsigned int keylen);
