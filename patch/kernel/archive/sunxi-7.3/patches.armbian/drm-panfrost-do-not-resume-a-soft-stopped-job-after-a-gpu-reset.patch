@@ -1,8 +1,8 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 469ad49e49a05b5a460fcec74bf7f6c4bfb3bbba Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 05:00:06 +0000
-Subject: [PATCH 4/7] drm/panfrost: Don't resume a soft-stopped job after a GPU
- reset
+Subject: [PATCH 09/12] drm/panfrost: Don't resume a soft-stopped job after a
+ GPU reset
 
 panfrost_reset() soft-stops every slot before it resets the GPU. A job
 that reaches a task boundary in time reports STOPPED,
@@ -51,12 +51,12 @@ index 1fe1554..fc0595d 100644
  
  	struct mutex shrinker_lock;
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index d59b486..b7351f9 100644
+index b813493..0d3d8f6 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
-@@ -413,6 +413,17 @@ static struct dma_fence *panfrost_job_run(struct drm_sched_job *sched_job)
+@@ -416,6 +416,17 @@ static struct dma_fence *panfrost_job_run(struct drm_sched_job *sched_job)
  	if (!job->jc)
- 		return NULL;
+ 		return dma_fence_get(job->done_fence);
  
 +	/* A soft-stopped job carries its progress in the job header and the
 +	 * GPU caches, which a GPU reset throws away. Resumed from JS_TAIL after
@@ -72,7 +72,7 @@ index d59b486..b7351f9 100644
  	fence = panfrost_fence_create(pfdev, slot);
  	if (IS_ERR(fence))
  		return fence;
-@@ -473,6 +484,8 @@ static void panfrost_job_handle_err(struct panfrost_device *pfdev,
+@@ -476,6 +487,8 @@ static void panfrost_job_handle_err(struct panfrost_device *pfdev,
  		/* Update the job head so we can resume */
  		job->jc = job_read(pfdev, JS_TAIL_LO(js)) |
  			  ((u64)job_read(pfdev, JS_TAIL_HI(js)) << 32);
@@ -81,7 +81,7 @@ index d59b486..b7351f9 100644
  
  		/* The job will be resumed, don't signal the fence */
  		signal_fence = false;
-@@ -726,6 +739,7 @@ panfrost_reset(struct panfrost_device *pfdev,
+@@ -753,6 +766,7 @@ panfrost_reset(struct panfrost_device *pfdev,
  			panfrost_devfreq_record_idle(&pfdev->pfdevfreq);
  		}
  	}
@@ -108,3 +108,6 @@ index c3f57e4..580f8f2 100644
  	struct panfrost_gem_mapping **mappings;
  	struct drm_gem_object **bos;
  	u32 bo_count;
+-- 
+2.55.0
+

@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 10d158b1a04a621ab5834aa740700ed575145716 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 05:00:19 +0000
-Subject: [PATCH 5/7] drm/panfrost: Wait for the soft-stopped slots with the
+Subject: [PATCH 10/12] drm/panfrost: Wait for the soft-stopped slots with the
  live slot status
 
 panfrost_reset() soft-stops the slots and waits for them to go idle by
@@ -40,7 +40,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 26 insertions(+), 22 deletions(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index b7351f9..78d04a4 100644
+index 0d3d8f6..15c7e5b 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -163,7 +163,11 @@ panfrost_dequeue_job(struct panfrost_device *pfdev, int slot)
@@ -56,7 +56,7 @@ index b7351f9..78d04a4 100644
  
  	if (job->is_profiled && job->engine_usage) {
  		job->engine_usage->elapsed_ns[slot] +=
-@@ -645,34 +649,31 @@ static void panfrost_jm_handle_irqs(struct panfrost_device *pfdev)
+@@ -648,25 +652,23 @@ static void panfrost_jm_handle_irqs(struct panfrost_device *pfdev)
  	}
  }
  
@@ -95,9 +95,10 @@ index b7351f9..78d04a4 100644
  }
  
  static void
- panfrost_reset(struct panfrost_device *pfdev,
+@@ -674,9 +676,8 @@ panfrost_reset(struct panfrost_device *pfdev,
  	       struct drm_sched_job *bad)
  {
+ 	struct panfrost_job *evicted[NUM_JOB_SLOTS] = {};
 -	u32 js_state, js_state_mask = 0xffffffff;
  	unsigned int i, j;
 -	bool cookie;
@@ -105,9 +106,9 @@ index b7351f9..78d04a4 100644
  	int ret;
  
  	if (!atomic_read(&pfdev->reset.pending))
-@@ -711,10 +712,13 @@ panfrost_reset(struct panfrost_device *pfdev,
- 		job_write(pfdev, JS_COMMAND(i), JS_COMMAND_SOFT_STOP);
+@@ -732,10 +733,13 @@ panfrost_reset(struct panfrost_device *pfdev,
  	}
+ 	spin_unlock(&pfdev->js->job_lock);
  
 -	/* Wait at most 10ms for soft-stops to complete */
 -	ret = readl_poll_timeout(pfdev->iomem + JOB_INT_JS_STATE, js_state,
@@ -123,3 +124,6 @@ index b7351f9..78d04a4 100644
  
  	if (ret)
  		dev_err(pfdev->base.dev, "Soft-stop failed\n");
+-- 
+2.55.0
+

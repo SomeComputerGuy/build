@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 641ec107c78b6a44e28e2a20e35e12abef6fbbc7 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 04:59:55 +0000
-Subject: [PATCH 2/7] drm/panfrost: Unwind a failed GPU mapping without
+Subject: [PATCH 05/12] drm/panfrost: Unwind a failed GPU mapping without
  dropping its pages
 
 Two error paths of a BO mapping leave the wrong state behind when an
@@ -31,7 +31,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 15 insertions(+), 7 deletions(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_mmu.c b/drivers/gpu/drm/panfrost/panfrost_mmu.c
-index 575a4d5..99d713c 100644
+index 2e43b37..82e58c5 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_mmu.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_mmu.c
 @@ -437,8 +437,11 @@ static int mmu_map_sg(struct panfrost_device *pfdev, struct panfrost_mmu *mmu,
@@ -85,3 +85,6 @@ index 575a4d5..99d713c 100644
  }
  
  void panfrost_mmu_unmap(struct panfrost_gem_mapping *mapping)
+-- 
+2.55.0
+

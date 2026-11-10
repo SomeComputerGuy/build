@@ -1,0 +1,64 @@
+From 5849511e6da48905bb299eb94d7d6ec5a5e51309 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 10 Nov 2026 08:39:49 +0000
+Subject: [PATCH 08/12] drm/panfrost: Don't cancel a job that completed during
+ a reset
+
+panfrost_reset() stops the schedulers, which detaches them from the done
+fences of the jobs on the GPU, then soft-stops the slots and handles the
+interrupts that are still pending. A job that finishes in that window
+instead of stopping is completed by panfrost_jm_handle_done(): its done
+fence is signalled and its jc cleared. drm_sched_resubmit_jobs() then
+calls panfrost_job_run(), which returns NULL for a job with no jc, and
+since commit 03877d621db0 ("drm/scheduler: mark jobs without fence as
+canceled") drm_sched_start() completes a pending job without a hardware
+fence with -ECANCELED. The job did complete, but userspace is told it
+did not.
+
+Return the job's done fence instead: drm_sched_start() finds it
+signalled and completes the job with the fence's status, which is 0 for
+a job that finished and the error panfrost_job_handle_err() set for one
+that was hard-stopped or faulted.
+
+This depends on the previous patch: before it, a job cancelled from
+_NEXT could be taken for done in the same window, and would now be
+reported as completed without having run.
+
+Found by code review (Sashiko) of the next patches, which make the
+soft-stop wait longer and the window wider. Not reproduced.
+
+Fixes: 03877d621db0 ("drm/scheduler: mark jobs without fence as canceled")
+Cc: stable@vger.kernel.org
+Reported-by: Sashiko <sashiko-bot@kernel.org>
+Closes: https://lore.kernel.org/all/sashiko-outbox-206581@kernel.org/
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/panfrost/panfrost_job.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
+index 567da26..b813493 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_job.c
++++ b/drivers/gpu/drm/panfrost/panfrost_job.c
+@@ -407,11 +407,14 @@ static struct dma_fence *panfrost_job_run(struct drm_sched_job *sched_job)
+ 	if (unlikely(job->base.s_fence->finished.error))
+ 		return NULL;
+ 
+-	/* Nothing to execute: can happen if the job has finished while
+-	 * we were resetting the GPU.
++	/* Nothing to execute: the job has finished (or failed) on the GPU
++	 * while we were resetting it, after drm_sched_stop() had detached the
++	 * scheduler from its done fence. Hand that fence back, so that the job
++	 * completes with the status the GPU gave it: with no fence,
++	 * drm_sched_start() would complete it as cancelled.
+ 	 */
+ 	if (!job->jc)
+-		return NULL;
++		return dma_fence_get(job->done_fence);
+ 
+ 	fence = panfrost_fence_create(pfdev, slot);
+ 	if (IS_ERR(fence))
+-- 
+2.55.0
+
