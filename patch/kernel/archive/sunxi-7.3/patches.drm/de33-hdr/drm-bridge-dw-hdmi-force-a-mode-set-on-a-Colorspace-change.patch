@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 10 Nov 2026 02:01:34 +0000
+Subject: [PATCH 14/16] drm/bridge: dw-hdmi: Force a mode set on a Colorspace
+ change
+
+The AVI infoframe, which carries the colorimetry, is only written on a
+mode set, and a display engine in front of the controller may have to
+convert into a different YCbCr encoding. A change of the Colorspace
+property alone does not make the atomic helpers do a mode set, unlike
+a max bpc change, so the new value would only take effect on the next
+unrelated one. Mark the mode as changed, as is already done for the
+HDR output metadata.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/bridge/synopsys/dw-hdmi.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+index e3cd2acda..4e679b73a 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+@@ -2660,7 +2660,12 @@ static int dw_hdmi_connector_atomic_check(struct drm_connector *connector,
+ 	if (!crtc)
+ 		return 0;
+ 
+-	if (!drm_connector_atomic_hdr_metadata_equal(old_state, new_state)) {
++	/*
++	 * The AVI infoframe colorimetry is only written on a mode set, and
++	 * the display engine may convert to a different YCbCr encoding.
++	 */
++	if (!drm_connector_atomic_hdr_metadata_equal(old_state, new_state) ||
++	    old_state->colorspace != new_state->colorspace) {
+ 		crtc_state = drm_atomic_get_crtc_state(state, crtc);
+ 		if (IS_ERR(crtc_state))
+ 			return PTR_ERR(crtc_state);
