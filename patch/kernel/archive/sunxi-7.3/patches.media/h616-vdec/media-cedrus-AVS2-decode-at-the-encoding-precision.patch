@@ -1,0 +1,112 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 10 Nov 2026 00:33:06 +0000
+Subject: media: cedrus: AVS2: decode at the encoding precision
+
+A Main10 AVS2 stream can carry 8-bit samples coded at 10 bits
+(sample_precision 1, encoding_precision 2). Its pictures are
+reconstructed at 10 bits; the sample precision only describes the
+source. The driver took the decoding depth from sample_precision, as
+the vendor library does, and decoded such a stream at 8 bits: none of
+its pictures matched the encoder's reconstruction, rounded or truncated
+to 8 bits, or at 10 bits. The davs2 decoder reconstructs at the encoding
+precision and matches the encoder.
+
+Take the depth, and with it the capture formats, from
+encoding_precision, and say so in the uAPI documentation. Streams whose
+two precisions are equal decode as before.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../media/v4l/ext-ctrls-codec-stateless.rst       | 15 ++++++++-------
+ drivers/staging/media/sunxi/cedrus/cedrus.c       |  3 ++-
+ drivers/staging/media/sunxi/cedrus/cedrus_avs2.c  | 11 +++++++----
+ include/uapi/linux/v4l2-controls.h                |  7 ++++---
+ 4 files changed, 21 insertions(+), 15 deletions(-)
+
+diff --git a/Documentation/userspace-api/media/v4l/ext-ctrls-codec-stateless.rst b/Documentation/userspace-api/media/v4l/ext-ctrls-codec-stateless.rst
+index 0a0dd31..4b53d8b 100644
+--- a/Documentation/userspace-api/media/v4l/ext-ctrls-codec-stateless.rst
++++ b/Documentation/userspace-api/media/v4l/ext-ctrls-codec-stateless.rst
+@@ -5804,16 +5804,17 @@ frame-interlaced picture both elements are equal.
+       - chroma_format, 1 for 4:2:0.
+     * - __u8
+       - ``sample_precision``
+-      - sample_precision: 1 for 8-bit and 2 for 10-bit samples. The capture
+-	formats a driver offers depend on it, so the application sets this
+-	control before it enumerates or sets the capture format. A 10-bit
+-	stream is not tied to one capture format: drivers offer what their
+-	hardware writes, for example a packed 10-bit format, P010 or a
+-	compressed format.
++      - sample_precision: 1 for 8-bit and 2 for 10-bit samples.
+     * - __u8
+       - ``encoding_precision``
+       - encoding_precision: 1 for 8-bit and 2 for 10-bit coding. Set to 1
+-	when the profile has no encoding_precision.
++	when the profile has no encoding_precision. Pictures are decoded at
++	this precision, also when it is higher than sample_precision. The
++	capture formats a driver offers depend on it, so the application
++	sets this control before it enumerates or sets the capture format.
++	A 10-bit stream is not tied to one capture format: drivers offer
++	what their hardware writes, for example a packed 10-bit format, P010
++	or a compressed format.
+     * - __u8
+       - ``lcu_size``
+       - lcu_size, the base 2 logarithm of the largest coding unit size, 4
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+index ceaa7fb..bedaf4c 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -172,7 +172,8 @@ static int cedrus_try_ctrl(struct v4l2_ctrl *ctrl)
+ 					  seq->vertical_size))
+ 			return -EINVAL;
+ 
+-		bit_depth = 6 + 2 * seq->sample_precision;
++		/* The decoding depth, see cedrus_avs2_bit_depth(). */
++		bit_depth = 6 + 2 * seq->encoding_precision;
+ 		if (bit_depth > 8 &&
+ 		    !cedrus_is_capable(ctx, CEDRUS_CAPABILITY_H265_10_DEC))
+ 			return -EINVAL;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c b/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
+index 26452f2..7cccc2c 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
+@@ -113,11 +113,14 @@ static void cedrus_avs2_irq_disable(struct cedrus_ctx *ctx)
+ static unsigned int cedrus_avs2_bit_depth(const struct v4l2_ctrl_avs2_sequence *seq)
+ {
+ 	/*
+-	 * The vendor library programs the depth derived from
+-	 * sample_precision; see the uAPI documentation about streams whose
+-	 * encoding_precision differs.
++	 * Pictures are reconstructed at the encoding precision; the sample
++	 * precision only describes the source. A Main10 stream with 8-bit
++	 * samples (sample_precision 1, encoding_precision 2) has 10-bit
++	 * pictures, and decoding it at 8 bits gives wrong pictures. The vendor
++	 * library programs the depth from sample_precision, which is the same
++	 * for every other stream.
+ 	 */
+-	return 6 + 2 * seq->sample_precision;
++	return 6 + 2 * seq->encoding_precision;
+ }
+ 
+ static u8 cedrus_avs2_hw_pic_type(const struct v4l2_ctrl_avs2_picture *pic)
+diff --git a/include/uapi/linux/v4l2-controls.h b/include/uapi/linux/v4l2-controls.h
+index 30e7eaa..9c42261 100644
+--- a/include/uapi/linux/v4l2-controls.h
++++ b/include/uapi/linux/v4l2-controls.h
+@@ -4382,10 +4382,11 @@ struct v4l2_ctrl_h263_slice_params {
+  * @level_id: level_id.
+  * @chroma_format: chroma_format, 1 for 4:2:0.
+  * @sample_precision: sample_precision: 1 for 8-bit, 2 for 10-bit samples.
+- *	The capture formats offered depend on it; 10-bit output is not tied
+- *	to one format (packed 10-bit, P010 or compressed, per driver).
+  * @encoding_precision: encoding_precision: 1 for 8-bit, 2 for 10-bit
+- *	coding. Set to 1 when the profile has no encoding_precision.
++ *	coding. Set to 1 when the profile has no encoding_precision. Pictures
++ *	are decoded at this precision, and the capture formats offered depend
++ *	on it; 10-bit output is not tied to one format (packed 10-bit, P010 or
++ *	compressed, per driver).
+  * @lcu_size: lcu_size, the base 2 logarithm of the largest coding unit
+  *	size, 4 to 6.
+  * @picture_reorder_delay: picture_reorder_delay, 0 when LOW_DELAY is set.
