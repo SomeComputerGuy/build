@@ -17,23 +17,30 @@ transfers and target mode keep using the classic engine. The vendor
 driver uses the same engine and the same threshold. Without DMA
 channels the driver works as before.
 
+The packet engine reports a byte that is not acknowledged as status 0x01,
+"timeout when sending 9th SCL clk" (TIMEOUT_N SCL cycles without an ACK);
+it is reported as -ENXIO like a NAK on the classic engine. If SCL is
+still held low after both engines are reset and a STOP is sent, a target
+holds the clock and the transfer fails with -ETIMEDOUT instead.
+
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
 
 --- a/drivers/i2c/busses/i2c-mv64xxx.c
 +++ b/drivers/i2c/busses/i2c-mv64xxx.c
-@@ -26,6 +26,9 @@
+@@ -26,6 +26,10 @@
  #include <linux/clk.h>
  #include <linux/err.h>
  #include <linux/delay.h>
 +#include <linux/completion.h>
 +#include <linux/dma-mapping.h>
 +#include <linux/dmaengine.h>
++#include <linux/iopoll.h>
  
  #define MV64XXX_I2C_BAUD_DIV_N(val)			(val & 0x7)
  #define MV64XXX_I2C_BAUD_DIV_M(val)			((val & 0xf) << 3)
-@@ -110,6 +113,52 @@
+@@ -110,6 +114,57 @@
  /* Bridge Status values */
  #define	MV64XXX_I2C_BRIDGE_STATUS_ERROR			BIT(0)
  
@@ -42,6 +49,9 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 + * engine next to the classic one that sends a whole packet (address,
 + * register address bytes, data) from a 32-byte FIFO and can be fed by DMA.
 + */
++/* line control register: current state of SCL */
++#define	SUNXI_TWI_LCR					0x20
++#define	SUNXI_TWI_LCR_SCL_STATE				BIT(5)
 +#define	SUNXI_TWI_DRV_CTRL				0x200
 +#define	SUNXI_TWI_DRV_CFG				0x204
 +#define	SUNXI_TWI_DRV_SLV				0x208
@@ -56,6 +66,8 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +#define	SUNXI_TWI_DRV_CTRL_START			BIT(31)
 +#define	SUNXI_TWI_DRV_CTRL_READ_MODE			BIT(28)
 +#define	SUNXI_TWI_DRV_CTRL_STA(v)			(((v) >> 16) & 0xff)
++/* no ACK within TIMEOUT_N SCL cycles at the 9th clock of a byte */
++#define	SUNXI_TWI_DRV_STA_ACK_TIMEOUT			0x01
 +#define	SUNXI_TWI_DRV_CTRL_TIMEOUT(n)			((n) << 8)
 +#define	SUNXI_TWI_DRV_CTRL_SOFT_RESET			BIT(1)
 +#define	SUNXI_TWI_DRV_CTRL_EN				BIT(0)
@@ -86,7 +98,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  /* Driver states */
  enum {
  	MV64XXX_I2C_STATE_INVALID,
-@@ -185,6 +234,11 @@
+@@ -185,6 +240,12 @@
  	/* Allwinner variant: the engine can be addressed as a target */
  	bool			has_target;
  	struct i2c_client	*target;
@@ -94,11 +106,12 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +	struct dma_chan		*dma_tx;
 +	struct dma_chan		*dma_rx;
 +	bool			drv_active;
++	bool			drv_ack_timeout;
 +	struct completion	dma_done;
  };
  
  static struct mv64xxx_i2c_regs mv64xxx_i2c_regs_mv64xxx = {
-@@ -721,6 +775,45 @@
+@@ -721,6 +782,55 @@
  
  	spin_lock(&drv_data->lock);
  
@@ -119,10 +132,20 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +		/* write the pending bits back to clear them */
 +		writel(st, drv_data->reg_base + SUNXI_TWI_DRV_INT_CTRL);
 +		if (drv_data->block && (st & SUNXI_TWI_DRV_INT_ERR)) {
-+			/* no ACK to the address: no device there */
++			/*
++			 * A byte that is not acknowledged, as on the classic
++			 * engine. The packet engine reports it as a timeout at
++			 * the 9th clock of the byte (TIMEOUT_N SCL cycles
++			 * without an ACK); mv64xxx_i2c_dma_xfer() tells a
++			 * target that holds SCL low apart afterwards.
++			 */
 +			if (sta == MV64XXX_I2C_STATUS_MAST_WR_ADDR_NO_ACK ||
++			    sta == MV64XXX_I2C_STATUS_MAST_WR_NO_ACK ||
 +			    sta == MV64XXX_I2C_STATUS_MAST_RD_ADDR_NO_ACK) {
 +				drv_data->rc = -ENXIO;
++			} else if (sta == SUNXI_TWI_DRV_STA_ACK_TIMEOUT) {
++				drv_data->rc = -ENXIO;
++				drv_data->drv_ack_timeout = true;
 +			} else if (sta == MV64XXX_I2C_STATUS_MAST_LOST_ARB) {
 +				drv_data->rc = -EAGAIN;
 +			} else {
@@ -144,7 +167,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	if (drv_data->offload_enabled)
  		rc = mv64xxx_i2c_intr_offload(drv_data);
  
-@@ -946,6 +1039,239 @@
+@@ -946,6 +1056,257 @@
  }
  
  /*
@@ -271,6 +294,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +	drv_data->rc = 0;
 +	drv_data->block = 1;
 +	drv_data->drv_active = true;
++	drv_data->drv_ack_timeout = false;
 +	writel(ctrl | SUNXI_TWI_DRV_CTRL_START, base + SUNXI_TWI_DRV_CTRL);
 +	/* the register address bytes of a write + read go in by the CPU */
 +	if (num == 2)
@@ -315,6 +339,23 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +
 +	if (rc)
 +		mv64xxx_i2c_hw_init(drv_data);
++
++	/*
++	 * After the reset of both engines and a STOP, SCL is released unless
++	 * a target holds it low: then the 9th clock timeout was a stuck bus
++	 * or clock stretching beyond TIMEOUT_N, not a missing ACK.
++	 */
++	if (rc == -ENXIO && drv_data->drv_ack_timeout) {
++		u32 lcr;
++
++		if (readl_poll_timeout(base + SUNXI_TWI_LCR, lcr,
++				       lcr & SUNXI_TWI_LCR_SCL_STATE, 10, 1000)) {
++			dev_warn_ratelimited(&drv_data->adapter.dev,
++					     "packet engine: SCL held low (line control 0x%02x)\n",
++					     lcr);
++			rc = -ETIMEDOUT;
++		}
++	}
 +
 +out_unmap:
 +	dma_unmap_single(chan->device->dev, dma_addr, data_msg->len, dir);
@@ -384,7 +425,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
   *****************************************************************************
   *
   *	I2C Core Support Routines (Interface to higher level I2C code)
-@@ -980,6 +1306,8 @@
+@@ -980,6 +1341,8 @@
  
  	if (mv64xxx_i2c_can_offload(drv_data) && !drv_data->atomic)
  		rc = mv64xxx_i2c_offload_xfer(drv_data);
@@ -393,7 +434,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	else
  		rc = mv64xxx_i2c_execute_msg(drv_data, &msgs[0], num == 1);
  
-@@ -1225,6 +1553,7 @@
+@@ -1225,6 +1588,7 @@
  {
  	struct mv64xxx_i2c_data		*drv_data;
  	struct mv64xxx_i2c_pdata	*pdata = dev_get_platdata(&pd->dev);
@@ -401,7 +442,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	int	rc;
  
  	if ((!pdata && !pd->dev.of_node))
-@@ -1235,7 +1564,7 @@
+@@ -1235,7 +1599,7 @@
  	if (!drv_data)
  		return -ENOMEM;
  
@@ -410,7 +451,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	if (IS_ERR(drv_data->reg_base))
  		return PTR_ERR(drv_data->reg_base);
  
-@@ -1280,6 +1609,15 @@
+@@ -1280,6 +1644,15 @@
  	if (rc == -EPROBE_DEFER)
  		return rc;
  
@@ -426,7 +467,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	drv_data->adapter.dev.parent = &pd->dev;
  	drv_data->adapter.algo = &mv64xxx_i2c_algo;
  	drv_data->adapter.owner = THIS_MODULE;
-@@ -1328,6 +1666,7 @@
+@@ -1328,6 +1701,7 @@
  	pm_runtime_disable(&pd->dev);
  	if (!pm_runtime_status_suspended(&pd->dev))
  		mv64xxx_i2c_runtime_suspend(&pd->dev);
@@ -434,7 +475,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  
  	return rc;
  }
-@@ -1344,6 +1683,7 @@
+@@ -1344,6 +1718,7 @@
  	pm_runtime_disable(&pd->dev);
  	if (!pm_runtime_status_suspended(&pd->dev))
  		mv64xxx_i2c_runtime_suspend(&pd->dev);
