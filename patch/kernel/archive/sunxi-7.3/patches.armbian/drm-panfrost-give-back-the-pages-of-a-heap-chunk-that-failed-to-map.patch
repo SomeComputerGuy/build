@@ -1,0 +1,98 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 10 Nov 2026 04:59:56 +0000
+Subject: [PATCH 3/7] drm/panfrost: Give back the pages of a heap chunk that
+ failed to map
+
+panfrost_mmu_map_fault_addr() grows a heap BO by one 2 MB chunk per
+fault. If reading the chunk's folios, building its sg table, DMA mapping
+it or mapping it on the GPU fails, the folios that were already read stay
+in bo->base.pages, while the chunk's sg table stays empty. The next fault
+in that chunk reads the same folios again and finds their pages already
+owned:
+
+  if (drm_WARN_ON(&pfdev->base, already_owned))
+          folio_put(folio);
+
+Before commit b49c35ba0ce1 ("drm/panfrost: Fix a page leak in
+panfrost_mmu_map_fault_addr() when THP is on") the fault path skipped
+pages that were already filled in; since then the array is filled a
+folio at a time and an already filled page is treated as a bug.
+
+On those error paths, put the folios read for the chunk and clear their
+entries, so that a later fault in it starts from an empty range.
+
+Fixes: b49c35ba0ce1 ("drm/panfrost: Fix a page leak in panfrost_mmu_map_fault_addr() when THP is on")
+Cc: stable@vger.kernel.org
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/panfrost/panfrost_mmu.c | 34 +++++++++++++++++++++++--
+ 1 file changed, 32 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_mmu.c b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+index 99d713c..fbbb745 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_mmu.c
++++ b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+@@ -592,6 +592,28 @@ out:
+ 
+ #define NUM_FAULT_PAGES (SZ_2M / PAGE_SIZE)
+ 
++static void panfrost_heap_put_chunk(struct page **pages, pgoff_t start,
++				    pgoff_t end)
++{
++	pgoff_t pg = start;
++
++	while (pg < end) {
++		struct folio *folio;
++		pgoff_t n;
++
++		if (!pages[pg]) {
++			pg++;
++			continue;
++		}
++
++		folio = page_folio(pages[pg]);
++		n = folio_nr_pages(folio);
++		for (pgoff_t i = 0; i < n && pg < end; i++)
++			pages[pg++] = NULL;
++		folio_put(folio);
++	}
++}
++
+ static int panfrost_mmu_map_fault_addr(struct panfrost_device *pfdev, int as,
+ 				       u64 addr)
+ {
+@@ -666,7 +688,7 @@ static int panfrost_mmu_map_fault_addr(struct panfrost_device *pfdev, int as,
+ 		folio = shmem_read_folio(mapping, pg);
+ 		if (IS_ERR(folio)) {
+ 			ret = PTR_ERR(folio);
+-			goto err_unlock;
++			goto err_put_chunk;
+ 		}
+ 
+ 		pg &= ~(folio_nr_pages(folio) - 1);
+@@ -688,7 +710,7 @@ static int panfrost_mmu_map_fault_addr(struct panfrost_device *pfdev, int as,
+ 	ret = sg_alloc_table_from_pages(sgt, pages + page_offset,
+ 					NUM_FAULT_PAGES, 0, SZ_2M, GFP_KERNEL);
+ 	if (ret)
+-		goto err_unlock;
++		goto err_put_chunk;
+ 
+ 	ret = dma_map_sgtable(pfdev->base.dev, sgt, DMA_BIDIRECTIONAL, 0);
+ 	if (ret)
+@@ -715,6 +737,14 @@ err_mmu_map_sg:
+ 	dma_unmap_sgtable(pfdev->base.dev, sgt, DMA_BIDIRECTIONAL, 0);
+ err_map:
+ 	sg_free_table(sgt);
++err_put_chunk:
++	/*
++	 * Give back the folios read for this chunk, so that the next fault in
++	 * it (the chunk has no sg table yet) starts from an empty page range
++	 * instead of finding it partly owned.
++	 */
++	panfrost_heap_put_chunk(pages, page_offset,
++				min_t(pgoff_t, page_offset + NUM_FAULT_PAGES, nr_pages));
+ err_unlock:
+ 	dma_resv_unlock(obj->resv);
+ err_bo:

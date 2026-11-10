@@ -1,23 +1,28 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
-Date: Fri, 6 Nov 2026 10:30:00 +0000
-Subject: [PATCH] drm/panfrost: Name the BOs around an unhandled page fault
+Date: Tue, 10 Nov 2026 05:00:27 +0000
+Subject: [PATCH 7/7] drm/panfrost: Name the BOs around an unhandled page fault
 
-An unhandled GPU page fault only reports the faulting VA, so it cannot
-tell a GPU access just past the end of a buffer (a userspace or
-hardware overrun) from an access to a buffer whose mapping is gone (a
-kernel bug) or a garbage pointer. Mali-G31 runner job 28 hit exactly
-that during the OpenCL-CTS 3D image read test:
-
-  Unhandled Page fault in AS0 at VA 0x000000000B2F8000
-  js fault, js=1, status=JOB_BUS_FAULT
+An unhandled GPU page fault only reports the faulting VA. That does not
+tell a GPU access just past the end of a buffer (a userspace or hardware
+overrun) from an access to a buffer that is no longer mapped (a kernel
+bug) or from a garbage pointer.
 
 After the fault report, look the address up in the faulting address
 space and print the BO that contains it, or else the nearest BO below
-and above it: VA range, size, distance of the fault from it, whether it
-is still mapped, heap/noexec, and the label userspace gave it (Mesa
-labels every BO with its use, format and size). Only the terminal fault
-path is affected; nothing changes for handled (heap growth) faults.
+and above it: VA range, size, the distance of the fault from it, whether
+it is still mapped, heap/noexec, and the label userspace gave it (Mesa
+labels its BOs with their use, format and size). For an OpenCL image
+read on a Mali-G31 this gave:
+
+  panfrost 1800000.gpu: Unhandled Page fault in AS0 at VA 0x000000000A181000
+  ...
+  panfrost 1800000.gpu: fault bo: below: VA [0xa041000-0xa181000) size 0x140000, fault at end+0x0, mapped, noexec, label "Texture format=r32g32b32_sint extent=25x128x32 array_size=1 mip_count=0 samples=0 modifier=0x0"
+
+that is, the texture unit reading past the end of a 96-bit-per-texel
+texture, which userspace can avoid by padding such textures.
+
+Only the unhandled fault path is affected; heap growth faults are not.
 
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
@@ -25,9 +30,11 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  drivers/gpu/drm/panfrost/panfrost_mmu.c | 81 +++++++++++++++++++++++++
  1 file changed, 81 insertions(+)
 
+diff --git a/drivers/gpu/drm/panfrost/panfrost_mmu.c b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+index fbbb745..8a1a80c 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_mmu.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_mmu.c
-@@ -582,6 +582,86 @@
+@@ -590,6 +590,86 @@ out:
  	return mapping;
  }
  
@@ -113,8 +120,8 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +
  #define NUM_FAULT_PAGES (SZ_2M / PAGE_SIZE)
  
- static int panfrost_mmu_map_fault_addr(struct panfrost_device *pfdev, int as,
-@@ -922,6 +1002,7 @@
+ static void panfrost_heap_put_chunk(struct page **pages, pgoff_t start,
+@@ -960,6 +1040,7 @@ static irqreturn_t panfrost_mmu_irq_handler_thread(int irq, void *data)
  				exception_type, panfrost_exception_name(exception_type),
  				access_type, access_type_name(pfdev, fault_status),
  				source_id);
@@ -122,5 +129,3 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  
  			spin_lock(&pfdev->as_lock);
  			/* Ignore MMU interrupts on this AS until it's been
--- 
-2.43.0
