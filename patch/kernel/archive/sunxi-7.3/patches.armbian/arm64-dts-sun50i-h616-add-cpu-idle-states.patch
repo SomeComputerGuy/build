@@ -1,0 +1,88 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Mon, 2 Nov 2026 12:00:00 +0000
+Subject: arm64: dts: allwinner: h616: add the cpu-sleep idle state
+
+The H616 has no management processor, so its TF-A port could not offer
+any CPU_SUSPEND state and the SoC had no cpuidle driver beyond WFI.
+TF-A (patch "feat(allwinner): offer CPU_SUSPEND natively on the H616")
+now powers a single core down through the CPUIDLE hardware block, which
+powers it back up as soon as the GIC has an interrupt pending for it.
+
+Describe that state so the PSCI cpuidle driver can use it. TF-A amends
+the DTB it finds with the same description, but U-Boot does not propagate
+that into a separately loaded kernel DTB, hence the static node (TF-A
+skips its amendment when /cpus/idle-states exists). The power state ID
+follows the TF-A sunxi encoding (4 bits per level, 3 = off at the CPU
+level, power-down type). The core's architected timer stops, the sun4i
+timer at 0x03009000 serves as broadcast clock event device.
+
+Latencies are initial estimates for the TF-A round trip and the residency
+is conservative (the vendor firmware advertises 46/59/3570 us); they are
+to be refined with measurements.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi | 17 +++++++++++++++++
+ 1 file changed, 17 insertions(+)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+index 111111111111..222222222222 100644
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+@@ -29,6 +29,7 @@
+ 			device_type = "cpu";
+ 			reg = <0>;
+ 			enable-method = "psci";
++			cpu-idle-states = <&cpu_sleep>;
+ 			clocks = <&ccu CLK_CPUX>;
+ 			#cooling-cells = <2>;
+ 			i-cache-size = <0x8000>;
+@@ -45,6 +46,7 @@
+ 			device_type = "cpu";
+ 			reg = <1>;
+ 			enable-method = "psci";
++			cpu-idle-states = <&cpu_sleep>;
+ 			clocks = <&ccu CLK_CPUX>;
+ 			#cooling-cells = <2>;
+ 			i-cache-size = <0x8000>;
+@@ -61,6 +63,7 @@
+ 			device_type = "cpu";
+ 			reg = <2>;
+ 			enable-method = "psci";
++			cpu-idle-states = <&cpu_sleep>;
+ 			clocks = <&ccu CLK_CPUX>;
+ 			#cooling-cells = <2>;
+ 			i-cache-size = <0x8000>;
+@@ -77,6 +80,7 @@
+ 			device_type = "cpu";
+ 			reg = <3>;
+ 			enable-method = "psci";
++			cpu-idle-states = <&cpu_sleep>;
+ 			clocks = <&ccu CLK_CPUX>;
+ 			#cooling-cells = <2>;
+ 			i-cache-size = <0x8000>;
+@@ -88,6 +92,19 @@
+ 			next-level-cache = <&l2_cache>;
+ 		};
+ 
++		idle-states {
++			entry-method = "psci";
++
++			cpu_sleep: cpu-sleep {
++				compatible = "arm,idle-state";
++				arm,psci-suspend-param = <0x00010003>;
++				local-timer-stop;
++				entry-latency-us = <100>;
++				exit-latency-us = <150>;
++				min-residency-us = <4000>;
++			};
++		};
++
+ 		l2_cache: l2-cache {
+ 			compatible = "cache";
+ 			cache-level = <2>;
+-- 
+Armbian
+
