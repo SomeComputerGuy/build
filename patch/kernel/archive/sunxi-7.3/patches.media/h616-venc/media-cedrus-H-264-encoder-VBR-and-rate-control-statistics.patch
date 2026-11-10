@@ -54,7 +54,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  		},
  		.capabilities	= CEDRUS_CAPABILITY_H264_ENC,
  	},
-+	/* The VBR peak, over the rate control's window of 25 pictures. */
++	/* The VBR peak bitrate, a bound over any second of the stream. */
 +	{
 +		.cfg = {
 +			.id	= V4L2_CID_MPEG_VIDEO_BITRATE_PEAK,
