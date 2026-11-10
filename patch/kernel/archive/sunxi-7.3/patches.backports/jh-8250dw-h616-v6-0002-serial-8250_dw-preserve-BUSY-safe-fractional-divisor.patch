@@ -1,0 +1,125 @@
+From a1024f3d3e1650399c50233a969649e61924a557 Mon Sep 17 00:00:00 2001
+From: James Hilliard <james.hilliard1@gmail.com>
+Date: Tue, 27 Oct 2026 11:10:57 -0600
+Subject: [PATCH 2/9] serial: 8250_dw: preserve BUSY-safe fractional divisor
+ programming
+
+dw8250_probe() installs a divisor setter that makes the UART idle and
+checks DLAB before writing DLL and DLH. When dw8250_setup_port() detects
+fractional-divisor support, it replaces that setter with the library's
+callback. The replacement writes DLF and uses serial8250_do_set_divisor(),
+bypassing the divisor setter's idle sequence and DLAB readback.
+
+If the LCR update fails to set DLAB, the subsequent divisor writes can
+reach TX and IER instead of DLL and DLH.
+
+Expose the library's fractional-divisor calculation and DLF write as
+shared helpers. Install the BUSY-safe setter after hardware discovery and
+use the shared DLF helper to program the fractional field only after DLAB
+has been confirmed, alongside DLL and DLH. Keep fractional-divisor
+detection and calculator selection in the library, preserving the core
+calculation for integer-only ports. Let the shared DLF setter check for
+fractional-divisor support so callers can use it for either kind of port.
+
+Fixes: a7b9ce39fbe4 ("serial: 8250_dw: Ensure BUSY is deasserted")
+Cc: stable@vger.kernel.org
+Signed-off-by: James Hilliard <james.hilliard1@gmail.com>
+Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+---
+ drivers/tty/serial/8250/8250_dw.c    |  5 ++++-
+ drivers/tty/serial/8250/8250_dwlib.c | 24 +++++++++++++++++++++---
+ drivers/tty/serial/8250/8250_dwlib.h |  2 ++
+ 3 files changed, 27 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/tty/serial/8250/8250_dw.c b/drivers/tty/serial/8250/8250_dw.c
+index 51d026f..1443dca 100644
+--- a/drivers/tty/serial/8250/8250_dw.c
++++ b/drivers/tty/serial/8250/8250_dw.c
+@@ -199,6 +199,7 @@ static void dw8250_set_divisor(struct uart_port *p, unsigned int baud,
+ 	if (!(serial_port_in(p, UART_LCR) & UART_LCR_DLAB))
+ 		goto idle_failed;
+ 
++	dw8250_set_divisor_dlf(p, quot_frac);
+ 	serial_dl_write(up, quot);
+ 	serial_port_out(p, UART_LCR, up->lcr);
+ 
+@@ -642,7 +643,6 @@ static int dw8250_probe(struct platform_device *pdev)
+ 
+ 	p->set_ldisc	= dw8250_set_ldisc;
+ 	p->set_termios	= dw8250_set_termios;
+-	p->set_divisor	= dw8250_set_divisor;
+ 
+ 	data = devm_kzalloc(dev, sizeof(*data), GFP_KERNEL);
+ 	if (!data)
+@@ -759,6 +759,9 @@ static int dw8250_probe(struct platform_device *pdev)
+ 	if (!data->skip_autocfg)
+ 		dw8250_setup_port(p);
+ 
++	/* Use the BUSY-safe sequence for both integer and fractional divisors. */
++	p->set_divisor = dw8250_set_divisor;
++
+ 	/* If we have a valid fifosize, try hooking up DMA */
+ 	if (p->fifosize) {
+ 		data->data.dma.rxconf.src_maxburst = p->fifosize / 4;
+diff --git a/drivers/tty/serial/8250/8250_dwlib.c b/drivers/tty/serial/8250/8250_dwlib.c
+index 8859e66..1af2fd2 100644
+--- a/drivers/tty/serial/8250/8250_dwlib.c
++++ b/drivers/tty/serial/8250/8250_dwlib.c
+@@ -23,8 +23,8 @@
+  * we have: div(F) * (16 * baud) = rem
+  * so frac = 2^dlf_size * rem / (16 * baud) = (rem << dlf_size) / (16 * baud)
+  */
+-static unsigned int dw8250_get_divisor(struct uart_port *p, unsigned int baud,
+-				       unsigned int *frac)
++unsigned int dw8250_get_divisor_dlf(struct uart_port *p, unsigned int baud,
++				    unsigned int *frac)
+ {
+ 	unsigned int quot, rem, base_baud = baud * 16;
+ 	struct dw8250_port_data *d = p->private_data;
+@@ -35,11 +35,29 @@ static unsigned int dw8250_get_divisor(struct uart_port *p, unsigned int baud,
+ 
+ 	return quot;
+ }
++EXPORT_SYMBOL_GPL(dw8250_get_divisor_dlf);
++
++static unsigned int dw8250_get_divisor(struct uart_port *p, unsigned int baud,
++				       unsigned int *frac)
++{
++	return dw8250_get_divisor_dlf(p, baud, frac);
++}
++
++void dw8250_set_divisor_dlf(struct uart_port *p, unsigned int quot_frac)
++{
++	struct dw8250_port_data *pd = p->private_data;
++
++	if (!pd->dlf_size)
++		return;
++
++	dw8250_writel_ext(p, DW_UART_DLF, quot_frac);
++}
++EXPORT_SYMBOL_GPL(dw8250_set_divisor_dlf);
+ 
+ static void dw8250_set_divisor(struct uart_port *p, unsigned int baud,
+ 			       unsigned int quot, unsigned int quot_frac)
+ {
+-	dw8250_writel_ext(p, DW_UART_DLF, quot_frac);
++	dw8250_set_divisor_dlf(p, quot_frac);
+ 	serial8250_do_set_divisor(p, baud, quot);
+ }
+ 
+diff --git a/drivers/tty/serial/8250/8250_dwlib.h b/drivers/tty/serial/8250/8250_dwlib.h
+index 1fe5233..0148be0 100644
+--- a/drivers/tty/serial/8250/8250_dwlib.h
++++ b/drivers/tty/serial/8250/8250_dwlib.h
+@@ -92,6 +92,8 @@ struct dw8250_port_data {
+ 	bool			hw_rs485_support;
+ };
+ 
++unsigned int dw8250_get_divisor_dlf(struct uart_port *p, unsigned int baud, unsigned int *frac);
++void dw8250_set_divisor_dlf(struct uart_port *p, unsigned int quot_frac);
+ void dw8250_do_set_termios(struct uart_port *p, struct ktermios *termios, const struct ktermios *old);
+ void dw8250_setup_port(struct uart_port *p);
+ 
+-- 
+2.55.0
+
