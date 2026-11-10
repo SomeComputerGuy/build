@@ -1,0 +1,262 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0000
+Subject: thermal/drivers/sun8i: Use the H616 alarm and shutdown interrupts
+
+The H616 THS has per-sensor alarm and shutdown thresholds with their own
+interrupts (H616 user manual v1.0, 3.10.6: THS_ALARM_CTRL, THS_SHUTDOWN_CTRL,
+THS_ALARM_INTC, THS_SHUT_INTC and their status registers). The driver
+only uses the data interrupt, so a hot sensor is noticed at the next
+polling interval at best.
+
+Implement .set_trips on the H616: program the alarm threshold of each
+sensor to the high trip and its hysteresis to the low trip, and enable
+the alarm interrupt. The interrupt handler acknowledges the alarm and
+alarm-off status and updates the thermal zone at once. The shutdown
+threshold is set to the critical trip of the zone; its interrupt is
+reported at critical level and the zone is updated, so the critical
+trip handling runs immediately.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+
+--- a/drivers/thermal/sun8i_thermal.c
++++ b/drivers/thermal/sun8i_thermal.c
+@@ -8,11 +8,13 @@
+  * Based on the work of Josef Gajdusek <atx@atx.name>
+  */
+ 
++#include <linux/bitfield.h>
+ #include <linux/bitmap.h>
+ #include <linux/cleanup.h>
+ #include <linux/clk.h>
+ #include <linux/device.h>
+ #include <linux/interrupt.h>
++#include <linux/math64.h>
+ #include <linux/module.h>
+ #include <linux/nvmem-consumer.h>
+ #include <linux/of.h>
+@@ -44,6 +46,13 @@
+ #define SUN50I_H6_THS_PC			0x08
+ #define SUN50I_H6_THS_DIC			0x10
+ #define SUN50I_H6_THS_DIS			0x20
++#define SUN50I_H6_THS_SHUT_IC			0x14
++#define SUN50I_H6_THS_ALARM_IC			0x18
++#define SUN50I_H6_THS_SHUT_IS			0x24
++#define SUN50I_H6_THS_ALARM_OFF_IS		0x28
++#define SUN50I_H6_THS_ALARM_IS			0x2c
++#define SUN50I_H6_THS_ALARM_CTRL(x)		(0x40 + 4 * (x))
++#define SUN50I_H6_THS_SHUT_CTRL(x)		(0x80 + 4 * ((x) / 2))
+ #define SUN50I_H6_THS_MFC			0x30
+ #define SUN50I_H6_THS_TEMP_CALIB		0xa0
+ #define SUN50I_H6_THS_TEMP_DATA			0xc0
+@@ -58,6 +67,10 @@
+ #define SUN50I_THS_FILTER_TYPE(x)		(GENMASK(1, 0) & (x))
+ #define SUN50I_H6_THS_PC_TEMP_PERIOD(x)		((GENMASK(19, 0) & (x)) << 12)
+ #define SUN50I_H6_THS_DATA_IRQ_STS(x)		BIT(x)
++#define SUN50I_H6_THS_ALARM_T_HOT		GENMASK(27, 16)
++#define SUN50I_H6_THS_ALARM_T_HYST		GENMASK(11, 0)
++#define SUN50I_H6_THS_SHUT_T_HOT(x)		(((x) & 1) ? GENMASK(27, 16) : \
++						 GENMASK(11, 0))
+ 
+ #define SUN55I_A523_DELIMITER			0x7c8
+ #define SUN55I_A523_OFFSET_ABOVE		2736
+@@ -69,12 +82,18 @@
+ 	struct ths_device		*tmdev;
+ 	struct thermal_zone_device	*tzd;
+ 	int				id;
++	/* hardware alarm window and shutdown threshold, in register units */
++	u32				alarm_ctrl;
++	bool				alarm_en;
++	u32				shut_reg;
++	bool				shut_en;
+ };
+ 
+ struct ths_thermal_chip {
+ 	bool            has_mod_clk;
+ 	bool            has_bus_clk_reset;
+ 	bool		needs_sram;
++	bool		has_alarm;
+ 	int		sensor_num;
+ 	int		offset;
+ 	int		scale;
+@@ -162,6 +181,73 @@
+ 	.get_temp = sun8i_ths_get_temp,
+ };
+ 
++/*
++ * Inverse of sun8i_ths_calc_temp(): the sensor register value at which the
++ * calibrated reading equals @temp (millidegree Celsius). The register value
++ * goes down as the temperature goes up.
++ */
++static u32 sun8i_ths_temp_to_reg(struct ths_device *tmdev, int temp)
++{
++	s64 reg;
++
++	temp -= tmdev->chip->ft_deviation;
++	reg = div_s64((s64)(tmdev->chip->offset - temp) * 10,
++		      tmdev->chip->scale);
++
++	return clamp_t(s64, reg, 0, FT_TEMP_MASK);
++}
++
++static void sun50i_h616_ths_write_alarm(struct tsensor *s)
++{
++	struct ths_device *tmdev = s->tmdev;
++
++	regmap_write(tmdev->regmap, SUN50I_H6_THS_ALARM_CTRL(s->id),
++		     s->alarm_ctrl);
++	regmap_update_bits(tmdev->regmap, SUN50I_H6_THS_ALARM_IC, BIT(s->id),
++			   s->alarm_en ? BIT(s->id) : 0);
++}
++
++static void sun50i_h616_ths_write_shut(struct tsensor *s)
++{
++	struct ths_device *tmdev = s->tmdev;
++	u32 mask = SUN50I_H6_THS_SHUT_T_HOT(s->id);
++
++	regmap_update_bits(tmdev->regmap, SUN50I_H6_THS_SHUT_CTRL(s->id), mask,
++			   (s->shut_reg << __ffs(mask)) & mask);
++	regmap_update_bits(tmdev->regmap, SUN50I_H6_THS_SHUT_IC, BIT(s->id),
++			   s->shut_en ? BIT(s->id) : 0);
++}
++
++/*
++ * The THS raises the alarm interrupt when a sensor goes above its "hot"
++ * threshold and the alarm-off interrupt when it falls below its
++ * "hysteresis" threshold. Use them as the trip window of the thermal core,
++ * so that trip crossings are reported by the hardware.
++ */
++static int sun50i_h616_ths_set_trips(struct thermal_zone_device *tz,
++				     int low, int high)
++{
++	struct tsensor *s = thermal_zone_device_priv(tz);
++	struct ths_device *tmdev = s->tmdev;
++	u32 hot, hyst;
++
++	hot = high == INT_MAX ? 0 : sun8i_ths_temp_to_reg(tmdev, high);
++	hyst = low == -INT_MAX ? FT_TEMP_MASK :
++	       sun8i_ths_temp_to_reg(tmdev, low);
++
++	s->alarm_ctrl = FIELD_PREP(SUN50I_H6_THS_ALARM_T_HOT, hot) |
++			FIELD_PREP(SUN50I_H6_THS_ALARM_T_HYST, hyst);
++	s->alarm_en = high != INT_MAX;
++	sun50i_h616_ths_write_alarm(s);
++
++	return 0;
++}
++
++static const struct thermal_zone_device_ops ths_alarm_ops = {
++	.get_temp = sun8i_ths_get_temp,
++	.set_trips = sun50i_h616_ths_set_trips,
++};
++
+ static const struct regmap_config config = {
+ 	.reg_bits = 32,
+ 	.val_bits = 32,
+@@ -205,12 +291,64 @@
+ 	return irq_bitmap;
+ }
+ 
++/*
++ * Acknowledge the alarm, alarm-off and shutdown interrupts. The alarm
++ * window and the shutdown threshold of every sensor that raised one are
++ * written again from the values the driver programmed, so a stray
++ * threshold cannot keep the interrupt asserted.
++ */
++static unsigned long sun50i_h616_alarm_ack(struct ths_device *tmdev)
++{
++	unsigned int alarm, alarm_off, shut;
++	unsigned long irq_bitmap = 0;
++	int i, temp;
++
++	regmap_read(tmdev->regmap, SUN50I_H6_THS_ALARM_IS, &alarm);
++	regmap_read(tmdev->regmap, SUN50I_H6_THS_ALARM_OFF_IS, &alarm_off);
++	regmap_read(tmdev->regmap, SUN50I_H6_THS_SHUT_IS, &shut);
++
++	for (i = 0; i < tmdev->chip->sensor_num; i++) {
++		struct tsensor *s = &tmdev->sensor[i];
++
++		if (alarm & BIT(i)) {
++			regmap_write(tmdev->regmap, SUN50I_H6_THS_ALARM_IS,
++				     BIT(i));
++			dev_dbg(tmdev->dev, "sensor %d: alarm\n", i);
++		}
++		if (alarm_off & BIT(i)) {
++			regmap_write(tmdev->regmap, SUN50I_H6_THS_ALARM_OFF_IS,
++				     BIT(i));
++			dev_dbg(tmdev->dev, "sensor %d: alarm off\n", i);
++		}
++		if (shut & BIT(i)) {
++			regmap_write(tmdev->regmap, SUN50I_H6_THS_SHUT_IS,
++				     BIT(i));
++			if (!s->tzd || IS_ERR(s->tzd) ||
++			    sun8i_ths_get_temp(s->tzd, &temp))
++				temp = 0;
++			dev_crit(tmdev->dev,
++				 "sensor %d: shutdown threshold interrupt (%d mC)\n",
++				 i, temp);
++			sun50i_h616_ths_write_shut(s);
++		}
++		if ((alarm | alarm_off) & BIT(i))
++			sun50i_h616_ths_write_alarm(s);
++		if ((alarm | alarm_off | shut) & BIT(i))
++			bitmap_set(&irq_bitmap, i, 1);
++	}
++
++	return irq_bitmap;
++}
++
+ static irqreturn_t sun8i_irq_thread(int irq, void *data)
+ {
+ 	struct ths_device *tmdev = data;
+ 	unsigned long irq_bitmap = tmdev->chip->irq_ack(tmdev);
+ 	int i;
+ 
++	if (tmdev->chip->has_alarm)
++		irq_bitmap |= sun50i_h616_alarm_ack(tmdev);
++
+ 	for_each_set_bit(i, &irq_bitmap, tmdev->chip->sensor_num) {
+ 		/* We allow some zones to not register. */
+ 		if (IS_ERR(tmdev->sensor[i].tzd))
+@@ -699,7 +837,8 @@
+ 			devm_thermal_of_zone_register(tmdev->dev,
+ 						      i,
+ 						      &tmdev->sensor[i],
+-						      &ths_ops);
++						      tmdev->chip->has_alarm ?
++						      &ths_alarm_ops : &ths_ops);
+ 
+ 		/*
+ 		 * If an individual zone fails to register for reasons
+@@ -716,6 +855,18 @@
+ 		}
+ 
+ 		devm_thermal_add_hwmon_sysfs(tmdev->dev, tmdev->sensor[i].tzd);
++
++		/* hardware shutdown interrupt at the critical trip point */
++		if (tmdev->chip->has_alarm) {
++			struct tsensor *s = &tmdev->sensor[i];
++			int crit;
++
++			if (!thermal_zone_get_crit_temp(s->tzd, &crit)) {
++				s->shut_reg = sun8i_ths_temp_to_reg(tmdev, crit);
++				s->shut_en = true;
++				sun50i_h616_ths_write_shut(s);
++			}
++		}
+ 	}
+ 
+ 	return 0;
+@@ -884,6 +1035,7 @@
+ 	.sensor_num = 4,
+ 	.has_bus_clk_reset = true,
+ 	.needs_sram = true,
++	.has_alarm = true,
+ 	.ft_deviation = 8000,
+ 	.offset = 263655,
+ 	.scale = 810,
+-- 
+Armbian
+
