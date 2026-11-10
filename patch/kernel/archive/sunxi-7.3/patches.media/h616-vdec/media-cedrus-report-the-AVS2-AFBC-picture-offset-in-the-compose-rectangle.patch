@@ -1,0 +1,92 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 10 Nov 2026 00:33:06 +0000
+Subject: media: cedrus: report the AVS2 AFBC picture offset in the
+ compose rectangle
+
+The AVS2 decoder writes its AFBC output 8 lines down, where the H.265
+decoder on the same engine writes it 4 lines down. Shown from row 0, a
+10-bit AVS2 AFBC buffer is 8 lines too low.
+
+Found with the DE33 writeback: AFBC captures of a 1080p 10-bit AVS2
+stream (SAO and ALF on) match the P010 captures moved 8 rows down and 0
+columns across (mean luma difference 0.11, against 12 for the next best
+shift), while the P010 output matches the reference decoder.
+The vendor library fills in the same AFBC header top_crop of 4 for AVS2
+as for H.265, so it cannot be taken from there.
+
+Report top 8 through the CAPTURE compose selection for AVS2 AFBC, as is
+done for H.265. Size the AFBC surfaces for a picture coded in whole 8x8
+blocks plus the 8 lines above it; for heights that are a multiple of 8
+the sizes do not change.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/staging/media/sunxi/cedrus/cedrus.h   |  9 ++++++--
+ .../staging/media/sunxi/cedrus/cedrus_video.c | 22 +++++++++++++------
+ 2 files changed, 22 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+index afb3a4b..886cc9f 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -553,10 +553,15 @@ static inline bool cedrus_fmt_is_scaled(struct cedrus_ctx *ctx,
+ 	       fmt->width < ctx->src_fmt.width;
+ }
+ 
+-/* Size of a 10-bit YUV 4:2:0 AFBC 16x16 split surface. */
++/*
++ * Size of a 10-bit YUV 4:2:0 AFBC 16x16 split surface. The decoders write
++ * the picture, coded in whole 8x8 blocks, up to 8 lines down (4 for H.265,
++ * 8 for AVS2, see cedrus_dst_picture_top()), so the surface covers the
++ * aligned height plus 8 lines.
++ */
+ static inline u32 cedrus_afbc_10_size(unsigned int width, unsigned int height)
+ {
+-	return DIV_ROUND_UP(width, 16) * DIV_ROUND_UP(height + 4, 16) *
++	return DIV_ROUND_UP(width, 16) * DIV_ROUND_UP(ALIGN(height, 8) + 8, 16) *
+ 	       (512 + 16) + 32 + SZ_1K;
+ }
+ 
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+index 54232d6..f2ee563 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -827,21 +827,29 @@ static int cedrus_s_fmt_vid_out(struct file *file, void *priv,
+  * picture row 0 and the surface is 4 lines taller than the picture (hence
+  * the "height + 4" in the AFBC buffer sizes). The vendor library describes
+  * this to its display driver as an AFBC header top_crop of 4 for H.265
+- * (HevcInitAfbcInfo()). VP9 AFBC output starts at row 0.
++ * (HevcInitAfbcInfo()). The AVS2 decoder, which runs on the same engine,
++ * writes its AFBC output 8 lines down, although the vendor library fills
++ * in the same top_crop of 4 for it. VP9 AFBC output starts at row 0.
+  */
+ static unsigned int cedrus_dst_picture_top(struct cedrus_ctx *ctx)
+ {
+-	if (cedrus_dst_is_afbc(ctx) &&
+-	    ctx->src_fmt.pixelformat == V4L2_PIX_FMT_HEVC_SLICE)
+-		return 4;
++	if (!cedrus_dst_is_afbc(ctx))
++		return 0;
+ 
+-	return 0;
++	switch (ctx->src_fmt.pixelformat) {
++	case V4L2_PIX_FMT_HEVC_SLICE:
++		return 4;
++	case V4L2_PIX_FMT_AVS2_FRAME:
++		return 8;
++	default:
++		return 0;
++	}
+ }
+ 
+ /*
+  * The compose rectangle tells userspace where the decoded picture lies in
+- * a CAPTURE buffer, so that a consumer of an H.265 AFBC buffer (e.g. a DRM
+- * plane) can skip the rows above it. It is fixed by the format.
++ * a CAPTURE buffer, so that a consumer of an H.265 or AVS2 AFBC buffer
++ * (e.g. a DRM plane) can skip the rows above it. It is fixed by the format.
+  */
+ static int cedrus_g_selection(struct file *file, void *priv,
+ 			      struct v4l2_selection *s)
