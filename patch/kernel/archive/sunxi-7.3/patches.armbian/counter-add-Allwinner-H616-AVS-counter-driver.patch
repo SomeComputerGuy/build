@@ -18,7 +18,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 
 --- /dev/null
 +++ b/Documentation/devicetree/bindings/counter/allwinner,sun50i-h616-avs-counter.yaml
-@@ -0,0 +1,39 @@
+@@ -0,0 +1,43 @@
 +# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
 +%YAML 1.2
 +---
@@ -31,8 +31,9 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +  - Arun Iyengar <aiyengar1990@gmail.com>
 +
 +description:
-+  Two free-running 33-bit counters in the timer block, clocked by OSC24M
-+  through a programmable divisor, used for audio/video synchronisation.
++  Two free-running 33-bit counters in the timer block, clocked by the AVS
++  clock (OSC24M through its CCU gate) and a programmable divisor, used for
++  audio/video synchronisation.
 +
 +properties:
 +  compatible:
@@ -42,7 +43,8 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +    maxItems: 1
 +
 +  clocks:
-+    maxItems: 1
++    items:
++      - description: AVS clock (the CCU gate of OSC24M for the counters)
 +
 +required:
 +  - compatible
@@ -53,10 +55,12 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +
 +examples:
 +  - |
++    #include <dt-bindings/clock/sun50i-h616-ccu.h>
++
 +    counter@30090c0 {
 +        compatible = "allwinner,sun50i-h616-avs-counter";
 +        reg = <0x030090c0 0x10>;
-+        clocks = <&osc24M>;
++        clocks = <&ccu CLK_AVS>;
 +    };
 --- a/drivers/counter/Kconfig
 +++ b/drivers/counter/Kconfig
