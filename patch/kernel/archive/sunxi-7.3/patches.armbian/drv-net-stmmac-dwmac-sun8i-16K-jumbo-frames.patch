@@ -1,0 +1,327 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0000
+Subject: net: stmmac: dwmac-sun8i: Support jumbo frames up to 16 KiB
+
+The sun8i EMAC receives and sends frames of up to 16384 bytes with
+RX_CTL0/TX_CTL0 FRM_LEN_CTL set (H616 user manual v1.0, 6.5.5 and 6.5.9), but the
+driver limits the MTU to 2018: its normal descriptors have an 11-bit
+buffer size, and stmmac only handles normal descriptor frames that fit
+in one RX and one TX buffer.
+
+Support jumbo frames up to the 16 KiB limit of stmmac (MTU 16320) on
+this EMAC:
+- RX: frames span several descriptors of 2040 bytes (the buffer size
+  must be a multiple of the bus width for the DMA to fill a buffer
+  completely). Descriptors without the last segment bit are passed to
+  stmmac_rx() as rx_not_ls, as with enhanced descriptors.
+- TX: in chain mode the linear part of a frame is split over several
+  descriptors of 2040 bytes; paged frames longer than that are
+  linearised.
+- Frames larger than the 4 KiB TX FIFO cannot be sent in
+  store-and-forward mode, which checksum insertion needs. With such an
+  MTU the TX DMA uses threshold mode and checksums are computed in
+  software.
+These paths are enabled by a new platform flag, STMMAC_FLAG_NDESC_JUMBO,
+which only dwmac-sun8i sets.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+
+--- a/include/linux/stmmac.h
++++ b/include/linux/stmmac.h
+@@ -211,6 +211,11 @@
+ #define STMMAC_FLAG_HWTSTAMP_CORRECT_LATENCY	BIT(14)
+ #define STMMAC_FLAG_KEEP_PREAMBLE_BEFORE_SFD	BIT(15)
+ #define STMMAC_FLAG_SERDES_SUPPORTS_2500M	BIT(16)
++/* Normal descriptors, frames may span several descriptors and be larger
++ * than the TX FIFO (sent in TX threshold mode without checksum offload);
++ * the MTU limit is plat->maxmtu.
++ */
++#define STMMAC_FLAG_NDESC_JUMBO			BIT(17)
+ 
+ struct mac_device_info;
+ 
+--- a/drivers/net/ethernet/stmicro/stmmac/common.h
++++ b/drivers/net/ethernet/stmicro/stmmac/common.h
+@@ -522,6 +522,10 @@
+ #define BUF_SIZE_8KiB 8188
+ #define BUF_SIZE_4KiB 4096
+ #define BUF_SIZE_2KiB 2048
++/* Largest buffer of a normal descriptor (11-bit size field) that the DMA
++ * fills completely: a multiple of the bus width.
++ */
++#define BUF_SIZE_NDESC 2040
+ 
+ /* Power Down and WOL */
+ #define PMT_NOT_SUPPORTED 0
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac.h
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+@@ -217,6 +217,8 @@
+ 
+ struct stmmac_dma_conf {
+ 	unsigned int dma_buf_sz;
++	/* largest frame for the MTU: MTU + Ethernet header, 2 VLAN tags, FCS */
++	unsigned int max_frame;
+ 
+ 	/* RX Queue */
+ 	struct stmmac_rx_queue rx_queue[MTL_MAX_RX_QUEUES];
+@@ -267,6 +269,8 @@
+ 	int hwts_tx_en;
+ 	bool tx_path_in_lpi_mode;
+ 	bool sph_active;
++	/* TX in threshold mode for frames larger than the TX FIFO */
++	bool tx_jumbo_thresh;
+ 	bool sph_capable;
+ 	u32 sarc_type;
+ 	u32 rx_riwt[MTL_MAX_RX_QUEUES];
+--- a/drivers/net/ethernet/stmicro/stmmac/chain_mode.c
++++ b/drivers/net/ethernet/stmicro/stmmac/chain_mode.c
+@@ -30,7 +30,7 @@
+ 	if (priv->plat->enh_desc)
+ 		bmax = BUF_SIZE_8KiB;
+ 	else
+-		bmax = BUF_SIZE_2KiB;
++		bmax = BUF_SIZE_NDESC;
+ 
+ 	buf_len = min_t(unsigned int, nopaged_len, bmax);
+ 	len = nopaged_len - buf_len;
+@@ -90,7 +90,7 @@
+ 	bool ret = false;
+ 
+ 	if ((enh_desc && (len > BUF_SIZE_8KiB)) ||
+-	    (!enh_desc && (len > BUF_SIZE_2KiB)))
++	    (!enh_desc && (len > BUF_SIZE_NDESC)))
+ 		ret = true;
+ 
+ 	return ret;
+--- a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
++++ b/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
+@@ -68,16 +68,13 @@
+ 	if (unlikely(rdes0 & RDES0_OWN))
+ 		return dma_own;
+ 
+-	/* Frames spanning more than one descriptor are not supported with
+-	 * normal descriptors: drop every descriptor of such a frame. Checking
+-	 * only the last descriptor bit would hand the tail of the frame to
+-	 * stmmac_rx() as if it were a complete frame.
++	/* A frame larger than the buffer spans several descriptors. The
++	 * status bits are only valid in the last one; the others are full
++	 * buffers (the RX buffer size is a multiple of the bus width, see
++	 * BUF_SIZE_NDESC).
+ 	 */
+-	if (unlikely(!(rdes0 & RDES0_LAST_DESCRIPTOR) ||
+-		     !(rdes0 & RDES0_FIRST_DESCRIPTOR))) {
+-		x->rx_length++;
+-		return discard_frame;
+-	}
++	if (!(rdes0 & RDES0_LAST_DESCRIPTOR))
++		return rx_not_ls;
+ 
+ 	if (unlikely(rdes0 & RDES0_ERROR_SUMMARY)) {
+ 		if (unlikely(rdes0 & RDES0_DESCRIPTOR_ERROR))
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -2565,6 +2565,24 @@
+ 		stmmac_deinit_chan(priv, priv->ioaddr, chan);
+ }
+ 
++/* TX FIFO size per queue, as used by stmmac_change_mtu() */
++static int stmmac_tx_fifo_per_queue(struct stmmac_priv *priv)
++{
++	int txfifosz = priv->plat->tx_fifo_size;
++
++	if (txfifosz == 0)
++		txfifosz = priv->dma_cap.tx_fifo_size;
++
++	return txfifosz / priv->plat->tx_queues_to_use;
++}
++
++/* Normal descriptors in chain mode: TX frames may span descriptors */
++static bool stmmac_ndesc_chain(struct stmmac_priv *priv)
++{
++	return priv->hw->desc == &ndesc_ops &&
++	       priv->descriptor_mode == STMMAC_CHAIN_MODE;
++}
++
+ /**
+  *  stmmac_dma_operation_mode - HW DMA operation mode
+  *  @priv: driver private structure
+@@ -2612,6 +2630,15 @@
+ 		rxmode = SF_DMA_MODE;
+ 	}
+ 
++	/* A frame larger than the TX FIFO cannot be sent in store-and-forward
++	 * mode, and checksum insertion needs store-and-forward: use the
++	 * threshold mode and insert checksums in software (stmmac_xmit()).
++	 */
++	priv->tx_jumbo_thresh = (priv->plat->flags & STMMAC_FLAG_NDESC_JUMBO) &&
++		priv->dma_conf.max_frame > stmmac_tx_fifo_per_queue(priv);
++	if (priv->tx_jumbo_thresh)
++		txmode = tc;
++
+ 	/* configure all channels */
+ 	for (chan = 0; chan < rx_channels_count; chan++) {
+ 		struct stmmac_rx_queue *rx_q = &priv->dma_conf.rx_queue[chan];
+@@ -4088,7 +4115,14 @@
+ 	if (bfsize < BUF_SIZE_16KiB)
+ 		bfsize = stmmac_set_bfsize(len);
+ 
++	/* Normal descriptors have an 11-bit buffer size: larger frames span
++	 * several descriptors of BUF_SIZE_NDESC bytes each.
++	 */
++	if (priv->hw->desc == &ndesc_ops && bfsize > BUF_SIZE_NDESC)
++		bfsize = BUF_SIZE_NDESC;
++
+ 	dma_conf->dma_buf_sz = bfsize;
++	dma_conf->max_frame = len;
+ 	/* Chose the tx/rx size from the already defined one in the
+ 	 * priv struct. (if defined)
+ 	 */
+@@ -4840,6 +4874,23 @@
+ 		}
+ 	}
+ 
++	/* A normal descriptor holds at most BUF_SIZE_NDESC bytes and only the
++	 * linear part of a jumbo frame is split over several descriptors.
++	 */
++	if (unlikely(nfrags && skb->len > BUF_SIZE_NDESC &&
++		     stmmac_ndesc_chain(priv))) {
++		if (skb_linearize(skb))
++			goto max_sdu_err;
++		nfrags = 0;
++		nopaged_len = skb_headlen(skb);
++	}
++
++	/* No checksum insertion in the TX threshold mode */
++	if (unlikely(priv->tx_jumbo_thresh &&
++		     skb->ip_summed == CHECKSUM_PARTIAL &&
++		     skb_checksum_help(skb)))
++		goto max_sdu_err;
++
+ 	if (unlikely(stmmac_tx_avail(priv, queue) < nfrags + 1)) {
+ 		if (!netif_tx_queue_stopped(netdev_get_tx_queue(dev, queue))) {
+ 			netif_tx_stop_queue(netdev_get_tx_queue(priv->dev,
+@@ -4870,7 +4921,7 @@
+ 
+ 	enh_desc = priv->plat->enh_desc;
+ 	/* To program the descriptors according to the size of the frame */
+-	if (enh_desc)
++	if (enh_desc || stmmac_ndesc_chain(priv))
+ 		is_jumbo = stmmac_is_jumbo_frm(priv, skb->len, enh_desc);
+ 
+ 	csum_insertion = skb->ip_summed == CHECKSUM_PARTIAL;
+@@ -6194,7 +6245,9 @@
+ 	new_mtu = STMMAC_ALIGN(new_mtu);
+ 
+ 	/* If condition true, FIFO is too small or MTU too large */
+-	if ((txfifosz < new_mtu) || (new_mtu > BUF_SIZE_16KiB))
++	if ((txfifosz < new_mtu &&
++	     !(priv->plat->flags & STMMAC_FLAG_NDESC_JUMBO)) ||
++	    (new_mtu > BUF_SIZE_16KiB))
+ 		return -EINVAL;
+ 
+ 	if (netif_running(dev)) {
+@@ -6247,6 +6300,14 @@
+ 	if (priv->plat->bugged_jumbo && (dev->mtu > ETH_DATA_LEN))
+ 		features &= ~NETIF_F_CSUM_MASK;
+ 
++	/* Frames larger than the TX FIFO are sent in threshold mode, which
++	 * cannot insert checksums.
++	 */
++	if ((priv->plat->flags & STMMAC_FLAG_NDESC_JUMBO) &&
++	    dev->mtu + ETH_HLEN + 2 * VLAN_HLEN + ETH_FCS_LEN >
++	    stmmac_tx_fifo_per_queue(priv))
++		features &= ~NETIF_F_CSUM_MASK;
++
+ 	if (priv->plat->core_type == DWMAC_CORE_XGMAC) {
+ 		if (features & NETIF_F_HW_VLAN_CTAG_RX)
+ 			features |= NETIF_F_HW_VLAN_STAG_RX;
+@@ -8064,6 +8125,8 @@
+ 		ndev->max_mtu = XGMAC_JUMBO_LEN;
+ 	else if (priv->plat->enh_desc || priv->synopsys_id >= DWMAC_CORE_4_00)
+ 		ndev->max_mtu = JUMBO_LEN;
++	else if (priv->plat->flags & STMMAC_FLAG_NDESC_JUMBO)
++		ndev->max_mtu = priv->plat->maxmtu;
+ 	else
+ 		ndev->max_mtu = SKB_MAX_HEAD(NET_SKB_PAD + NET_IP_ALIGN);
+ 
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
+@@ -222,24 +222,25 @@
+ 
+ /* Used in RX_CTL0 */
+ #define EMAC_RX_RECEIVER_EN             BIT(31)
++#define EMAC_RX_FRM_LEN_CTL		BIT(30)
+ #define EMAC_RX_JUMBO_FRM_EN		BIT(29)
+ #define EMAC_RX_DO_CRC BIT(27)
+ #define EMAC_RX_FLOW_CTL_EN             BIT(16)
+ 
+ /* Used in TX_CTL0 */
+ #define EMAC_TX_TRANSMITTER_EN  BIT(31)
++#define EMAC_TX_FRM_LEN_CTL	BIT(30)
+ 
+-/* The buffer size field of the EMAC DMA descriptors is 11 bits wide, and
+- * the RX DMA only fills a multiple of 4 bytes of a buffer: with 2047
+- * programmed, frames longer than 2044 bytes spill into a second
+- * descriptor. The stmmac normal descriptor code used for this EMAC only
+- * handles frames that fit in a single RX descriptor and a single TX
+- * descriptor buffer. Bound the MTU so that a frame, including two VLAN
+- * tags and the FCS, always fits in 2044 bytes.
++/* With RX_CTL0/TX_CTL0 FRM_LEN_CTL set, the EMAC receives and sends frames
++ * of up to 16384 bytes. They span several DMA descriptors (11-bit buffer
++ * size), and frames larger than the 4 KiB TX FIFO are sent in threshold
++ * mode (STMMAC_FLAG_NDESC_JUMBO). stmmac_change_mtu() also limits the
++ * cache-aligned MTU to BUF_SIZE_16KiB.
+  */
+-#define EMAC_MAX_FRAME_LEN	2044
+-#define EMAC_MAX_MTU		(EMAC_MAX_FRAME_LEN - ETH_HLEN - \
+-				 2 * VLAN_HLEN - ETH_FCS_LEN)
++#define EMAC_MAX_FRAME_LEN	16384
++#define EMAC_MAX_MTU		min(EMAC_MAX_FRAME_LEN - ETH_HLEN - \
++				    2 * VLAN_HLEN - ETH_FCS_LEN, \
++				    ALIGN_DOWN(BUF_SIZE_16KiB, SMP_CACHE_BYTES))
+ 
+ /* Used in EMAC_TX_FLOW_CTL */
+ #define EMAC_TX_FLOW_CTL_EN             BIT(0)
+@@ -672,12 +673,16 @@
+ 
+ 	/* Without JUMBO_FRM_EN the receiver flags every frame longer than
+ 	 * 1518 bytes (1522 with a VLAN tag) as a length error, so any MTU
+-	 * above 1500 is unusable. Frames are still bounded by the RX
+-	 * descriptor buffer size, see EMAC_MAX_MTU.
++	 * above 1500 is unusable. FRM_LEN_CTL raises the frame length limit
++	 * from 10240 to 16384 bytes in both directions, see EMAC_MAX_MTU.
+ 	 */
+ 	v = readl(ioaddr + EMAC_RX_CTL0);
+-	v |= EMAC_RX_JUMBO_FRM_EN;
++	v |= EMAC_RX_JUMBO_FRM_EN | EMAC_RX_FRM_LEN_CTL;
+ 	writel(v, ioaddr + EMAC_RX_CTL0);
++
++	v = readl(ioaddr + EMAC_TX_CTL0);
++	v |= EMAC_TX_FRM_LEN_CTL;
++	writel(v, ioaddr + EMAC_TX_CTL0);
+ }
+ 
+ static void sun8i_dwmac_set_mac(void __iomem *ioaddr, bool enable)
+@@ -1284,14 +1289,14 @@
+ 	 */
+ 	plat_dat->rx_coe = STMMAC_RX_COE_TYPE2;
+ 	plat_dat->tx_coe = true;
+-	plat_dat->flags |= STMMAC_FLAG_HAS_SUN8I;
++	plat_dat->flags |= STMMAC_FLAG_HAS_SUN8I | STMMAC_FLAG_NDESC_JUMBO;
+ 	plat_dat->bsp_priv = gmac;
+ 	plat_dat->init = sun8i_dwmac_init;
+ 	plat_dat->exit = sun8i_dwmac_exit;
+ 	plat_dat->mac_setup = sun8i_dwmac_setup;
+ 	plat_dat->tx_fifo_size = 4096;
+ 	plat_dat->rx_fifo_size = 16384;
+-	plat_dat->maxmtu = min(plat_dat->maxmtu, EMAC_MAX_MTU);
++	plat_dat->maxmtu = EMAC_MAX_MTU;
+ 
+ 	ret = sun8i_dwmac_set_syscon(&pdev->dev, plat_dat);
+ 	if (ret)
+-- 
+Armbian
+

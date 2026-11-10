@@ -1,0 +1,123 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0000
+Subject: clocksource: sun5i: Read the 56-bit high speed timer counter on the H616
+
+The H616 high speed timer counts down from a 56-bit interval: the
+interval and current value registers have a high word (HS_TMR_INTV_HI,
+HS_TMR_CURNT_HI, bits [23:0]) next to the low word (H616 user manual v1.0,
+3.7.6). The driver only uses the low 32 bits, so the clocksource wraps
+every 21 s at 200 MHz.
+
+On the H616, load the full 56-bit interval and read the counter as
+low, high, low until the high word is stable, giving a 56-bit
+clocksource. The clock event keeps using the low word only.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+
+--- a/drivers/clocksource/timer-sun5i.c
++++ b/drivers/clocksource/timer-sun5i.c
+@@ -37,9 +37,11 @@
+  * struct sunxi_timer_quirks - Differences between SoC variants.
+  *
+  * @from_ctl_base_offset: offset applied from ctl register onwards
++ * @counter_56bit: the counters are 56 bits wide (CNTVAL_HI holds bits 55:32)
+  */
+ struct sunxi_timer_quirks {
+ 	u32 from_ctl_base_offset;
++	bool counter_56bit;
+ };
+ 
+ struct sun5i_timer {
+@@ -91,6 +93,8 @@
+ 	u32 offset = ce->quirks->from_ctl_base_offset;
+ 
+ 	writel(delay, ce->base + TIMER_INTVAL_LO_REG(timer, offset));
++	if (ce->quirks->counter_56bit)
++		writel(0, ce->base + TIMER_INTVAL_HI_REG(timer, offset));
+ }
+ 
+ static void sun5i_clkevt_time_start(struct sun5i_timer *ce, u8 timer, bool periodic)
+@@ -168,6 +172,29 @@
+ 	return ~readl(cs->base + TIMER_CNTVAL_LO_REG(1, offset));
+ }
+ 
++/*
++ * The counter is 56 bits wide and counts down. The manual asks for the low
++ * word to be read first; read low/high pairs until the high word is stable
++ * across a pair, so that a borrow from the low into the high word between
++ * the two reads cannot tear the value.
++ */
++static u64 sun5i_clksrc_read_56bit(struct clocksource *clksrc)
++{
++	struct sun5i_timer *cs = clksrc_to_sun5i_timer(clksrc);
++	u32 offset = cs->quirks->from_ctl_base_offset;
++	u32 lo, hi, hi2;
++
++	readl(cs->base + TIMER_CNTVAL_LO_REG(1, offset));
++	hi = readl(cs->base + TIMER_CNTVAL_HI_REG(1, offset));
++	do {
++		lo = readl(cs->base + TIMER_CNTVAL_LO_REG(1, offset));
++		hi2 = hi;
++		hi = readl(cs->base + TIMER_CNTVAL_HI_REG(1, offset));
++	} while (hi != hi2);
++
++	return ~(((u64)(hi & GENMASK(23, 0)) << 32) | lo) & CLOCKSOURCE_MASK(56);
++}
++
+ static int sun5i_rate_cb(struct notifier_block *nb,
+ 			 unsigned long event, void *data)
+ {
+@@ -200,14 +227,22 @@
+ 	void __iomem *base = cs->base;
+ 	int ret;
+ 
++	/* The low word of the interval must be written before the high word. */
+ 	writel(~0, base + TIMER_INTVAL_LO_REG(1, offset));
++	if (cs->quirks->counter_56bit)
++		writel(GENMASK(23, 0), base + TIMER_INTVAL_HI_REG(1, offset));
+ 	writel(TIMER_CTL_ENABLE | TIMER_CTL_RELOAD,
+ 	       base + TIMER_CTL_REG(1, offset));
+ 
+ 	cs->clksrc.name = pdev->dev.of_node->name;
+ 	cs->clksrc.rating = 340;
+-	cs->clksrc.read = sun5i_clksrc_read;
+-	cs->clksrc.mask = CLOCKSOURCE_MASK(32);
++	if (cs->quirks->counter_56bit) {
++		cs->clksrc.read = sun5i_clksrc_read_56bit;
++		cs->clksrc.mask = CLOCKSOURCE_MASK(56);
++	} else {
++		cs->clksrc.read = sun5i_clksrc_read;
++		cs->clksrc.mask = CLOCKSOURCE_MASK(32);
++	}
+ 	cs->clksrc.flags = CLOCK_SOURCE_IS_CONTINUOUS;
+ 	cs->clksrc.owner = THIS_MODULE;
+ 
+@@ -352,6 +387,11 @@
+ 	.from_ctl_base_offset = 0x10,
+ };
+ 
++static const struct sunxi_timer_quirks sun50i_h616_hstimer_quirks = {
++	.from_ctl_base_offset = 0x10,
++	.counter_56bit = true,
++};
++
+ static const struct of_device_id sun5i_timer_of_match[] = {
+ 	{
+ 		.compatible = "allwinner,sun5i-a13-hstimer",
+@@ -365,6 +405,10 @@
+ 		.compatible = "allwinner,sun20i-d1-hstimer",
+ 		.data = &sun20i_d1_hstimer_quirks,
+ 	},
++	{
++		.compatible = "allwinner,sun50i-h616-hstimer",
++		.data = &sun50i_h616_hstimer_quirks,
++	},
+ 	{},
+ };
+ MODULE_DEVICE_TABLE(of, sun5i_timer_of_match);
+-- 
+Armbian
+
