@@ -7,16 +7,22 @@ The H616 crypto engine computes HMAC-SHA1 (algorithm 0x16) and
 HMAC-SHA256 (0x17) itself. Register hmac(sha1) and hmac(sha256) for the
 H616, with the library implementations as fallback.
 
-As in the vendor driver, one HMAC is one task marked as the last package
-(common control bit 15): the engine pads the message itself. The ctr
-address points to the key (K1), one block long: a longer key is hashed
-first and a shorter one padded with zeroes, as HMAC does. The key
-address points to the message length in bits and the data length is in
-bits. The source is read in words; the last word may be a partial one.
+One HMAC is one task marked as the last package (common control bit
+15): the engine pads the data itself. The ctr address points to the key
+(K1), one block long: a longer key is hashed first and a shorter one
+padded with zeroes, as HMAC does. The engine uses that key only for the
+outer hash; it does not put the key XOR ipad block in front of the data
+(the vendor driver, which passes the bare message, gets wrong MACs), so
+the driver keeps that block next to the key and makes it the first
+source SG. The key address points to the length in bits of the whole
+inner input (ipad block and message), and the data length is the same
+number of bits. The source is read in words; the last word may be a
+partial one.
 
 Only digest() runs on the engine; init/update/final/finup, export and
-import, the empty message, more than 8 SGs, unaligned SGs and SGs that
-are not a whole number of words before the last one go to the fallback.
+import, the empty message, more than 7 message SGs, unaligned SGs and
+SGs that are not a whole number of words before the last one go to the
+fallback.
 
 Like the engine's other new modes, both register below every CPU
 implementation (the library ones use the CPU's SHA instructions): the
@@ -28,9 +34,9 @@ Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  .../crypto/allwinner/sun8i-ce/sun8i-ce-core.c |  81 +++++-
- .../crypto/allwinner/sun8i-ce/sun8i-ce-hash.c | 237 +++++++++++++++++-
+ .../crypto/allwinner/sun8i-ce/sun8i-ce-hash.c | 252 +++++++++++++++++-
  drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h  |  14 +-
- 3 files changed, 324 insertions(+), 8 deletions(-)
+ 3 files changed, 339 insertions(+), 8 deletions(-)
 
 diff --git a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c
 index 41b88e8..42dd2eb 100644
@@ -174,10 +180,10 @@ index 41b88e8..42dd2eb 100644
  };
  
 diff --git a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-hash.c b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-hash.c
-index 80ae476..46e3a9c 100644
+index 80ae476..e32344c 100644
 --- a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-hash.c
 +++ b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-hash.c
-@@ -5,8 +5,8 @@
+@@ -5,12 +5,13 @@
   *
   * Copyright (C) 2015-2020 Corentin Labbe <clabbe@baylibre.com>
   *
@@ -188,7 +194,12 @@ index 80ae476..46e3a9c 100644
   *
   * You could find the datasheet in Documentation/arch/arm/sunxi.rst
   */
-@@ -698,3 +698,236 @@ int sun8i_ce_cbcmac_run(struct crypto_engine *engine, void *async_req)
+ 
++#include <crypto/hmac.h>
+ #include <crypto/internal/hash.h>
+ #include <crypto/md5.h>
+ #include <crypto/sha1.h>
+@@ -698,3 +699,250 @@ int sun8i_ce_cbcmac_run(struct crypto_engine *engine, void *async_req)
  
  	return 0;
  }
@@ -200,12 +211,17 @@ index 80ae476..46e3a9c 100644
 +	struct ahash_alg *alg = crypto_ahash_alg(tfm);
 +	unsigned int bs = crypto_ahash_blocksize(tfm);
 +	struct sun8i_ce_alg_template *algt;
++	unsigned int i;
 +	u8 *k;
 +
 +	algt = container_of(alg, struct sun8i_ce_alg_template, alg.hash.base);
 +
-+	/* The engine takes the key as one block: hashed if longer, 0-padded */
-+	k = kzalloc(bs, GFP_KERNEL | GFP_DMA);
++	/*
++	 * Two blocks: the key (hashed if longer than a block, 0-padded), which
++	 * the engine reads for the outer hash, and the key XOR ipad, which the
++	 * driver feeds in front of the message for the inner hash.
++	 */
++	k = kzalloc(2 * bs, GFP_KERNEL | GFP_DMA);
 +	if (!k)
 +		return -ENOMEM;
 +	if (keylen > bs) {
@@ -216,10 +232,12 @@ index 80ae476..46e3a9c 100644
 +	} else {
 +		memcpy(k, key, keylen);
 +	}
++	for (i = 0; i < bs; i++)
++		k[bs + i] = k[i] ^ HMAC_IPAD_VALUE;
 +
 +	kfree_sensitive(op->key);
 +	op->key = (u32 *)k;
-+	op->keylen = bs;
++	op->keylen = 2 * bs;
 +
 +	crypto_ahash_clear_flags(op->fallback_tfm, CRYPTO_TFM_REQ_MASK);
 +	crypto_ahash_set_flags(op->fallback_tfm,
@@ -249,14 +267,15 @@ index 80ae476..46e3a9c 100644
 +			algt->stat_fb_len0++;
 +		return true;
 +	}
-+	/* The data length is in bits, in 32 bits */
-+	if (len > U32_MAX / 8) {
++	/* The data length (with the ipad block) is in bits, in 32 bits */
++	if (len > U32_MAX / 8 - crypto_ahash_blocksize(tfm)) {
 +		if (IS_ENABLED(CONFIG_CRYPTO_DEV_SUN8I_CE_DEBUG))
 +			algt->stat_fb_srclen++;
 +		return true;
 +	}
++	/* The first source SG is the ipad block */
 +	nents = sg_nents_for_len(areq->src, len);
-+	if (nents < 0 || nents > MAX_SG) {
++	if (nents < 0 || nents > MAX_SG - 1) {
 +		if (IS_ENABLED(CONFIG_CRYPTO_DEV_SUN8I_CE_DEBUG))
 +			algt->stat_fb_maxsg++;
 +		return true;
@@ -297,9 +316,12 @@ index 80ae476..46e3a9c 100644
 +}
 +
 +/*
-+ * HMAC in one task, as the last package: the ctr address points to the key
-+ * (one block), the key address to the message length in bits, the data
-+ * length is in bits; the engine adds the padding and writes the MAC.
++ * HMAC in one task, as the last package. The engine hashes the source as is
++ * (it does not add the key XOR ipad block itself), pads it to the length the
++ * key address points to, then hashes the key XOR opad block with that inner
++ * digest, taking the key from the ctr address. So the source is the key XOR
++ * ipad block followed by the message, and the data length and the length
++ * word are both that whole length in bits.
 + */
 +static int sun8i_ce_hmac_prepare(struct ahash_request *areq,
 +				 struct ce_task *cet)
@@ -310,6 +332,7 @@ index 80ae476..46e3a9c 100644
 +	struct ahash_alg *alg = crypto_ahash_alg(tfm);
 +	struct sun8i_ce_alg_template *algt;
 +	struct sun8i_ce_dev *ce = ctx->ce;
++	unsigned int bs = crypto_ahash_blocksize(tfm);
 +	struct scatterlist *sg;
 +	unsigned int len, todo;
 +	int nr_sgs, i, err;
@@ -329,10 +352,10 @@ index 80ae476..46e3a9c 100644
 +	cet->t_common_ctl = cpu_to_le32(common);
 +	cet->t_sym_ctl = 0;
 +	cet->t_asym_ctl = 0;
-+	cet->t_dlen = cpu_to_le32(areq->nbytes * 8);
++	cet->t_dlen = cpu_to_le32((bs + areq->nbytes) * 8);
 +
 +	bitlen = (__le32 *)rctx->pad;
-+	bitlen[0] = cpu_to_le32(areq->nbytes * 8);
++	bitlen[0] = cpu_to_le32((bs + areq->nbytes) * 8);
 +	bitlen[1] = 0;
 +	rctx->pad_len = 2 * sizeof(u32);
 +	rctx->addr_pad = dma_map_single(ce->dev, rctx->pad, rctx->pad_len,
@@ -351,10 +374,12 @@ index 80ae476..46e3a9c 100644
 +		goto err_unmap_pad;
 +	}
 +	cet->t_ctr = desc_addr_val_le32(ce, rctx->addr_key);
++	cet->t_src[0].addr = desc_addr_val_le32(ce, rctx->addr_key + bs);
++	cet->t_src[0].len = cpu_to_le32(bs / 4);
 +
 +	rctx->nr_sgs = sg_nents_for_len(areq->src, areq->nbytes);
 +	nr_sgs = dma_map_sg(ce->dev, areq->src, rctx->nr_sgs, DMA_TO_DEVICE);
-+	if (nr_sgs <= 0 || nr_sgs > MAX_SG) {
++	if (nr_sgs <= 0 || nr_sgs > MAX_SG - 1) {
 +		dev_err(ce->dev, "Invalid sg number %d\n", nr_sgs);
 +		err = -EINVAL;
 +		goto err_unmap_key;
@@ -362,9 +387,9 @@ index 80ae476..46e3a9c 100644
 +
 +	len = areq->nbytes;
 +	for_each_sg(areq->src, sg, nr_sgs, i) {
-+		cet->t_src[i].addr = desc_addr_val_le32(ce, sg_dma_address(sg));
++		cet->t_src[i + 1].addr = desc_addr_val_le32(ce, sg_dma_address(sg));
 +		todo = min(len, sg_dma_len(sg));
-+		cet->t_src[i].len = cpu_to_le32(DIV_ROUND_UP(todo, 4));
++		cet->t_src[i + 1].len = cpu_to_le32(DIV_ROUND_UP(todo, 4));
 +		len -= todo;
 +	}
 +	if (len > 0) {
@@ -426,7 +451,7 @@ index 80ae476..46e3a9c 100644
 +	return 0;
 +}
 diff --git a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h
-index 8300289..22d47c6 100644
+index 8300289..c991340 100644
 --- a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h
 +++ b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h
 @@ -39,6 +39,7 @@
@@ -463,7 +488,7 @@ index 8300289..22d47c6 100644
   * @fallback_tfm:	pointer to the fallback TFM
 - * @key:		pointer to key data (CBC-MAC only)
 + * @key:		pointer to key data (CBC-MAC), or the HMAC key padded to
-+ *			one block (HMAC)
++ *			one block followed by that block XOR ipad (HMAC)
   * @keylen:		len of the key
   */
  struct sun8i_ce_hash_tfm_ctx {
