@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Mon, 9 Nov 2026 23:00:00 +0000
+Subject: [PATCH] media: h264: Add a VBR mode to the stateless encode rate control
+
+The core reads V4L2_CID_MPEG_VIDEO_BITRATE and _BITRATE_PEAK for
+V4L2_MPEG_VIDEO_BITRATE_MODE_VBR but has no mode for it, so a driver
+offering VBR fails the first picture with -EINVAL.
+
+Add one: the bitrate is the average over the stream, the peak bitrate a
+bound over the size window. A picture's size target is the average that
+brings the stream back to the bitrate within twice the size window
+(sizes since the mode was set up are counted for it), split between
+intra and inter pictures as for CBR, and at most what keeps the size
+window within the peak bitrate. The QP follows from the target as for
+CBR.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/media/v4l2-core/v4l2-h264-enc-rc.c
++++ b/drivers/media/v4l2-core/v4l2-h264-enc-rc.c
+@@ -60,6 +60,9 @@
+ 
+ 	stats->index = (index + 1) % V4L2_H264_ENC_RC_STATS_SIZE_COUNT;
+ 
++	stats->size_all += bytesused;
++	stats->count_all++;
++
+ 	bitrate = 8 * stats->size_total * timeperframe->denominator /
+ 		  stats->count / timeperframe->numerator;
+ 
+@@ -509,10 +512,90 @@
+ 	.complete	= cbr_complete,
+ };
+ 
++/*
++ * Variable bitrate: the bitrate control is the average over the stream and
++ * the peak bitrate control a bound over the size window. A picture's size
++ * target is what brings the average back to the bitrate within twice the
++ * size window, split between intra and inter pictures as for CBR, and no
++ * more than leaves the window within the peak. The QP follows from the
++ * target as for CBR.
++ */
++#define VBR_HORIZON	(2 * V4L2_H264_ENC_RC_STATS_SIZE_COUNT)
++
++static int vbr_measure(struct v4l2_h264_enc_rc *rc, unsigned long *size)
++{
++	struct v4l2_h264_enc_state *state = rc->state;
++	struct v4l2_fract *timeperframe = &state->timeperframe;
++	struct v4l2_h264_enc_rc_stats *stats = &rc->stats;
++	unsigned long long expected;
++	unsigned long long window;
++	unsigned long target_nominal;
++	unsigned long peak_nominal;
++	unsigned long target_min;
++	unsigned long target;
++	unsigned int bitrate_peak;
++
++	pr_debug("+ v4l2-h264-enc-rc: vbr measure");
++
++	bitrate_peak = max(state->bitrate_peak, state->bitrate);
++
++	/* Nominal average size for the average and the peak bitrate. */
++	target_nominal = div_u64((u64)state->bitrate * timeperframe->numerator,
++				 timeperframe->denominator * 8);
++	peak_nominal = div_u64((u64)bitrate_peak * timeperframe->numerator,
++			       timeperframe->denominator * 8);
++	target_min = max(target_nominal / 4, 1UL);
++
++	/* Average size that meets the bitrate again within the horizon. */
++	expected = (stats->count_all + VBR_HORIZON) * target_nominal;
++	if (expected > stats->size_all)
++		target = div_u64(expected - stats->size_all, VBR_HORIZON);
++	else
++		target = target_min;
++
++	target = clamp(target, target_min, peak_nominal);
++
++	pr_debug("  nominal target: %lu bytes, peak %lu bytes", target_nominal,
++		 peak_nominal);
++	pr_debug("  average target: %lu bytes", target);
++
++	target = rc_split_target(rc, target);
++
++	/* The window with this picture stays within the peak bitrate. */
++	window = (u64)V4L2_H264_ENC_RC_STATS_SIZE_COUNT * peak_nominal;
++	if (stats->count == V4L2_H264_ENC_RC_STATS_SIZE_COUNT)
++		window += stats->size[stats->index];
++
++	if (window > stats->size_total + target_min)
++		target = min_t(u64, target, window - stats->size_total);
++	else
++		target = target_min;
++
++	pr_debug("  final target: %lu bytes", target);
++
++	*size = max(target, target_min);
++
++	return 0;
++}
++
++static int vbr_complete(struct v4l2_h264_enc_rc *rc, unsigned long bytesused)
++{
++	return v4l2_h264_enc_rc_stats_collect(rc, bytesused);
++}
++
++static const struct v4l2_h264_enc_rc_mode vbr_mode = {
++	.name		= "variable bitrate",
++	.type		= V4L2_H264_ENC_RC_TYPE_VBR,
++	.measure	= vbr_measure,
++	.estimate	= cbr_estimate,
++	.complete	= vbr_complete,
++};
++
+ static const struct v4l2_h264_enc_rc_mode *modes[] = {
+ 	&direct_mode,
+ 	&cq_mode,
+ 	&cbr_mode,
++	&vbr_mode,
+ };
+ 
+ static int mode_prepare(struct v4l2_h264_enc_rc *rc)
+--- a/drivers/media/v4l2-core/v4l2-h264-enc.c
++++ b/drivers/media/v4l2-core/v4l2-h264-enc.c
+@@ -1273,7 +1273,8 @@
+ 	if (rc->mode) {
+ 		pr_debug("  rc mode: %s", rc->mode->name);
+ 
+-		if (rc->mode->type == V4L2_H264_ENC_RC_TYPE_CBR) {
++		if (rc->mode->type == V4L2_H264_ENC_RC_TYPE_CBR ||
++		    rc->mode->type == V4L2_H264_ENC_RC_TYPE_VBR) {
+ 			pr_debug("  rc bitrate: %u bits/s", state->bitrate);
+ 			pr_debug("  rc target: %lu bytes", rc->size);
+ 		}
+--- a/include/media/v4l2-h264-enc-rc.h
++++ b/include/media/v4l2-h264-enc-rc.h
+@@ -80,6 +80,10 @@
+ 	unsigned long long size_total;
+ 	unsigned int count;
+ 	unsigned int index;
++
++	/* Since the rate control mode was set up. */
++	unsigned long long size_all;
++	unsigned long long count_all;
+ };
+ 
+ struct v4l2_h264_enc_rc {

@@ -1,0 +1,853 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Mon, 9 Nov 2026 12:00:00 +0000
+Subject: crypto: sun8i-ce - Add CTR, CTS and CBC-MAC for the H616
+
+The H616 crypto engine also does the CTR (symmetric mode 2), CTS (3) and
+CBC-MAC (6) modes. Register them for the H616, with the generic
+templates as fallback:
+
+- ctr(aes) and ctr(des3_ede): the counter is the whole IV block (counter
+  width 128 bits for AES, 64 bits for 3DES), as in the ctr template. The
+  counter is encrypted in both directions. A final partial block goes to
+  the fallback; the IV of the next request is the counter plus the
+  number of blocks.
+- cts(cbc(aes)): one request is one complete message, so the "last
+  package" flag is always set. One block (plain CBC) and lengths that are
+  not a multiple of 4 go to the fallback.
+- cbcmac(aes), the MAC that ccm uses: a CBC encryption from a zero IV of
+  which the engine writes the 128-bit last block. Only digest() of whole
+  blocks runs on the engine, everything else on the fallback. It is
+  registered with CRYPTO_ALG_NO_FALLBACK: the hash API cannot find the
+  extra fallback it adds to asynchronous hashes, because the only
+  synchronous cbcmac(aes), cbcmac-aes-lib, has no export_core(), and
+  every allocation of the transform would fail with -EINVAL. The
+  driver's own fallback is asked for as a synchronous one, so that it
+  cannot be this algorithm itself.
+
+The engine writes the IV of the next block to the ctr address of the
+task. The driver does not use it, but gives these modes a valid one: one
+block right after each flow's task descriptor.
+
+The CPU's ARMv8 AES instructions are much faster than the engine, so the
+new modes register below every CPU implementation, like xts(aes): the
+CPU stays the default and the engine is used when it is asked for by
+driver name.
+
+The CFB and OFB modes have no user in the crypto API any more, and the
+kernel has no test vectors for a DES CBC-MAC, so they are not
+registered. The other variants get CE_ID_NOTSUPP for the new modes.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../allwinner/sun8i-ce/sun8i-ce-cipher.c      |  86 ++++++-
+ .../crypto/allwinner/sun8i-ce/sun8i-ce-core.c | 172 +++++++++++++-
+ .../crypto/allwinner/sun8i-ce/sun8i-ce-hash.c | 218 +++++++++++++++++-
+ drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h  |  29 ++-
+ 4 files changed, 481 insertions(+), 24 deletions(-)
+
+diff --git a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-cipher.c b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-cipher.c
+index b87be31..3dc80d8 100644
+--- a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-cipher.c
++++ b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-cipher.c
+@@ -6,7 +6,8 @@
+  * Copyright (C) 2016-2019 Corentin LABBE <clabbe.montjoie@gmail.com>
+  *
+  * This file add support for AES cipher with 128,192,256 bits keysize in
+- * CBC and ECB mode, and for AES-XTS with 256 and 512 bits keysize.
++ * CBC and ECB mode, for AES-XTS with 256 and 512 bits keysize, and for
++ * AES-CTR, AES-CTS and 3DES-CTR.
+  *
+  * You could find a link for the datasheet in Documentation/arch/arm/sunxi.rst
+  */
+@@ -23,12 +24,26 @@
+ #include "sun8i-ce.h"
+ 
+ /*
+- * XTS uses the request IV as the tweak of its first block and returns no IV,
+  * CBC returns the last ciphertext block as the IV of the next request.
++ * CTR returns the counter after the last block (sun8i_ce_ctr_add()).
++ * XTS uses the request IV as the tweak of its first block and returns no IV,
++ * CTS returns no IV either: a request is always a complete message.
+  */
+ static bool sun8i_ce_cipher_iv_out(struct sun8i_ce_alg_template *algt)
+ {
+-	return algt->ce_blockmode != CE_ID_OP_XTS;
++	return algt->ce_blockmode == CE_ID_OP_CBC;
++}
++
++/* Add n to the big-endian counter that fills the whole IV block */
++static void sun8i_ce_ctr_add(u8 *ctr, unsigned int size, u32 n)
++{
++	u64 v = n;
++
++	while (size-- && v) {
++		v += ctr[size];
++		ctr[size] = v & 0xff;
++		v >>= 8;
++	}
+ }
+ 
+ static int sun8i_ce_cipher_need_fallback(struct skcipher_request *areq)
+@@ -69,11 +84,37 @@ static int sun8i_ce_cipher_need_fallback(struct skcipher_request *areq)
+ 		return true;
+ 	}
+ 
+-	if (areq->cryptlen % 16) {
+-		if (IS_ENABLED(CONFIG_CRYPTO_DEV_SUN8I_CE_DEBUG))
+-			algt->stat_fb_mod16++;
++	switch (algt->ce_blockmode) {
++	case CE_ID_OP_CTS:
++		/*
++		 * One block is plain CBC: the CTS flag is for a last package
++		 * of more than one block. Lengths that are not a multiple of
++		 * 4 are sent to the fallback by the SG checks below.
++		 */
++		if (areq->cryptlen <= AES_BLOCK_SIZE) {
++			if (IS_ENABLED(CONFIG_CRYPTO_DEV_SUN8I_CE_DEBUG))
++				algt->stat_fb_leniv++;
+ 
+-		return true;
++			return true;
++		}
++		break;
++	case CE_ID_OP_CTR:
++		/* a final partial block is left to the fallback */
++		todo = crypto_skcipher_chunksize(tfm);
++		if (areq->cryptlen % todo) {
++			if (IS_ENABLED(CONFIG_CRYPTO_DEV_SUN8I_CE_DEBUG))
++				algt->stat_fb_mod16++;
++
++			return true;
++		}
++		break;
++	default:
++		if (areq->cryptlen % 16) {
++			if (IS_ENABLED(CONFIG_CRYPTO_DEV_SUN8I_CE_DEBUG))
++				algt->stat_fb_mod16++;
++
++			return true;
++		}
+ 	}
+ 
+ 	len = areq->cryptlen;
+@@ -184,7 +225,10 @@ static int sun8i_ce_cipher_prepare(struct skcipher_request *areq,
+ 		common = CE_ALG_RAES;
+ 	else
+ 		common = ce->variant->alg_cipher[algt->ce_algo_id];
+-	common |= rctx->op_dir | CE_COMM_INT;
++	common |= CE_COMM_INT;
++	/* CTR encrypts the counter in both directions */
++	if (algt->ce_blockmode != CE_ID_OP_CTR)
++		common |= rctx->op_dir;
+ 	cet->t_common_ctl = cpu_to_le32(common);
+ 	/* CTS and recent CE (H6) need length in bytes, in word otherwise */
+ 	if (ce->variant->cipher_t_dlen_in_bytes)
+@@ -192,9 +236,11 @@ static int sun8i_ce_cipher_prepare(struct skcipher_request *areq,
+ 	else
+ 		cet->t_dlen = cpu_to_le32(areq->cryptlen / 4);
+ 
++	ivsize = crypto_skcipher_ivsize(tfm);
+ 	sym = ce->variant->op_mode[algt->ce_blockmode];
+ 	len = op->keylen;
+-	if (algt->ce_blockmode == CE_ID_OP_XTS) {
++	switch (algt->ce_blockmode) {
++	case CE_ID_OP_XTS:
+ 		/*
+ 		 * One request is one data unit: its first block uses the
+ 		 * tweak from the IV, its last block ends the data unit. The
+@@ -202,6 +248,18 @@ static int sun8i_ce_cipher_prepare(struct skcipher_request *areq,
+ 		 */
+ 		sym |= CE_SYM_XTS_FIRST | CE_SYM_XTS_LAST;
+ 		len /= 2;
++		break;
++	case CE_ID_OP_CTR:
++		/* The counter is the whole IV block, as in the ctr template */
++		if (ivsize == AES_BLOCK_SIZE)
++			sym |= CE_SYM_CTR_128;
++		else
++			sym |= CE_SYM_CTR_64;
++		break;
++	case CE_ID_OP_CTS:
++		/* One request is one complete message */
++		sym |= CE_SYM_CTS_LAST;
++		break;
+ 	}
+ 	switch (len) {
+ 	case 128 / 8:
+@@ -226,7 +284,12 @@ static int sun8i_ce_cipher_prepare(struct skcipher_request *areq,
+ 	}
+ 	cet->t_key = desc_addr_val_le32(ce, rctx->addr_key);
+ 
+-	ivsize = crypto_skcipher_ivsize(tfm);
++	/* Where the CE writes the IV of the next block, unused by the driver */
++	if (algt->ce_blockmode == CE_ID_OP_CTR ||
++	    algt->ce_blockmode == CE_ID_OP_CTS)
++		cet->t_ctr = desc_addr_val_le32(ce,
++						ce->chanlist[rctx->flow].iv_out_phy);
++
+ 	if (areq->iv && ivsize > 0) {
+ 		if (sun8i_ce_cipher_iv_out(algt) &&
+ 		    (rctx->op_dir & CE_DECRYPTION)) {
+@@ -376,6 +439,9 @@ static void sun8i_ce_cipher_unprepare(struct skcipher_request *areq,
+ 							 offset, ivsize, 0);
+ 			}
+ 		}
++		if (algt->ce_blockmode == CE_ID_OP_CTR)
++			sun8i_ce_ctr_add(areq->iv, ivsize,
++					 areq->cryptlen / ivsize);
+ 		memzero_explicit(rctx->bounce_iv, ivsize);
+ 	}
+ 
+diff --git a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c
+index a7d7719..41b88e8 100644
+--- a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c
++++ b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c
+@@ -10,6 +10,7 @@
+  * You could find a link for the datasheet in Documentation/arch/arm/sunxi.rst
+  */
+ 
++#include <crypto/aes-cbc-macs.h>
+ #include <crypto/engine.h>
+ #include <crypto/internal/hash.h>
+ #include <crypto/internal/skcipher.h>
+@@ -41,7 +42,8 @@ static const struct ce_variant ce_h3_variant = {
+ 	.alg_hash = { CE_ALG_MD5, CE_ALG_SHA1, CE_ALG_SHA224, CE_ALG_SHA256,
+ 		CE_ALG_SHA384, CE_ALG_SHA512
+ 	},
+-	.op_mode = { CE_OP_ECB, CE_OP_CBC, CE_ID_NOTSUPP
++	.op_mode = { CE_OP_ECB, CE_OP_CBC, CE_ID_NOTSUPP, CE_ID_NOTSUPP,
++		CE_ID_NOTSUPP, CE_ID_NOTSUPP
+ 	},
+ 	.ce_clks = {
+ 		{ "bus", 0, 200000000 },
+@@ -57,7 +59,8 @@ static const struct ce_variant ce_h5_variant = {
+ 	.alg_hash = { CE_ALG_MD5, CE_ALG_SHA1, CE_ALG_SHA224, CE_ALG_SHA256,
+ 		CE_ID_NOTSUPP, CE_ID_NOTSUPP
+ 	},
+-	.op_mode = { CE_OP_ECB, CE_OP_CBC, CE_ID_NOTSUPP
++	.op_mode = { CE_OP_ECB, CE_OP_CBC, CE_ID_NOTSUPP, CE_ID_NOTSUPP,
++		CE_ID_NOTSUPP, CE_ID_NOTSUPP
+ 	},
+ 	.ce_clks = {
+ 		{ "bus", 0, 200000000 },
+@@ -73,7 +76,8 @@ static const struct ce_variant ce_h6_variant = {
+ 	.alg_hash = { CE_ALG_MD5, CE_ALG_SHA1, CE_ALG_SHA224, CE_ALG_SHA256,
+ 		CE_ALG_SHA384, CE_ALG_SHA512
+ 	},
+-	.op_mode = { CE_OP_ECB, CE_OP_CBC, CE_ID_NOTSUPP
++	.op_mode = { CE_OP_ECB, CE_OP_CBC, CE_ID_NOTSUPP, CE_ID_NOTSUPP,
++		CE_ID_NOTSUPP, CE_ID_NOTSUPP
+ 	},
+ 	.cipher_t_dlen_in_bytes = true,
+ 	.hash_t_dlen_in_bits = true,
+@@ -93,7 +97,8 @@ static const struct ce_variant ce_h616_variant = {
+ 	.alg_hash = { CE_ALG_MD5, CE_ALG_SHA1, CE_ALG_SHA224, CE_ALG_SHA256,
+ 		CE_ALG_SHA384, CE_ALG_SHA512
+ 	},
+-	.op_mode = { CE_OP_ECB, CE_OP_CBC, CE_OP_XTS
++	.op_mode = { CE_OP_ECB, CE_OP_CBC, CE_OP_XTS, CE_OP_CTR, CE_OP_CTS,
++		CE_OP_CBCMAC
+ 	},
+ 	.cipher_t_dlen_in_bytes = true,
+ 	.hash_t_dlen_in_bits = true,
+@@ -115,7 +120,8 @@ static const struct ce_variant ce_a64_variant = {
+ 	.alg_hash = { CE_ALG_MD5, CE_ALG_SHA1, CE_ALG_SHA224, CE_ALG_SHA256,
+ 		CE_ID_NOTSUPP, CE_ID_NOTSUPP
+ 	},
+-	.op_mode = { CE_OP_ECB, CE_OP_CBC, CE_ID_NOTSUPP
++	.op_mode = { CE_OP_ECB, CE_OP_CBC, CE_ID_NOTSUPP, CE_ID_NOTSUPP,
++		CE_ID_NOTSUPP, CE_ID_NOTSUPP
+ 	},
+ 	.ce_clks = {
+ 		{ "bus", 0, 200000000 },
+@@ -131,7 +137,8 @@ static const struct ce_variant ce_d1_variant = {
+ 	.alg_hash = { CE_ALG_MD5, CE_ALG_SHA1, CE_ALG_SHA224, CE_ALG_SHA256,
+ 		CE_ALG_SHA384, CE_ALG_SHA512
+ 	},
+-	.op_mode = { CE_OP_ECB, CE_OP_CBC, CE_ID_NOTSUPP
++	.op_mode = { CE_OP_ECB, CE_OP_CBC, CE_ID_NOTSUPP, CE_ID_NOTSUPP,
++		CE_ID_NOTSUPP, CE_ID_NOTSUPP
+ 	},
+ 	.ce_clks = {
+ 		{ "bus", 0, 200000000 },
+@@ -149,7 +156,8 @@ static const struct ce_variant ce_r40_variant = {
+ 	.alg_hash = { CE_ALG_MD5, CE_ALG_SHA1, CE_ALG_SHA224, CE_ALG_SHA256,
+ 		CE_ID_NOTSUPP, CE_ID_NOTSUPP
+ 	},
+-	.op_mode = { CE_OP_ECB, CE_OP_CBC, CE_ID_NOTSUPP
++	.op_mode = { CE_OP_ECB, CE_OP_CBC, CE_ID_NOTSUPP, CE_ID_NOTSUPP,
++		CE_ID_NOTSUPP, CE_ID_NOTSUPP
+ 	},
+ 	.ce_clks = {
+ 		{ "bus", 0, 200000000 },
+@@ -380,6 +388,67 @@ static struct sun8i_ce_alg_template ce_algs[] = {
+ 		.do_one_request = sun8i_ce_cipher_do_one,
+ 	},
+ },
++{
++	.type = CRYPTO_ALG_TYPE_SKCIPHER,
++	.ce_algo_id = CE_ID_CIPHER_AES,
++	.ce_blockmode = CE_ID_OP_CTR,
++	.alg.skcipher.base = {
++		.base = {
++			.cra_name = "ctr(aes)",
++			.cra_driver_name = "ctr-aes-sun8i-ce",
++			.cra_priority = CE_PRIO_BELOW_CPU,
++			.cra_blocksize = 1,
++			.cra_flags = CRYPTO_ALG_TYPE_SKCIPHER |
++				CRYPTO_ALG_ASYNC |
++				CRYPTO_ALG_NEED_FALLBACK,
++			.cra_ctxsize = sizeof(struct sun8i_cipher_tfm_ctx),
++			.cra_module = THIS_MODULE,
++			.cra_alignmask = 0xf,
++			.cra_init = sun8i_ce_cipher_init,
++			.cra_exit = sun8i_ce_cipher_exit,
++		},
++		.min_keysize	= AES_MIN_KEY_SIZE,
++		.max_keysize	= AES_MAX_KEY_SIZE,
++		.ivsize		= AES_BLOCK_SIZE,
++		.chunksize	= AES_BLOCK_SIZE,
++		.setkey		= sun8i_ce_aes_setkey,
++		.encrypt	= sun8i_ce_skencrypt,
++		.decrypt	= sun8i_ce_skdecrypt,
++	},
++	.alg.skcipher.op = {
++		.do_one_request = sun8i_ce_cipher_do_one,
++	},
++},
++{
++	.type = CRYPTO_ALG_TYPE_SKCIPHER,
++	.ce_algo_id = CE_ID_CIPHER_AES,
++	.ce_blockmode = CE_ID_OP_CTS,
++	.alg.skcipher.base = {
++		.base = {
++			.cra_name = "cts(cbc(aes))",
++			.cra_driver_name = "cts-cbc-aes-sun8i-ce",
++			.cra_priority = CE_PRIO_BELOW_CPU,
++			.cra_blocksize = AES_BLOCK_SIZE,
++			.cra_flags = CRYPTO_ALG_TYPE_SKCIPHER |
++				CRYPTO_ALG_ASYNC |
++				CRYPTO_ALG_NEED_FALLBACK,
++			.cra_ctxsize = sizeof(struct sun8i_cipher_tfm_ctx),
++			.cra_module = THIS_MODULE,
++			.cra_alignmask = 0xf,
++			.cra_init = sun8i_ce_cipher_init,
++			.cra_exit = sun8i_ce_cipher_exit,
++		},
++		.min_keysize	= AES_MIN_KEY_SIZE,
++		.max_keysize	= AES_MAX_KEY_SIZE,
++		.ivsize		= AES_BLOCK_SIZE,
++		.setkey		= sun8i_ce_aes_setkey,
++		.encrypt	= sun8i_ce_skencrypt,
++		.decrypt	= sun8i_ce_skdecrypt,
++	},
++	.alg.skcipher.op = {
++		.do_one_request = sun8i_ce_cipher_do_one,
++	},
++},
+ {
+ 	.type = CRYPTO_ALG_TYPE_SKCIPHER,
+ 	.ce_algo_id = CE_ID_CIPHER_DES3,
+@@ -439,6 +508,37 @@ static struct sun8i_ce_alg_template ce_algs[] = {
+ 		.do_one_request = sun8i_ce_cipher_do_one,
+ 	},
+ },
++{
++	.type = CRYPTO_ALG_TYPE_SKCIPHER,
++	.ce_algo_id = CE_ID_CIPHER_DES3,
++	.ce_blockmode = CE_ID_OP_CTR,
++	.alg.skcipher.base = {
++		.base = {
++			.cra_name = "ctr(des3_ede)",
++			.cra_driver_name = "ctr-des3-sun8i-ce",
++			.cra_priority = CE_PRIO_BELOW_CPU,
++			.cra_blocksize = 1,
++			.cra_flags = CRYPTO_ALG_TYPE_SKCIPHER |
++				CRYPTO_ALG_ASYNC |
++				CRYPTO_ALG_NEED_FALLBACK,
++			.cra_ctxsize = sizeof(struct sun8i_cipher_tfm_ctx),
++			.cra_module = THIS_MODULE,
++			.cra_alignmask = 0xf,
++			.cra_init = sun8i_ce_cipher_init,
++			.cra_exit = sun8i_ce_cipher_exit,
++		},
++		.min_keysize	= DES3_EDE_KEY_SIZE,
++		.max_keysize	= DES3_EDE_KEY_SIZE,
++		.ivsize		= DES3_EDE_BLOCK_SIZE,
++		.chunksize	= DES3_EDE_BLOCK_SIZE,
++		.setkey		= sun8i_ce_des3_setkey,
++		.encrypt	= sun8i_ce_skencrypt,
++		.decrypt	= sun8i_ce_skdecrypt,
++	},
++	.alg.skcipher.op = {
++		.do_one_request = sun8i_ce_cipher_do_one,
++	},
++},
+ #ifdef CONFIG_CRYPTO_DEV_SUN8I_CE_HASH
+ {	.type = CRYPTO_ALG_TYPE_AHASH,
+ 	.ce_algo_id = CE_ID_HASH_MD5,
+@@ -633,6 +733,47 @@ static struct sun8i_ce_alg_template ce_algs[] = {
+ 		.do_one_request = sun8i_ce_hash_run,
+ 	},
+ },
++{	.type = CRYPTO_ALG_TYPE_AHASH,
++	.ce_algo_id = CE_ID_CIPHER_AES,
++	.ce_blockmode = CE_ID_OP_CBCMAC,
++	.alg.hash.base = {
++		.init = sun8i_ce_hash_init,
++		.update = sun8i_ce_hash_update,
++		.final = sun8i_ce_hash_final,
++		.finup = sun8i_ce_hash_finup,
++		.digest = sun8i_ce_cbcmac_digest,
++		.export = sun8i_ce_hash_export,
++		.import = sun8i_ce_hash_import,
++		.init_tfm = sun8i_ce_hash_init_tfm,
++		.exit_tfm = sun8i_ce_hash_exit_tfm,
++		.setkey = sun8i_ce_cbcmac_setkey,
++		.halg = {
++			.digestsize = AES_BLOCK_SIZE,
++			.statesize = sizeof(struct aes_cbcmac_ctx),
++			.base = {
++				.cra_name = "cbcmac(aes)",
++				.cra_driver_name = "cbcmac-aes-sun8i-ce",
++				.cra_priority = CE_PRIO_BELOW_CPU,
++				/*
++				 * The driver has its own fallback. The one the
++				 * hash API would add for virtual address
++				 * requests cannot exist: cbcmac-aes-lib, the
++				 * only synchronous cbcmac(aes), has no
++				 * export_core().
++				 */
++				.cra_flags = CRYPTO_ALG_TYPE_AHASH |
++					CRYPTO_ALG_ASYNC |
++					CRYPTO_ALG_NO_FALLBACK,
++				.cra_blocksize = AES_BLOCK_SIZE,
++				.cra_ctxsize = sizeof(struct sun8i_ce_hash_tfm_ctx),
++				.cra_module = THIS_MODULE,
++			}
++		}
++	},
++	.alg.hash.op = {
++		.do_one_request = sun8i_ce_cbcmac_run,
++	},
++},
+ #endif
+ };
+ 
+@@ -707,12 +848,15 @@ static int sun8i_ce_debugfs_show(struct seq_file *seq, void *v)
+ 
+ DEFINE_SHOW_ATTRIBUTE(sun8i_ce_debugfs);
+ 
++/* Each task is followed by the block where the CE writes the next IV */
++#define CE_TASK_ALLOC_SIZE	(sizeof(struct ce_task) + AES_BLOCK_SIZE)
++
+ static void sun8i_ce_free_chanlist(struct sun8i_ce_dev *ce, int i)
+ {
+ 	while (i >= 0) {
+ 		crypto_engine_exit(ce->chanlist[i].engine);
+ 		if (ce->chanlist[i].tl)
+-			dma_free_coherent(ce->dev, sizeof(struct ce_task),
++			dma_free_coherent(ce->dev, CE_TASK_ALLOC_SIZE,
+ 					  ce->chanlist[i].tl,
+ 					  ce->chanlist[i].t_phy);
+ 		i--;
+@@ -747,7 +891,7 @@ static int sun8i_ce_allocate_chanlist(struct sun8i_ce_dev *ce)
+ 			goto error_engine;
+ 		}
+ 		ce->chanlist[i].tl = dma_alloc_coherent(ce->dev,
+-							sizeof(struct ce_task),
++							CE_TASK_ALLOC_SIZE,
+ 							&ce->chanlist[i].t_phy,
+ 							GFP_KERNEL);
+ 		if (!ce->chanlist[i].tl) {
+@@ -756,6 +900,8 @@ static int sun8i_ce_allocate_chanlist(struct sun8i_ce_dev *ce)
+ 			err = -ENOMEM;
+ 			goto error_engine;
+ 		}
++		ce->chanlist[i].iv_out_phy = ce->chanlist[i].t_phy +
++					     sizeof(struct ce_task);
+ 	}
+ 	return 0;
+ error_engine:
+@@ -905,7 +1051,13 @@ static int sun8i_ce_register_algs(struct sun8i_ce_dev *ce)
+ #ifdef CONFIG_CRYPTO_DEV_SUN8I_CE_HASH
+ 		case CRYPTO_ALG_TYPE_AHASH:
+ 			id = ce_algs[i].ce_algo_id;
+-			ce_method = ce->variant->alg_hash[id];
++			if (ce_algs[i].ce_blockmode == CE_ID_OP_CBCMAC) {
++				ce_method = ce->variant->alg_cipher[id];
++				if (ce_method != CE_ID_NOTSUPP)
++					ce_method = ce->variant->op_mode[CE_ID_OP_CBCMAC];
++			} else {
++				ce_method = ce->variant->alg_hash[id];
++			}
+ 			if (ce_method == CE_ID_NOTSUPP) {
+ 				dev_info(ce->dev,
+ 					 "DEBUG: Algo of %s not supported\n",
+diff --git a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-hash.c b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-hash.c
+index d015943..80ae476 100644
+--- a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-hash.c
++++ b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-hash.c
+@@ -5,7 +5,8 @@
+  *
+  * Copyright (C) 2015-2020 Corentin Labbe <clabbe@baylibre.com>
+  *
+- * This file add support for MD5 and SHA1/SHA224/SHA256/SHA384/SHA512.
++ * This file add support for MD5 and SHA1/SHA224/SHA256/SHA384/SHA512, and
++ * for the AES CBC-MAC.
+  *
+  * You could find the datasheet in Documentation/arch/arm/sunxi.rst
+  */
+@@ -40,14 +41,22 @@ int sun8i_ce_hash_init_tfm(struct crypto_ahash *tfm)
+ 	struct sun8i_ce_hash_tfm_ctx *op = crypto_ahash_ctx(tfm);
+ 	struct ahash_alg *alg = crypto_ahash_alg(tfm);
+ 	struct sun8i_ce_alg_template *algt;
++	u32 mask = CRYPTO_ALG_NEED_FALLBACK;
+ 	int err;
+ 
+ 	algt = container_of(alg, struct sun8i_ce_alg_template, alg.hash.base);
+ 	op->ce = algt->ce;
+ 
++	/*
++	 * cbcmac(aes) has no CRYPTO_ALG_NEED_FALLBACK flag to keep it from
++	 * being its own fallback: ask for a synchronous one.
++	 */
++	if (algt->ce_blockmode == CE_ID_OP_CBCMAC)
++		mask |= CRYPTO_ALG_ASYNC;
++
+ 	/* FALLBACK */
+ 	op->fallback_tfm = crypto_alloc_ahash(crypto_ahash_alg_name(tfm), 0,
+-					      CRYPTO_ALG_NEED_FALLBACK);
++					      mask);
+ 	if (IS_ERR(op->fallback_tfm)) {
+ 		dev_err(algt->ce->dev, "Fallback driver could no be loaded\n");
+ 		return PTR_ERR(op->fallback_tfm);
+@@ -79,6 +88,7 @@ void sun8i_ce_hash_exit_tfm(struct crypto_ahash *tfm)
+ {
+ 	struct sun8i_ce_hash_tfm_ctx *tfmctx = crypto_ahash_ctx(tfm);
+ 
++	kfree_sensitive(tfmctx->key);
+ 	crypto_free_ahash(tfmctx->fallback_tfm);
+ 	pm_runtime_put_sync_suspend(tfmctx->ce->dev);
+ }
+@@ -484,3 +494,207 @@ int sun8i_ce_hash_run(struct crypto_engine *engine, void *async_req)
+ 
+ 	return 0;
+ }
++
++int sun8i_ce_cbcmac_setkey(struct crypto_ahash *tfm, const u8 *key,
++			   unsigned int keylen)
++{
++	struct sun8i_ce_hash_tfm_ctx *op = crypto_ahash_ctx(tfm);
++	int err;
++
++	err = aes_check_keylen(keylen);
++	if (err)
++		return err;
++
++	kfree_sensitive(op->key);
++	op->keylen = keylen;
++	op->key = kmemdup(key, keylen, GFP_KERNEL | GFP_DMA);
++	if (!op->key)
++		return -ENOMEM;
++
++	crypto_ahash_clear_flags(op->fallback_tfm, CRYPTO_TFM_REQ_MASK);
++	crypto_ahash_set_flags(op->fallback_tfm,
++			       crypto_ahash_get_flags(tfm) & CRYPTO_TFM_REQ_MASK);
++
++	return crypto_ahash_setkey(op->fallback_tfm, key, keylen);
++}
++
++/*
++ * The CE takes whole blocks only: the zero padding of a final partial block
++ * and the empty message are left to the fallback.
++ */
++int sun8i_ce_cbcmac_digest(struct ahash_request *areq)
++{
++	struct crypto_ahash *tfm = crypto_ahash_reqtfm(areq);
++	struct sun8i_ce_hash_tfm_ctx *ctx = crypto_ahash_ctx(tfm);
++	struct sun8i_ce_hash_reqctx *rctx = ahash_request_ctx_dma(areq);
++	struct sun8i_ce_dev *ce = ctx->ce;
++	struct crypto_engine *engine;
++	int e;
++
++	if (sun8i_ce_hash_need_fallback(areq))
++		return sun8i_ce_hash_digest_fb(areq);
++
++	if (areq->nbytes % AES_BLOCK_SIZE) {
++		if (IS_ENABLED(CONFIG_CRYPTO_DEV_SUN8I_CE_DEBUG)) {
++			struct sun8i_ce_alg_template *algt;
++			struct ahash_alg *alg = crypto_ahash_alg(tfm);
++
++			algt = container_of(alg, struct sun8i_ce_alg_template,
++					    alg.hash.base);
++			algt->stat_fb_srclen++;
++		}
++		return sun8i_ce_hash_digest_fb(areq);
++	}
++
++	e = sun8i_ce_get_engine_number(ce);
++	rctx->flow = e;
++	engine = ce->chanlist[e].engine;
++
++	return crypto_transfer_hash_request_to_engine(engine, areq);
++}
++
++/*
++ * CBC-MAC: an AES-CBC encryption from a zero IV of which the CE writes the
++ * last block only, to the destination.
++ */
++static int sun8i_ce_cbcmac_prepare(struct ahash_request *areq,
++				   struct ce_task *cet)
++{
++	struct crypto_ahash *tfm = crypto_ahash_reqtfm(areq);
++	struct sun8i_ce_hash_tfm_ctx *ctx = crypto_ahash_ctx(tfm);
++	struct sun8i_ce_hash_reqctx *rctx = ahash_request_ctx_dma(areq);
++	struct ahash_alg *alg = crypto_ahash_alg(tfm);
++	struct sun8i_ce_alg_template *algt;
++	struct sun8i_ce_dev *ce = ctx->ce;
++	struct scatterlist *sg;
++	unsigned int len, todo;
++	int nr_sgs, i, err;
++	u32 common, sym;
++
++	algt = container_of(alg, struct sun8i_ce_alg_template, alg.hash.base);
++
++	if (IS_ENABLED(CONFIG_CRYPTO_DEV_SUN8I_CE_DEBUG))
++		algt->stat_req++;
++
++	memset(cet, 0, sizeof(struct ce_task));
++
++	cet->t_id = cpu_to_le32(rctx->flow);
++	common = ce->variant->alg_cipher[algt->ce_algo_id];
++	common |= CE_ENCRYPTION | CE_COMM_INT;
++	common |= CE_COMM_CBCMAC_LEN(AES_BLOCK_SIZE * 8);
++	cet->t_common_ctl = cpu_to_le32(common);
++
++	sym = ce->variant->op_mode[CE_ID_OP_CBCMAC];
++	switch (ctx->keylen) {
++	case AES_KEYSIZE_128:
++		sym |= CE_AES_128BITS;
++		break;
++	case AES_KEYSIZE_192:
++		sym |= CE_AES_192BITS;
++		break;
++	case AES_KEYSIZE_256:
++		sym |= CE_AES_256BITS;
++		break;
++	}
++	cet->t_sym_ctl = cpu_to_le32(sym);
++	cet->t_asym_ctl = 0;
++
++	if (ce->variant->cipher_t_dlen_in_bytes)
++		cet->t_dlen = cpu_to_le32(areq->nbytes);
++	else
++		cet->t_dlen = cpu_to_le32(areq->nbytes / 4);
++
++	rctx->addr_key = dma_map_single(ce->dev, ctx->key, ctx->keylen,
++					DMA_TO_DEVICE);
++	if (dma_mapping_error(ce->dev, rctx->addr_key)) {
++		dev_err(ce->dev, "Cannot DMA MAP KEY\n");
++		return -EFAULT;
++	}
++	cet->t_key = desc_addr_val_le32(ce, rctx->addr_key);
++
++	/* The IV is zero; the ctr address gets the IV of the next block */
++	memset(rctx->pad, 0, AES_BLOCK_SIZE);
++	rctx->pad_len = AES_BLOCK_SIZE;
++	rctx->addr_pad = dma_map_single(ce->dev, rctx->pad, rctx->pad_len,
++					DMA_TO_DEVICE);
++	if (dma_mapping_error(ce->dev, rctx->addr_pad)) {
++		dev_err(ce->dev, "Cannot DMA MAP IV\n");
++		err = -EFAULT;
++		goto err_unmap_key;
++	}
++	cet->t_iv = desc_addr_val_le32(ce, rctx->addr_pad);
++	cet->t_ctr = desc_addr_val_le32(ce, ce->chanlist[rctx->flow].iv_out_phy);
++
++	rctx->nr_sgs = sg_nents_for_len(areq->src, areq->nbytes);
++	nr_sgs = dma_map_sg(ce->dev, areq->src, rctx->nr_sgs, DMA_TO_DEVICE);
++	if (nr_sgs <= 0 || nr_sgs > MAX_SG) {
++		dev_err(ce->dev, "Invalid sg number %d\n", nr_sgs);
++		err = -EINVAL;
++		goto err_unmap_iv;
++	}
++
++	len = areq->nbytes;
++	for_each_sg(areq->src, sg, nr_sgs, i) {
++		cet->t_src[i].addr = desc_addr_val_le32(ce, sg_dma_address(sg));
++		todo = min(len, sg_dma_len(sg));
++		cet->t_src[i].len = cpu_to_le32(todo / 4);
++		len -= todo;
++	}
++	if (len > 0) {
++		dev_err(ce->dev, "remaining len %d\n", len);
++		err = -EINVAL;
++		goto err_unmap_src;
++	}
++
++	rctx->result_len = AES_BLOCK_SIZE;
++	rctx->addr_res = dma_map_single(ce->dev, rctx->result, rctx->result_len,
++					DMA_FROM_DEVICE);
++	if (dma_mapping_error(ce->dev, rctx->addr_res)) {
++		dev_err(ce->dev, "DMA map dest\n");
++		err = -EINVAL;
++		goto err_unmap_src;
++	}
++	cet->t_dst[0].addr = desc_addr_val_le32(ce, rctx->addr_res);
++	cet->t_dst[0].len = cpu_to_le32(rctx->result_len / 4);
++
++	return 0;
++
++err_unmap_src:
++	dma_unmap_sg(ce->dev, areq->src, rctx->nr_sgs, DMA_TO_DEVICE);
++err_unmap_iv:
++	dma_unmap_single(ce->dev, rctx->addr_pad, rctx->pad_len, DMA_TO_DEVICE);
++err_unmap_key:
++	dma_unmap_single(ce->dev, rctx->addr_key, ctx->keylen, DMA_TO_DEVICE);
++	return err;
++}
++
++int sun8i_ce_cbcmac_run(struct crypto_engine *engine, void *async_req)
++{
++	struct ahash_request *areq = ahash_request_cast(async_req);
++	struct crypto_ahash *tfm = crypto_ahash_reqtfm(areq);
++	struct sun8i_ce_hash_tfm_ctx *ctx = crypto_ahash_ctx(tfm);
++	struct sun8i_ce_hash_reqctx *rctx = ahash_request_ctx_dma(areq);
++	struct sun8i_ce_dev *ce = ctx->ce;
++	int err;
++
++	err = sun8i_ce_cbcmac_prepare(areq, ce->chanlist[rctx->flow].tl);
++	if (err)
++		return err;
++
++	err = sun8i_ce_run_task(ce, rctx->flow, crypto_ahash_alg_name(tfm));
++
++	dma_unmap_single(ce->dev, rctx->addr_res, rctx->result_len,
++			 DMA_FROM_DEVICE);
++	dma_unmap_sg(ce->dev, areq->src, rctx->nr_sgs, DMA_TO_DEVICE);
++	dma_unmap_single(ce->dev, rctx->addr_pad, rctx->pad_len, DMA_TO_DEVICE);
++	dma_unmap_single(ce->dev, rctx->addr_key, ctx->keylen, DMA_TO_DEVICE);
++
++	if (!err)
++		memcpy(areq->result, rctx->result, AES_BLOCK_SIZE);
++
++	local_bh_disable();
++	crypto_finalize_hash_request(engine, async_req, err);
++	local_bh_enable();
++
++	return 0;
++}
+diff --git a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h
+index 89689e5..8300289 100644
+--- a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h
++++ b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h
+@@ -38,6 +38,7 @@
+ #define CE_DECRYPTION		BIT(8)
+ 
+ #define CE_COMM_INT		BIT(31)
++#define CE_COMM_CBCMAC_LEN(bits)	((bits) << 17)
+ 
+ /* ce_task symmetric */
+ #define CE_AES_128BITS 0
+@@ -46,10 +47,17 @@
+ 
+ #define CE_OP_ECB	0
+ #define CE_OP_CBC	(1 << 8)
++#define CE_OP_CTR	(2 << 8)
++#define CE_OP_CTS	(3 << 8)
++#define CE_OP_CBCMAC	(6 << 8)
+ #define CE_OP_XTS	(9 << 8)
+ 
++#define CE_SYM_CTR_64		(2 << 2)
++#define CE_SYM_CTR_128		(3 << 2)
++
+ #define CE_SYM_XTS_FIRST	BIT(12)
+ #define CE_SYM_XTS_LAST		BIT(13)
++#define CE_SYM_CTS_LAST		BIT(16)
+ 
+ #define CE_ALG_AES		0
+ #define CE_ALG_DES		1
+@@ -83,7 +91,10 @@
+ #define CE_ID_OP_ECB	0
+ #define CE_ID_OP_CBC	1
+ #define CE_ID_OP_XTS	2
+-#define CE_ID_OP_MAX	3
++#define CE_ID_OP_CTR	3
++#define CE_ID_OP_CTS	4
++#define CE_ID_OP_CBCMAC	5
++#define CE_ID_OP_MAX	6
+ 
+ /* Used in CE registers */
+ #define CE_ERR_ALGO_NOTSUP	BIT(0)
+@@ -139,7 +150,8 @@ struct ce_clock {
+  * @alg_hash:	list of supported hashes. for each CE_ID_ this will give the
+  *              corresponding CE_ALG_XXX value
+  * @op_mode:	list of supported block modes, CE_ID_NOTSUPP if not supported.
+- *		XTS runs on the RAES unit (algorithm CE_ALG_RAES)
++ *		XTS runs on the RAES unit (algorithm CE_ALG_RAES), the
++ *		CBC-MAC mode is registered as a hash
+  * @cipher_t_dlen_in_bytes:	Does the request size for cipher is in
+  *				bytes or words
+  * @hash_t_dlen_in_bytes:	Does the request size for hash is in
+@@ -194,6 +206,8 @@ struct ce_task {
+  * @status:	set to 1 by interrupt if task is done
+  * @t_phy:	Physical address of task
+  * @tl:		pointer to the current ce_task for this flow
++ * @iv_out_phy:	Physical address of a block where the CE can write the IV of
++ *		the next block (ctr address of the task), right after the task
+  * @stat_req:	number of request done by this flow
+  */
+ struct sun8i_ce_flow {
+@@ -202,6 +216,7 @@ struct sun8i_ce_flow {
+ 	int status;
+ 	dma_addr_t t_phy;
+ 	struct ce_task *tl;
++	dma_addr_t iv_out_phy;
+ #ifdef CONFIG_CRYPTO_DEV_SUN8I_CE_DEBUG
+ 	unsigned long stat_req;
+ #endif
+@@ -300,10 +315,14 @@ struct sun8i_cipher_tfm_ctx {
+  * struct sun8i_ce_hash_tfm_ctx - context for an ahash TFM
+  * @ce:			pointer to the private data of driver handling this TFM
+  * @fallback_tfm:	pointer to the fallback TFM
++ * @key:		pointer to key data (CBC-MAC only)
++ * @keylen:		len of the key
+  */
+ struct sun8i_ce_hash_tfm_ctx {
+ 	struct sun8i_ce_dev *ce;
+ 	struct crypto_ahash *fallback_tfm;
++	u32 *key;
++	u32 keylen;
+ };
+ 
+ /*
+@@ -315,6 +334,7 @@ struct sun8i_ce_hash_tfm_ctx {
+  * @pad_len: padding length in bytes
+  * @addr_res: DMA address of the result buffer, returned by dma_map_single()
+  * @addr_pad: DMA address of the padding buffer, returned by dma_map_single()
++ * @addr_key: DMA address of the key (CBC-MAC), returned by dma_map_single()
+  * @result: per-request result buffer
+  * @pad: per-request padding buffer (up to 2 blocks)
+  */
+@@ -325,6 +345,7 @@ struct sun8i_ce_hash_reqctx {
+ 	size_t pad_len;
+ 	dma_addr_t addr_res;
+ 	dma_addr_t addr_pad;
++	dma_addr_t addr_key;
+ 	u8 result[CE_MAX_HASH_DIGEST_SIZE] __aligned(CRYPTO_DMA_ALIGN);
+ 	u8 pad[2 * CE_MAX_HASH_BLOCK_SIZE];
+ 	struct ahash_request fallback_req; // keep at the end
+@@ -391,6 +412,10 @@ int sun8i_ce_hash_update(struct ahash_request *areq);
+ int sun8i_ce_hash_finup(struct ahash_request *areq);
+ int sun8i_ce_hash_digest(struct ahash_request *areq);
+ int sun8i_ce_hash_run(struct crypto_engine *engine, void *breq);
++int sun8i_ce_cbcmac_setkey(struct crypto_ahash *tfm, const u8 *key,
++			   unsigned int keylen);
++int sun8i_ce_cbcmac_digest(struct ahash_request *areq);
++int sun8i_ce_cbcmac_run(struct crypto_engine *engine, void *breq);
+ 
+ int sun8i_ce_hwrng_register(struct sun8i_ce_dev *ce);
+ void sun8i_ce_hwrng_unregister(struct sun8i_ce_dev *ce);

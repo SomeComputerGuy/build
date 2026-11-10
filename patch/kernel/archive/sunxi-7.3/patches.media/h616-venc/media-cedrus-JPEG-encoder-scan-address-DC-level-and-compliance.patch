@@ -1,0 +1,288 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Mon, 9 Nov 2026 23:00:00 +0000
+Subject: [PATCH] media: cedrus: fix the JPEG encoder's scan address and DC
+ level
+
+Every image of the JPEG encoder was undecodable: the scan began at the
+first byte of the coded buffer, over the headers, followed by as many
+zero bytes as the headers are long, and with its DC values 128 too high.
+
+The stream start register counts in units of 256 bytes and does not
+hold its two low bits, so it names 1 KiB boundaries only: the scan
+address 768 bytes into the buffer became the buffer's start. Pad the
+headers to 1 KiB instead of 256 bytes, refuse a coded buffer that does
+not start at 1 KiB, and size the coded buffer in multiples of 1 KiB
+(the end address register does not hold its two low bits either) with
+room for at least the 64 KiB minimum after the headers: a 66x50 picture
+got a 64 KiB buffer, less than the headers and the minimum, and every
+job failed with -ENOSPC. The stream size register has 28 bits; clamp it.
+
+The engine does not shift the samples to signed values; the DC biases
+of the JPEG control register (0x400 / the DC quantiser) do. They and the
+fill bit had no effect (the last scan byte was padded with zeros), and
+the register was written while the trigger register still selected
+H.264 mode, which the vendor library never does: it selects JPEG mode
+before anything else and writes the control register before the
+quantisation tables. Do the same.
+
+v4l2-compliance: a JPEG encoder is an M2M device without G/S_PARM, and
+its raw format is sRGB. Drop G/S_PARM (the frame rate was only stored)
+and describe the raw format as full range BT.601 of sRGB, which is what
+the engine codes.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
+@@ -136,8 +136,6 @@
+ 	/* Quantisation tables in natural order: luma, chroma. */
+ 	u8			qt[2][64];
+ 
+-	struct v4l2_fract	timeperframe;
+-
+ 	/*
+ 	 * Every address register of the H.264 path names this buffer, see
+ 	 * cedrus_enc_jpeg_start().
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
+@@ -134,10 +134,20 @@
+ }
+ 
+ /*
++ * Where the engine starts writing the scan: the stream start register
++ * counts in units of 256 bytes and does not hold its two low bits, so the
++ * start address is a multiple of 1 KiB (an address 768 bytes into a buffer
++ * makes the engine write at the start of the buffer, over the headers).
++ */
++#define CEDRUS_ENC_JPEG_SCAN_ALIGN	SZ_1K
++
++/* The largest value of the stream size register, in bits. */
++#define CEDRUS_ENC_JPEG_BIT_MAX		0x0fff0000
++
++/*
+  * SOI, JFIF APP0, DQT, SOF0 (three components, 4:2:0), DHT (the Annex K
+- * tables), a comment segment that pads the headers to a multiple of 256
+- * bytes, SOS. The scan follows at the next 256 byte boundary of the coded
+- * buffer, where the engine starts writing.
++ * tables), a comment segment that pads the headers to a multiple of
++ * CEDRUS_ENC_JPEG_SCAN_ALIGN, SOS. The scan follows them.
+  */
+ static void cedrus_enc_jpeg_build_header(struct cedrus_enc_jpeg_ctx *jpeg_ctx,
+ 					 unsigned int width,
+@@ -210,7 +220,7 @@
+ 	}
+ 
+ 	com_size = ALIGN(w.pos + sos_size + JPEG_COM_MIN_SIZE,
+-			 CEDRUS_ENC_CODED_ALIGN) - w.pos - sos_size;
++			 CEDRUS_ENC_JPEG_SCAN_ALIGN) - w.pos - sos_size;
+ 	cedrus_enc_jpeg_put16(&w, JPEG_MARKER_COM);
+ 	cedrus_enc_jpeg_put16(&w, com_size - 2);
+ 	memset(w.buf + w.pos, 0, com_size - 4);
+@@ -240,7 +250,10 @@
+  * The coded (CAPTURE) buffer: the headers and the scan. The default is
+  * twice the raw picture, far more than a quality 100 encode of a natural
+  * picture takes; the engine stops at the end of the buffer (a stall, the
+- * job fails), it never writes past it.
++ * job fails), it never writes past it. The scan gets at least
++ * CEDRUS_ENC_CODED_MIN_SIZE after the headers, and the size is a multiple of
++ * 1 KiB: the engine's end address register does not hold its two low bits
++ * either.
+  */
+ static void cedrus_enc_jpeg_prepare_coded_format(struct cedrus_ctx *ctx,
+ 						 struct v4l2_pix_format *pix_fmt)
+@@ -257,9 +270,10 @@
+ 		sizeimage = CEDRUS_ENC_JPEG_HEADER_MAX +
+ 			    raw_fmt->bytesperline * raw_fmt->height * 3;
+ 
+-	sizeimage = clamp_t(unsigned int, sizeimage, CEDRUS_ENC_CODED_MIN_SIZE,
++	sizeimage = clamp_t(unsigned int, sizeimage,
++			    CEDRUS_ENC_JPEG_HEADER_MAX + CEDRUS_ENC_CODED_MIN_SIZE,
+ 			    CEDRUS_ENC_CODED_MAX_SIZE);
+-	pix_fmt->sizeimage = ALIGN(sizeimage, CEDRUS_ENC_CODED_ALIGN);
++	pix_fmt->sizeimage = ALIGN(sizeimage, CEDRUS_ENC_JPEG_SCAN_ALIGN);
+ 
+ 	pix_fmt->field = V4L2_FIELD_NONE;
+ 	pix_fmt->colorspace = V4L2_COLORSPACE_JPEG;
+@@ -268,22 +282,32 @@
+ 	pix_fmt->quantization = V4L2_QUANTIZATION_DEFAULT;
+ }
+ 
+-void cedrus_enc_jpeg_reset_formats(struct cedrus_ctx *ctx)
++/*
++ * The raw (OUTPUT) picture: the input stage passes the samples through
++ * unchanged, so they are those of the JPEG image: full range BT.601 Y'CbCr
++ * of sRGB (V4L2_COLORSPACE_JPEG on the CAPTURE side).
++ */
++static void cedrus_enc_jpeg_prepare_raw_format(struct v4l2_pix_format *pix_fmt)
+ {
+-	struct cedrus_enc_jpeg_ctx *jpeg_ctx = &ctx->codec.enc_jpeg;
++	cedrus_enc_prepare_raw_format(pix_fmt, &cedrus_enc_jpeg_frmsize);
+ 
++	pix_fmt->colorspace = V4L2_COLORSPACE_SRGB;
++	pix_fmt->xfer_func = V4L2_XFER_FUNC_SRGB;
++	pix_fmt->ycbcr_enc = V4L2_YCBCR_ENC_601;
++	pix_fmt->quantization = V4L2_QUANTIZATION_FULL_RANGE;
++}
++
++void cedrus_enc_jpeg_reset_formats(struct cedrus_ctx *ctx)
++{
+ 	ctx->current_codec = &cedrus_enc_ops_jpeg;
+ 
+ 	memset(&ctx->src_fmt, 0, sizeof(ctx->src_fmt));
+ 	ctx->src_fmt.width = 1280;
+ 	ctx->src_fmt.height = 720;
+-	cedrus_enc_prepare_raw_format(&ctx->src_fmt, &cedrus_enc_jpeg_frmsize);
++	cedrus_enc_jpeg_prepare_raw_format(&ctx->src_fmt);
+ 
+ 	memset(&ctx->dst_fmt, 0, sizeof(ctx->dst_fmt));
+ 	cedrus_enc_jpeg_prepare_coded_format(ctx, &ctx->dst_fmt);
+-
+-	jpeg_ctx->timeperframe.numerator = 1;
+-	jpeg_ctx->timeperframe.denominator = 30;
+ }
+ 
+ static int cedrus_enc_jpeg_enum_fmt_vid_cap(struct file *file, void *priv,
+@@ -353,7 +377,7 @@
+ static int cedrus_enc_jpeg_try_fmt_vid_out(struct file *file, void *priv,
+ 					   struct v4l2_format *f)
+ {
+-	cedrus_enc_prepare_raw_format(&f->fmt.pix, &cedrus_enc_jpeg_frmsize);
++	cedrus_enc_jpeg_prepare_raw_format(&f->fmt.pix);
+ 
+ 	return 0;
+ }
+@@ -388,7 +412,7 @@
+ 	if (vb2_is_busy(vq) || vb2_is_busy(peer_vq))
+ 		return -EBUSY;
+ 
+-	cedrus_enc_prepare_raw_format(&f->fmt.pix, &cedrus_enc_jpeg_frmsize);
++	cedrus_enc_jpeg_prepare_raw_format(&f->fmt.pix);
+ 	ctx->src_fmt = f->fmt.pix;
+ 
+ 	ctx->dst_fmt.sizeimage = 0;
+@@ -397,36 +421,6 @@
+ 	return 0;
+ }
+ 
+-/* The frame rate is informative: every picture is coded on its own. */
+-static int cedrus_enc_jpeg_g_parm(struct file *file, void *priv,
+-				  struct v4l2_streamparm *parm)
+-{
+-	struct cedrus_ctx *ctx = cedrus_file2ctx(file);
+-
+-	if (parm->type != V4L2_BUF_TYPE_VIDEO_OUTPUT)
+-		return -EINVAL;
+-
+-	parm->parm.output.capability = V4L2_CAP_TIMEPERFRAME;
+-	parm->parm.output.timeperframe = ctx->codec.enc_jpeg.timeperframe;
+-
+-	return 0;
+-}
+-
+-static int cedrus_enc_jpeg_s_parm(struct file *file, void *priv,
+-				  struct v4l2_streamparm *parm)
+-{
+-	struct cedrus_ctx *ctx = cedrus_file2ctx(file);
+-	struct v4l2_fract *timeperframe = &parm->parm.output.timeperframe;
+-
+-	if (parm->type != V4L2_BUF_TYPE_VIDEO_OUTPUT)
+-		return -EINVAL;
+-
+-	if (timeperframe->numerator && timeperframe->denominator)
+-		ctx->codec.enc_jpeg.timeperframe = *timeperframe;
+-
+-	return cedrus_enc_jpeg_g_parm(file, priv, parm);
+-}
+-
+ static int cedrus_enc_jpeg_encoder_cmd(struct file *file, void *priv,
+ 				       struct v4l2_encoder_cmd *ec)
+ {
+@@ -465,9 +459,6 @@
+ 	.vidioc_try_fmt_vid_out		= cedrus_enc_jpeg_try_fmt_vid_out,
+ 	.vidioc_s_fmt_vid_out		= cedrus_enc_jpeg_s_fmt_vid_out,
+ 
+-	.vidioc_g_parm			= cedrus_enc_jpeg_g_parm,
+-	.vidioc_s_parm			= cedrus_enc_jpeg_s_parm,
+-
+ 	.vidioc_reqbufs			= v4l2_m2m_ioctl_reqbufs,
+ 	.vidioc_querybuf		= v4l2_m2m_ioctl_querybuf,
+ 	.vidioc_qbuf			= v4l2_m2m_ioctl_qbuf,
+@@ -695,35 +686,60 @@
+ 					     ctx->src_fmt.height);
+ 	}
+ 
+-	/* The scan starts after the headers, at a 256 byte boundary. */
+-	coded_size = ALIGN_DOWN(coded_size, CEDRUS_ENC_CODED_ALIGN);
++	/*
++	 * The scan starts right after the headers, which end at a multiple of
++	 * CEDRUS_ENC_JPEG_SCAN_ALIGN, as the buffer itself must start.
++	 */
++	coded_size = ALIGN_DOWN(coded_size, CEDRUS_ENC_JPEG_SCAN_ALIGN);
+ 	if (coded_size < jpeg_ctx->header_size + CEDRUS_ENC_CODED_MIN_SIZE)
+ 		return -ENOSPC;
+ 
++	if (!IS_ALIGNED(coded_dma, CEDRUS_ENC_JPEG_SCAN_ALIGN) ||
++	    !IS_ALIGNED(jpeg_ctx->header_size, CEDRUS_ENC_JPEG_SCAN_ALIGN))
++		return -EINVAL;
++
+ 	memcpy(coded, jpeg_ctx->header, jpeg_ctx->header_size);
+ 	scan_dma = coded_dma + jpeg_ctx->header_size;
+ 	scan_size = coded_size - jpeg_ctx->header_size;
+ 
+ 	cedrus_enc_jpeg_engine_enable(ctx);
+ 
++	/*
++	 * JPEG mode is selected before anything else is written, as the
++	 * vendor library does: with the H.264 mode selected, the JPEG control
++	 * fields of PARA0 (the DC biases, the fill) have no effect, and the
++	 * scan comes out with its DC values 128 too high and zero padded.
++	 */
++	cedrus_write(dev, VE_ENC_AVC_STARTTRIG,
++		     VE_ENC_AVC_STARTTRIG_ENCODE_MODE_JPEG);
++
+ 	cedrus_enc_setup_isp(ctx, src_buf);
+ 
+ 	/* Clear the interrupt and status flags. */
+ 	cedrus_write(dev, VE_ENC_AVC_INT_EN, 0);
+ 	cedrus_write(dev, VE_ENC_AVC_STATUS, VE_ENC_AVC_STATUS_MASK);
+ 
+-	/* Coded buffer: the scan part. */
+-	cedrus_write(dev, VE_ENC_AVC_STARTTRIG, 0);
++	/*
++	 * Coded buffer: the scan part. The size register counts in units of
++	 * 65536 bits and has 28 bits.
++	 */
+ 	cedrus_write(dev, VE_ENC_AVC_STM_BIT_OFFSET, 0);
+ 	cedrus_write(dev, VE_ENC_AVC_STM_START_ADDR,
+ 		     cedrus_enc_addr(ctx, scan_dma));
+ 	cedrus_write(dev, VE_ENC_AVC_STM_END_ADDR,
+ 		     cedrus_enc_addr(ctx, scan_dma + scan_size - 1));
+-	cedrus_write(dev, VE_ENC_AVC_STM_BIT_MAX, scan_size * 8);
++	cedrus_write(dev, VE_ENC_AVC_STM_BIT_MAX,
++		     min_t(u64, (u64)scan_size * 8, CEDRUS_ENC_JPEG_BIT_MAX));
+ 	cedrus_write(dev, VE_ENC_AVC_STM_BIT_LEN, 0);
+ 	cedrus_write(dev, VE_ENC_AVC_HEADER_BITS, 0);
+ 	cedrus_write(dev, VE_ENC_AVC_RESIDUAL_BITS, 0);
+ 
++	/* DC biases (0x400 / the DC quantiser), fill and stuffing. */
++	cedrus_write(dev, VE_ENC_AVC_PARA0,
++		     VE_ENC_JPEG_CTRL_FILL1 | VE_ENC_JPEG_CTRL_STUFF |
++		     VE_ENC_JPEG_CTRL_BIAS_C(0x400 / jpeg_ctx->qt[1][0]) |
++		     VE_ENC_JPEG_CTRL_BIAS_Y(0x400 / jpeg_ctx->qt[0][0]));
++
+ 	/* Quantisation tables, luma then chroma, natural order. */
+ 	cedrus_write(dev, VE_ENC_AVC_SRAM_INDEX, 0);
+ 	for (t = 0; t < 2; t++)
+@@ -731,10 +747,6 @@
+ 			cedrus_write(dev, VE_ENC_AVC_SRAM_DATA,
+ 				     VE_ENC_AVC_SRAM_DATA_JPEG_QM(jpeg_ctx->qt[t][i]));
+ 
+-	cedrus_write(dev, VE_ENC_AVC_PARA0,
+-		     VE_ENC_JPEG_CTRL_FILL1 | VE_ENC_JPEG_CTRL_STUFF |
+-		     VE_ENC_JPEG_CTRL_BIAS_C(0x400 / jpeg_ctx->qt[1][0]) |
+-		     VE_ENC_JPEG_CTRL_BIAS_Y(0x400 / jpeg_ctx->qt[0][0]));
+ 	cedrus_write(dev, VE_ENC_AVC_PARA1, 0);
+ 	cedrus_write(dev, VE_ENC_AVC_PARA2, 0);
+ 	cedrus_write(dev, VE_ENC_AVC_ME_PARA, VE_ENC_AVC_ME_PARA_WB_MV_INFO_DIS);

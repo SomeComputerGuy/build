@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Mon, 9 Nov 2026 22:40:00 +0000
+Subject: [PATCH] media: sunxi: sun50i-di300: fix Cr from semi-planar input,
+ open the TNR window
+
+A semi-planar source (NV12/NV21/NV16/NV61) with a planar capture format
+came out with a broken Cr plane: every line held the first Cr line of
+its field. The engine reads Cb and Cr of an interleaved chroma plane
+through two channels and steps the Cr one by the third input pitch,
+which the driver left at zero for these formats. Set it to the chroma
+stride, as the vendor driver does.
+
+TNR changed only the top left pixel. The TNR block filters only inside
+its demo window (0x2a8/0x2ac), which has no enable bit; the driver
+cleared it to an empty window. Open it to the full frame on every TNR
+job, as the vendor does (its tnr_demo_crop defaults to the output crop).
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../sunxi/sun50i-di300/sun50i-di300.c         | 24 +++++++++++++++++++---
+ 1 file changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
+--- a/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
++++ b/drivers/media/platform/sunxi/sun50i-di300/sun50i-di300.c
+@@ -155,8 +155,15 @@ static void deinterlace_get_planes(const struct v4l2_pix_format *fmt,
+ 		}
+ 		break;
+ 	default:
+-		/* UV-combined formats: no separate third plane */
++		/*
++		 * UV-combined formats: no separate third plane, but the
++		 * engine still steps its Cr line address by the third pitch
++		 * (with zero, a planar capture format got the first Cr line
++		 * of each field in every line). The vendor sets it to the
++		 * chroma stride for these formats too.
++		 */
+ 		pl->pitch[1] = bpl;
++		pl->pitch[2] = bpl;
+ 		break;
+ 	}
+ }
+@@ -667,6 +674,19 @@ static void deinterlace_device_run(void *priv)
+ 	deinterlace_write(dev, DEINTERLACE_MD_CROP_V, reg);
+ 	deinterlace_write(dev, DEINTERLACE_TNR_CROP_V, reg);
+ 
++	/*
++	 * The TNR filters only inside its demo window, which has no enable
++	 * bit: a zero window filtered the top left pixel alone. Open it to
++	 * the full frame, as the vendor does (tnr_demo_crop = the output
++	 * crop).
++	 */
++	if (ctx->tnr_active) {
++		reg = (ctx->src_fmt.width - 1) << 16;
++		deinterlace_write(dev, DEINTERLACE_TNR_DEMO_H, reg);
++		reg = (ctx->src_fmt.height - 1) << 16;
++		deinterlace_write(dev, DEINTERLACE_TNR_DEMO_V, reg);
++	}
++
+ 	if (ctx->fmd_active) {
+ 		reg = (ctx->src_fmt.width - 1) << 16;
+ 		deinterlace_write(dev, DEINTERLACE_FMD_CROP_H, reg);
+@@ -1012,8 +1032,6 @@ static void deinterlace_init(struct deinterlace_dev *dev)
+ 		deinterlace_write(dev, DEINTERLACE_TNR_RANDOM_CFG, 0x02031c01);
+ 		deinterlace_write(dev, DEINTERLACE_TNR_RANDOM_GEN, 0);
+ 		deinterlace_write(dev, DEINTERLACE_TNR_MD_RESULT, 0);
+-		deinterlace_write(dev, DEINTERLACE_TNR_DEMO_H, 0);
+-		deinterlace_write(dev, DEINTERLACE_TNR_DEMO_V, 0);
+ 	}
+ }
+ 
+-- 
+2.47.3

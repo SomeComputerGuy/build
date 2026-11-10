@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Mon, 9 Nov 2026 23:00:00 +0000
+Subject: [PATCH] media: cedrus: H.264 encoder VBR and rate control statistics
+
+The stateless encode core now has a VBR mode: offer it in
+V4L2_CID_MPEG_VIDEO_BITRATE_MODE and add V4L2_CID_MPEG_VIDEO_BITRATE_PEAK,
+which the core reads for it.
+
+Report the rate control of the last picture in the debugfs file
+<debugfs>/cedrus/encoder-rc: the mode, bitrate and peak, the picture's
+type, QP, size target and size, the bitrate over the rate control's
+window, and the engine's statistics of the picture (MAD, residual and
+header bits of 0xb50, 0xb54 and 0xb58). The QP of every picture is also
+in the encode parameters of its request, as the core leaves them.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -1210,6 +1210,7 @@
+ 	 * that their jobs and the decoding jobs are serialised on the engine.
+ 	 */
+ 	spin_lock_init(&dev->enc_layout.lock);
++	spin_lock_init(&dev->enc_rc.lock);
+ 
+ 	if (dev->capabilities & CEDRUS_CAPABILITY_H264_ENC) {
+ 		ret = cedrus_enc_register(dev, &dev->vfd_enc,
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -423,6 +423,8 @@
+ 	unsigned int		enc_flags;
+ 	/* Buffers of the last encode job (struct cedrus_enc_layout). */
+ 	struct cedrus_enc_layout enc_layout;
++	/* Rate control of the last H.264 picture (struct cedrus_enc_rc_report). */
++	struct cedrus_enc_rc_report enc_rc;
+ 	struct dentry		*debugfs;
+ 
+ 	struct delayed_work	watchdog_work;
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+@@ -216,9 +216,6 @@
+ 			.min	= V4L2_MPEG_VIDEO_BITRATE_MODE_VBR,
+ 			.max	= V4L2_MPEG_VIDEO_BITRATE_MODE_CQ,
+ 			.def	= V4L2_MPEG_VIDEO_BITRATE_MODE_CBR,
+-			/* The core has no VBR mode yet. */
+-			.menu_skip_mask =
+-				BIT(V4L2_MPEG_VIDEO_BITRATE_MODE_VBR),
+ 		},
+ 		.capabilities	= CEDRUS_CAPABILITY_H264_ENC,
+ 	},
+@@ -242,6 +239,17 @@
+ 		},
+ 		.capabilities	= CEDRUS_CAPABILITY_H264_ENC,
+ 	},
++	/* The VBR peak, over the rate control's window of 25 pictures. */
++	{
++		.cfg = {
++			.id	= V4L2_CID_MPEG_VIDEO_BITRATE_PEAK,
++			.min	= 1,
++			.max	= 100000000,
++			.step	= 1,
++			.def	= 4000000,
++		},
++		.capabilities	= CEDRUS_CAPABILITY_H264_ENC,
++	},
+ };
+ 
+ const unsigned int cedrus_enc_controls_count = ARRAY_SIZE(cedrus_enc_controls);
+@@ -822,11 +830,45 @@
+ }
+ DEFINE_SHOW_ATTRIBUTE(cedrus_enc_buffers);
+ 
++static int cedrus_enc_rc_show(struct seq_file *s, void *data)
++{
++	struct cedrus_dev *dev = s->private;
++	struct cedrus_enc_rc_report *report = &dev->enc_rc;
++	struct cedrus_enc_rc_report copy;
++	unsigned long flags;
++
++	spin_lock_irqsave(&report->lock, flags);
++	copy = *report;
++	spin_unlock_irqrestore(&report->lock, flags);
++
++	seq_printf(s, "pictures %lu\n", copy.pictures);
++	seq_printf(s, "mode %s\n", copy.mode ? copy.mode : "none");
++	seq_printf(s, "bitrate %u\n", copy.bitrate);
++	seq_printf(s, "bitrate_peak %u\n", copy.bitrate_peak);
++	seq_printf(s, "slice_type %s\n",
++		   copy.slice_type == V4L2_H264_SLICE_TYPE_I ? "I" :
++		   copy.slice_type == V4L2_H264_SLICE_TYPE_P ? "P" : "?");
++	seq_printf(s, "qp %u\n", copy.qp);
++	seq_printf(s, "target %lu\n", copy.target);
++	seq_printf(s, "size %lu\n", copy.size);
++	seq_printf(s, "window_bitrate %lu\n", copy.window_bitrate);
++	seq_printf(s, "window_pictures %u\n", copy.window_count);
++	seq_printf(s, "mad %u\n", copy.mad);
++	seq_printf(s, "residual_bits %u\n", copy.residual_bits);
++	seq_printf(s, "header_bits %u\n", copy.header_bits);
++
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(cedrus_enc_rc);
++
+ void cedrus_enc_debugfs_init(struct cedrus_dev *dev)
+ {
+ 	dev->debugfs = debugfs_create_dir(CEDRUS_NAME, NULL);
+ 	debugfs_create_file("encoder-buffers", 0444, dev->debugfs, dev,
+ 			    &cedrus_enc_buffers_fops);
++	if (dev->capabilities & CEDRUS_CAPABILITY_H264_ENC)
++		debugfs_create_file("encoder-rc", 0444, dev->debugfs, dev,
++				    &cedrus_enc_rc_fops);
+ }
+ 
+ void cedrus_enc_debugfs_exit(struct cedrus_dev *dev)
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
+@@ -170,6 +170,29 @@
+ 	struct cedrus_enc_layout_entry entry[CEDRUS_ENC_LAYOUT_MAX];
+ };
+ 
++/*
++ * Rate control of the last H.264 picture, for the debugfs file
++ * <debugfs>/cedrus/encoder-rc: the rate control mode and its target, the
++ * picture's QP and size, the bitrate over the rate control's window and
++ * the engine's statistics of the picture (MAD, residual and header bits).
++ */
++struct cedrus_enc_rc_report {
++	spinlock_t	lock;	/* the job writes, debugfs reads */
++	unsigned long	pictures;
++	const char	*mode;
++	unsigned int	bitrate;
++	unsigned int	bitrate_peak;
++	unsigned char	slice_type;
++	unsigned int	qp;
++	unsigned long	target;
++	unsigned long	size;
++	unsigned long	window_bitrate;
++	unsigned int	window_count;
++	u32		mad;
++	u32		residual_bits;
++	u32		header_bits;
++};
++
+ /* Raw (OUTPUT) formats of the encoders and their input stage format. */
+ struct cedrus_enc_raw_format {
+ 	u32		pixelformat;
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -20,6 +20,7 @@
+ #include <linux/delay.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/iopoll.h>
++#include <linux/math64.h>
+ #include <linux/sizes.h>
+ #include <linux/types.h>
+ #include <linux/videodev2.h>
+@@ -794,6 +795,41 @@
+ 	cedrus_write(ctx->dev, VE_ENC_AVC_INT_EN, 0);
+ }
+ 
++/* The rate control of the picture and the engine's statistics, for debugfs. */
++static void cedrus_enc_h264_report_rc(struct cedrus_ctx *ctx, unsigned int size)
++{
++	struct cedrus_dev *dev = ctx->dev;
++	struct v4l2_h264_enc *enc = &ctx->codec.enc_h264.enc;
++	struct v4l2_h264_enc_state *state = &enc->state_active;
++	struct v4l2_h264_enc_rc *rc = &enc->rc;
++	struct v4l2_h264_enc_rc_stats *stats = &rc->stats;
++	struct cedrus_enc_rc_report *report = &dev->enc_rc;
++	struct v4l2_fract *timeperframe = &state->timeperframe;
++	unsigned long window_bitrate = 0;
++	unsigned long flags;
++
++	if (stats->count && timeperframe->numerator)
++		window_bitrate = div_u64(8 * stats->size_total *
++					 timeperframe->denominator,
++					 stats->count * timeperframe->numerator);
++
++	spin_lock_irqsave(&report->lock, flags);
++	report->pictures++;
++	report->mode = rc->mode ? rc->mode->name : NULL;
++	report->bitrate = state->frame_rc_enable ? state->bitrate : 0;
++	report->bitrate_peak = state->frame_rc_enable ? state->bitrate_peak : 0;
++	report->slice_type = state->encode.slice_type;
++	report->qp = rc->qp;
++	report->target = rc->size;
++	report->size = size;
++	report->window_bitrate = window_bitrate;
++	report->window_count = stats->count;
++	report->mad = cedrus_read(dev, VE_ENC_AVC_MAD);
++	report->residual_bits = cedrus_read(dev, VE_ENC_AVC_RESIDUAL_BITS);
++	report->header_bits = cedrus_read(dev, VE_ENC_AVC_HEADER_BITS);
++	spin_unlock_irqrestore(&report->lock, flags);
++}
++
+ /* The picture is done: its size, and the core's reference and RC bookkeeping. */
+ static void cedrus_enc_h264_post_process(struct cedrus_ctx *ctx)
+ {
+@@ -818,6 +854,8 @@
+ 	vb2_set_plane_payload(&dst->vb2_buf, 0, size);
+ 
+ 	v4l2_h264_enc_complete(&h264_ctx->enc, dst);
++
++	cedrus_enc_h264_report_rc(ctx, size);
+ }
+ 
+ struct cedrus_dec_ops cedrus_enc_ops_h264 = {

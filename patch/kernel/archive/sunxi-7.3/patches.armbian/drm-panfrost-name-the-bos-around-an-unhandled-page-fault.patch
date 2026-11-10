@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 10:30:00 +0000
+Subject: [PATCH] drm/panfrost: Name the BOs around an unhandled page fault
+
+An unhandled GPU page fault only reports the faulting VA, so it cannot
+tell a GPU access just past the end of a buffer (a userspace or
+hardware overrun) from an access to a buffer whose mapping is gone (a
+kernel bug) or a garbage pointer. Mali-G31 runner job 28 hit exactly
+that during the OpenCL-CTS 3D image read test:
+
+  Unhandled Page fault in AS0 at VA 0x000000000B2F8000
+  js fault, js=1, status=JOB_BUS_FAULT
+
+After the fault report, look the address up in the faulting address
+space and print the BO that contains it, or else the nearest BO below
+and above it: VA range, size, distance of the fault from it, whether it
+is still mapped, heap/noexec, and the label userspace gave it (Mesa
+labels every BO with its use, format and size). Only the terminal fault
+path is affected; nothing changes for handled (heap growth) faults.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/panfrost/panfrost_mmu.c | 81 +++++++++++++++++++++++++
+ 1 file changed, 81 insertions(+)
+
+--- a/drivers/gpu/drm/panfrost/panfrost_mmu.c
++++ b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+@@ -582,6 +582,86 @@
+ 	return mapping;
+ }
+ 
++static void panfrost_mmu_print_fault_bo(struct panfrost_device *pfdev,
++					struct panfrost_gem_mapping *m,
++					u64 addr, const char *where)
++{
++	struct panfrost_gem_object *bo = m->obj;
++	u64 start = m->mmnode.start << PAGE_SHIFT;
++	u64 end = (m->mmnode.start + m->mmnode.size) << PAGE_SHIFT;
++	u64 dist = addr < start ? start - addr : addr >= end ? addr - end : addr - start;
++
++	mutex_lock(&bo->label.lock);
++	dev_err(pfdev->base.dev,
++		"fault bo: %s: VA [0x%llx-0x%llx) size 0x%zx, fault at %s0x%llx, %s%s%s, label \"%s\"\n",
++		where, start, end, bo->base.base.size,
++		addr < start ? "-" : addr >= end ? "end+" : "start+", dist,
++		m->active ? "mapped" : "NOT mapped",
++		bo->is_heap ? ", heap" : "", bo->noexec ? ", noexec" : "",
++		bo->label.str ? bo->label.str : "");
++	mutex_unlock(&bo->label.lock);
++}
++
++/*
++ * Report the BOs around an unhandled fault address in the faulting address
++ * space: the one containing it (if any), else the nearest one below and above.
++ * An access just past the end of a BO that a hole follows is a GPU overrun of
++ * that BO (userspace or hardware), a fault inside a BO whose mapping is gone
++ * points at the kernel, an address far from any BO at a stale or garbage
++ * pointer.
++ */
++static void panfrost_mmu_report_fault_bos(struct panfrost_device *pfdev,
++					  int as, u64 addr)
++{
++	struct panfrost_gem_mapping *below = NULL, *above = NULL;
++	u64 offset = addr >> PAGE_SHIFT;
++	struct drm_mm_node *node;
++	struct panfrost_mmu *mmu;
++	bool inside = false;
++
++	spin_lock(&pfdev->as_lock);
++	list_for_each_entry(mmu, &pfdev->as_lru_list, list) {
++		if (as == mmu->as)
++			goto found_mmu;
++	}
++	spin_unlock(&pfdev->as_lock);
++	dev_err(pfdev->base.dev, "fault bo: no context holds AS%d\n", as);
++	return;
++
++found_mmu:
++	spin_lock(&mmu->mm_lock);
++	/* The node list is sorted by address. */
++	drm_mm_for_each_node(node, &mmu->mm) {
++		if (node->start > offset) {
++			above = drm_mm_node_to_panfrost_mapping(node);
++			break;
++		}
++		below = drm_mm_node_to_panfrost_mapping(node);
++	}
++	if (below) {
++		inside = offset < below->mmnode.start + below->mmnode.size;
++		kref_get(&below->refcount);
++		if (inside)
++			above = NULL;
++	}
++	if (above)
++		kref_get(&above->refcount);
++	spin_unlock(&mmu->mm_lock);
++	spin_unlock(&pfdev->as_lock);
++
++	if (!below && !above)
++		dev_err(pfdev->base.dev, "fault bo: AS%d has no BO\n", as);
++	if (below) {
++		panfrost_mmu_print_fault_bo(pfdev, below, addr,
++					    inside ? "inside" : "below");
++		panfrost_gem_mapping_put(below);
++	}
++	if (above) {
++		panfrost_mmu_print_fault_bo(pfdev, above, addr, "above");
++		panfrost_gem_mapping_put(above);
++	}
++}
++
+ #define NUM_FAULT_PAGES (SZ_2M / PAGE_SIZE)
+ 
+ static int panfrost_mmu_map_fault_addr(struct panfrost_device *pfdev, int as,
+@@ -922,6 +1002,7 @@
+ 				exception_type, panfrost_exception_name(exception_type),
+ 				access_type, access_type_name(pfdev, fault_status),
+ 				source_id);
++			panfrost_mmu_report_fault_bos(pfdev, as, addr);
+ 
+ 			spin_lock(&pfdev->as_lock);
+ 			/* Ignore MMU interrupts on this AS until it's been
+-- 
+2.43.0

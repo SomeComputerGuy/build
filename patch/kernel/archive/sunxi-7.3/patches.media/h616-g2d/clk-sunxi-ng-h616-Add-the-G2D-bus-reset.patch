@@ -1,0 +1,33 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 6 Nov 2026 12:00:00 +0000
+Subject: clk: sunxi-ng: h616: Add the G2D bus reset
+
+The H616 CCU already models the G2D module, bus and MBUS clocks but not
+the reset in bit 16 of the G2D bus gating reset register (H616 user
+manual v1.0, 3.3.5.56, G2D_BGR_REG at 0x063c). Add it after the last
+reset so the existing indices stay unchanged.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+
+--- a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
++++ b/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
+@@ -1115,6 +1115,7 @@
+ 	[RST_BUS_TCON_TV0]	= { 0xb9c, BIT(16) },
+ 	[RST_BUS_TCON_TV1]	= { 0xb9c, BIT(17) },
+ 	[RST_BUS_LVDS]		= { 0xbac, BIT(16) },
++	[RST_BUS_G2D]		= { 0x63c, BIT(16) },
+ 	[RST_BUS_TVE_TOP]	= { 0xbbc, BIT(16) },
+ 	[RST_BUS_TVE0]		= { 0xbbc, BIT(17) },
+ 	[RST_BUS_HDCP]		= { 0xc4c, BIT(16) },
+--- a/include/dt-bindings/reset/sun50i-h616-ccu.h
++++ b/include/dt-bindings/reset/sun50i-h616-ccu.h
+@@ -70,5 +70,6 @@
+ #define RST_BUS_TCON_LCD0	61
+ #define RST_BUS_TCON_LCD1	62
+ #define RST_BUS_LVDS		63
++#define RST_BUS_G2D		64
+ 
+ #endif /* _DT_BINDINGS_RESET_SUN50I_H616_H_ */

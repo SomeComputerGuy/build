@@ -1,0 +1,125 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Mon, 9 Nov 2026 23:00:00 +0000
+Subject: [PATCH] media: cedrus: encode H.264 with CABAC in the main and high
+ profiles
+
+The encoder block codes CABAC slice data with bit 8 of PARA0 (0xb04), as
+on the V3s (Bootlin's encoder) and in the vendor library's programming
+of the H6/H616 encoder. The context table of a P slice goes in bits
+11:10, the field the V3s register map calls "fix mode num": Bootlin's
+V3s encoder writes cabac_init_idc there; the vendor library writes 1
+there for every P picture, also with CAVLC (0x410), which stays so.
+
+Let the PPS ask for CABAC unless the profile is baseline, keep the
+cabac_init_idc of a P slice (0 to 2) and write it to PARA0, and code the
+second chroma QP offset (always written in the PPS) as the first, the
+engine having one offset. The 8x8 transform stays off: the high profile
+allows the 4x4 transform alone, and no register for the 8x8 one is
+known.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+@@ -96,8 +96,8 @@
+ 	},
+ 	/*
+ 	 * Profile and level are informative here: the SPS control carries
+-	 * profile_idc and level_idc. CABAC (main and high profiles) is not
+-	 * enabled yet, see cedrus_enc_h264_state_constrain().
++	 * profile_idc and level_idc, the PPS control the entropy coding
++	 * mode (CABAC in the main and high profiles).
+ 	 */
+ 	{
+ 		.cfg = {
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -207,12 +207,14 @@
+ 	/* PPS */
+ 
+ 	/*
+-	 * The engine has CABAC (bit 8 of PARA0), but the meaning of the
+-	 * "fix mode num" field next to it, which the vendor library sets
+-	 * for P pictures, is not established: CAVLC only until then.
++	 * CABAC (bit 8 of PARA0) in the main and high profiles; the baseline
++	 * profile has CAVLC only. No 8x8 transform: the high profile allows
++	 * the 4x4 transform alone, and no register for the 8x8 one is known.
+ 	 */
+-	pps->flags &= ~(V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE |
+-			V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE |
++	if (sps->profile_idc == 66)
++		pps->flags &= ~V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE;
++
++	pps->flags &= ~(V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE |
+ 			V4L2_H264_PPS_FLAG_CONSTRAINED_INTRA_PRED);
+ 
+ 	/* The deblocking filter is set per slice (PARA0). */
+@@ -229,6 +231,8 @@
+ 	else
+ 		pps->chroma_qp_index_offset =
+ 			clamp_t(s8, pps->chroma_qp_index_offset, 0, 7);
++	/* One offset for both chroma components. */
++	pps->second_chroma_qp_index_offset = pps->chroma_qp_index_offset;
+ 
+ 	/* Encode */
+ 
+@@ -247,7 +251,21 @@
+ 	encode->pic_order_cnt_lsb &=
+ 		GENMASK(sps->log2_max_pic_order_cnt_lsb_minus4 + 3, 0);
+ 
+-	encode->cabac_init_idc = 0;
++	/* The engine never finishes a P picture of a narrow frame. */
++	if (encode->slice_type == V4L2_H264_SLICE_TYPE_P &&
++	    state->width_mbs < CEDRUS_ENC_INTER_MIN_WIDTH_MBS)
++		encode->slice_type = V4L2_H264_SLICE_TYPE_I;
++
++	/*
++	 * The context table of a P slice: PARA0 carries cabac_init_idc in
++	 * the field the V3s register map calls "fix mode num" (Bootlin's V3s
++	 * encoder); an I slice has none.
++	 */
++	if (!(pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE) ||
++	    encode->slice_type == V4L2_H264_SLICE_TYPE_I)
++		encode->cabac_init_idc = 0;
++	else if (encode->cabac_init_idc > 2)
++		encode->cabac_init_idc = 0;
+ 
+ 	if (encode->disable_deblocking_filter_idc > 2)
+ 		encode->disable_deblocking_filter_idc = 0;
+@@ -257,11 +275,6 @@
+ 	encode->slice_beta_offset_div2 =
+ 		clamp_t(s8, encode->slice_beta_offset_div2, -6, 6);
+ 
+-	/* The engine never finishes a P picture of a narrow frame. */
+-	if (encode->slice_type == V4L2_H264_SLICE_TYPE_P &&
+-	    state->width_mbs < CEDRUS_ENC_INTER_MIN_WIDTH_MBS)
+-		encode->slice_type = V4L2_H264_SLICE_TYPE_I;
+-
+ 	return 0;
+ }
+ 
+@@ -604,13 +617,17 @@
+ 		value |= VE_ENC_AVC_PARA0_ENTROPY_CODING_CABAC;
+ 
+ 	if (encode->slice_type == V4L2_H264_SLICE_TYPE_P) {
++		value |= VE_ENC_AVC_PARA0_SLICE_TYPE_P;
++
+ 		/*
+-		 * The vendor library writes 0x410 for a P picture: the slice
+-		 * type and the first bit of the field the V3s register map
+-		 * calls "fix mode num".
++		 * "Fix mode num" carries cabac_init_idc with CABAC (Bootlin's
++		 * V3s encoder). With CAVLC the vendor library writes 1 there
++		 * for a P picture (0x410), so do the same.
+ 		 */
+-		value |= VE_ENC_AVC_PARA0_SLICE_TYPE_P |
+-			 VE_ENC_AVC_PARA0_FIX_MODE_NUM(1);
++		if (pps->flags & V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE)
++			value |= VE_ENC_AVC_PARA0_FIX_MODE_NUM(encode->cabac_init_idc);
++		else
++			value |= VE_ENC_AVC_PARA0_FIX_MODE_NUM(1);
+ 	} else {
+ 		value |= VE_ENC_AVC_PARA0_SLICE_TYPE_I;
+ 	}
