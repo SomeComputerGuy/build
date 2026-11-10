@@ -17,7 +17,13 @@ templates as fallback:
   not a multiple of 4 go to the fallback.
 - cbcmac(aes), the MAC that ccm uses: a CBC encryption from a zero IV of
   which the engine writes the 128-bit last block. Only digest() of whole
-  blocks runs on the engine, everything else on the fallback.
+  blocks runs on the engine, everything else on the fallback. It is
+  registered with CRYPTO_ALG_NO_FALLBACK: the hash API cannot find the
+  extra fallback it adds to asynchronous hashes, because the only
+  synchronous cbcmac(aes), cbcmac-aes-lib, has no export_core(), and
+  every allocation of the transform would fail with -EINVAL. The
+  driver's own fallback is asked for as a synchronous one, so that it
+  cannot be this algorithm itself.
 
 The engine writes the IV of the next block to the ctr address of the
 task. The driver does not use it, but gives these modes a valid one: one
@@ -35,11 +41,11 @@ registered. The other variants get CE_ID_NOTSUPP for the new modes.
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- .../allwinner/sun8i-ce/sun8i-ce-cipher.c      |  86 +++++++-
- .../crypto/allwinner/sun8i-ce/sun8i-ce-core.c | 165 +++++++++++++-
- .../crypto/allwinner/sun8i-ce/sun8i-ce-hash.c | 208 +++++++++++++++++-
+ .../allwinner/sun8i-ce/sun8i-ce-cipher.c      |  86 ++++++-
+ .../crypto/allwinner/sun8i-ce/sun8i-ce-core.c | 172 +++++++++++++-
+ .../crypto/allwinner/sun8i-ce/sun8i-ce-hash.c | 218 +++++++++++++++++-
  drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h  |  29 ++-
- 4 files changed, 465 insertions(+), 23 deletions(-)
+ 4 files changed, 481 insertions(+), 24 deletions(-)
 
 diff --git a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-cipher.c b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-cipher.c
 index b87be31..3dc80d8 100644
@@ -195,7 +201,7 @@ index b87be31..3dc80d8 100644
  	}
  
 diff --git a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c
-index a7d7719..e2c7e63 100644
+index a7d7719..41b88e8 100644
 --- a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c
 +++ b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c
 @@ -10,6 +10,7 @@
@@ -382,7 +388,7 @@ index a7d7719..e2c7e63 100644
  #ifdef CONFIG_CRYPTO_DEV_SUN8I_CE_HASH
  {	.type = CRYPTO_ALG_TYPE_AHASH,
  	.ce_algo_id = CE_ID_HASH_MD5,
-@@ -633,6 +733,40 @@ static struct sun8i_ce_alg_template ce_algs[] = {
+@@ -633,6 +733,47 @@ static struct sun8i_ce_alg_template ce_algs[] = {
  		.do_one_request = sun8i_ce_hash_run,
  	},
  },
@@ -407,9 +413,16 @@ index a7d7719..e2c7e63 100644
 +				.cra_name = "cbcmac(aes)",
 +				.cra_driver_name = "cbcmac-aes-sun8i-ce",
 +				.cra_priority = CE_PRIO_BELOW_CPU,
++				/*
++				 * The driver has its own fallback. The one the
++				 * hash API would add for virtual address
++				 * requests cannot exist: cbcmac-aes-lib, the
++				 * only synchronous cbcmac(aes), has no
++				 * export_core().
++				 */
 +				.cra_flags = CRYPTO_ALG_TYPE_AHASH |
 +					CRYPTO_ALG_ASYNC |
-+					CRYPTO_ALG_NEED_FALLBACK,
++					CRYPTO_ALG_NO_FALLBACK,
 +				.cra_blocksize = AES_BLOCK_SIZE,
 +				.cra_ctxsize = sizeof(struct sun8i_ce_hash_tfm_ctx),
 +				.cra_module = THIS_MODULE,
@@ -423,7 +436,7 @@ index a7d7719..e2c7e63 100644
  #endif
  };
  
-@@ -707,12 +841,15 @@ static int sun8i_ce_debugfs_show(struct seq_file *seq, void *v)
+@@ -707,12 +848,15 @@ static int sun8i_ce_debugfs_show(struct seq_file *seq, void *v)
  
  DEFINE_SHOW_ATTRIBUTE(sun8i_ce_debugfs);
  
@@ -440,7 +453,7 @@ index a7d7719..e2c7e63 100644
  					  ce->chanlist[i].tl,
  					  ce->chanlist[i].t_phy);
  		i--;
-@@ -747,7 +884,7 @@ static int sun8i_ce_allocate_chanlist(struct sun8i_ce_dev *ce)
+@@ -747,7 +891,7 @@ static int sun8i_ce_allocate_chanlist(struct sun8i_ce_dev *ce)
  			goto error_engine;
  		}
  		ce->chanlist[i].tl = dma_alloc_coherent(ce->dev,
@@ -449,7 +462,7 @@ index a7d7719..e2c7e63 100644
  							&ce->chanlist[i].t_phy,
  							GFP_KERNEL);
  		if (!ce->chanlist[i].tl) {
-@@ -756,6 +893,8 @@ static int sun8i_ce_allocate_chanlist(struct sun8i_ce_dev *ce)
+@@ -756,6 +900,8 @@ static int sun8i_ce_allocate_chanlist(struct sun8i_ce_dev *ce)
  			err = -ENOMEM;
  			goto error_engine;
  		}
@@ -458,7 +471,7 @@ index a7d7719..e2c7e63 100644
  	}
  	return 0;
  error_engine:
-@@ -905,7 +1044,13 @@ static int sun8i_ce_register_algs(struct sun8i_ce_dev *ce)
+@@ -905,7 +1051,13 @@ static int sun8i_ce_register_algs(struct sun8i_ce_dev *ce)
  #ifdef CONFIG_CRYPTO_DEV_SUN8I_CE_HASH
  		case CRYPTO_ALG_TYPE_AHASH:
  			id = ce_algs[i].ce_algo_id;
@@ -474,7 +487,7 @@ index a7d7719..e2c7e63 100644
  				dev_info(ce->dev,
  					 "DEBUG: Algo of %s not supported\n",
 diff --git a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-hash.c b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-hash.c
-index d015943..5dda201 100644
+index d015943..80ae476 100644
 --- a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-hash.c
 +++ b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-hash.c
 @@ -5,7 +5,8 @@
@@ -487,7 +500,31 @@ index d015943..5dda201 100644
   *
   * You could find the datasheet in Documentation/arch/arm/sunxi.rst
   */
-@@ -79,6 +80,7 @@ void sun8i_ce_hash_exit_tfm(struct crypto_ahash *tfm)
+@@ -40,14 +41,22 @@ int sun8i_ce_hash_init_tfm(struct crypto_ahash *tfm)
+ 	struct sun8i_ce_hash_tfm_ctx *op = crypto_ahash_ctx(tfm);
+ 	struct ahash_alg *alg = crypto_ahash_alg(tfm);
+ 	struct sun8i_ce_alg_template *algt;
++	u32 mask = CRYPTO_ALG_NEED_FALLBACK;
+ 	int err;
+ 
+ 	algt = container_of(alg, struct sun8i_ce_alg_template, alg.hash.base);
+ 	op->ce = algt->ce;
+ 
++	/*
++	 * cbcmac(aes) has no CRYPTO_ALG_NEED_FALLBACK flag to keep it from
++	 * being its own fallback: ask for a synchronous one.
++	 */
++	if (algt->ce_blockmode == CE_ID_OP_CBCMAC)
++		mask |= CRYPTO_ALG_ASYNC;
++
+ 	/* FALLBACK */
+ 	op->fallback_tfm = crypto_alloc_ahash(crypto_ahash_alg_name(tfm), 0,
+-					      CRYPTO_ALG_NEED_FALLBACK);
++					      mask);
+ 	if (IS_ERR(op->fallback_tfm)) {
+ 		dev_err(algt->ce->dev, "Fallback driver could no be loaded\n");
+ 		return PTR_ERR(op->fallback_tfm);
+@@ -79,6 +88,7 @@ void sun8i_ce_hash_exit_tfm(struct crypto_ahash *tfm)
  {
  	struct sun8i_ce_hash_tfm_ctx *tfmctx = crypto_ahash_ctx(tfm);
  
@@ -495,7 +532,7 @@ index d015943..5dda201 100644
  	crypto_free_ahash(tfmctx->fallback_tfm);
  	pm_runtime_put_sync_suspend(tfmctx->ce->dev);
  }
-@@ -484,3 +486,207 @@ int sun8i_ce_hash_run(struct crypto_engine *engine, void *async_req)
+@@ -484,3 +494,207 @@ int sun8i_ce_hash_run(struct crypto_engine *engine, void *async_req)
  
  	return 0;
  }
