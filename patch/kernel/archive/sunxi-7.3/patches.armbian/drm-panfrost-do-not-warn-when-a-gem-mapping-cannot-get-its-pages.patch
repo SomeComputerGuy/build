@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 50566084dd09f9d8c2b0e9b2f957bbb526d7922a Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 04:59:29 +0000
-Subject: [PATCH 1/7] drm/panfrost: Don't WARN when a GEM mapping cannot get
+Subject: [PATCH 04/12] drm/panfrost: Don't WARN when a GEM mapping cannot get
  its pages
 
 panfrost_mmu_map() gets the pages of a BO with
@@ -29,7 +29,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_mmu.c b/drivers/gpu/drm/panfrost/panfrost_mmu.c
-index 4a3162c..575a4d5 100644
+index 6cd1678..2e43b37 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_mmu.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_mmu.c
 @@ -475,7 +475,7 @@ int panfrost_mmu_map(struct panfrost_gem_mapping *mapping)
@@ -41,3 +41,6 @@ index 4a3162c..575a4d5 100644
  		return PTR_ERR(sgt);
  
  	ret = mmu_map_sg(pfdev, mapping->mmu, mapping->mmnode.start << PAGE_SHIFT,
+-- 
+2.55.0
+

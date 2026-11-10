@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 123724bfe67a88ddf46523549fef6834f92faca8 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 05:00:27 +0000
-Subject: [PATCH 6/7] drm/panfrost: Soft-stop and resume a job that outlives
+Subject: [PATCH 11/12] drm/panfrost: Soft-stop and resume a job that outlives
  the timeout
 
 JOB_TIMEOUT_MS is 500 ms, and when it fires panfrost resets the GPU and
@@ -37,11 +37,20 @@ that (JS_RESET_TICKS_SS = 55). Do the same from the timeout handler:
   keep the 10 ms;
 - a slot still active after that is hard-stopped, which ends its job at
   once with TERMINATED (-ECANCELED); the stopped jobs on the other slots
-  are resumed, nothing is reset;
+  are resumed, nothing is reset. The job that did not stop is hung, so
+  it gets its karma raised and a devcoredump, as a hung job did before;
 - the GPU is reset when the hard stop has not taken effect after
-  JOB_HARD_STOP_TIMEOUT_MS (0.5 s); the job still running is then failed
-  with -ECANCELED instead of being restarted from scratch, where it would
-  only time out again;
+  JOB_HARD_STOP_TIMEOUT_MS (0.5 s); the job that did not stop is then
+  failed with -ECANCELED instead of being restarted from scratch, where
+  it would only time out again. Jobs that were only given the 10 ms of a
+  reset for another reason are restarted, as before;
+- a reset that is asked for while the slots are being stopped (a job
+  fault that needs one, the MMU) is not lost: the timeout only marks
+  reset.pending for a stop (PANFROST_RESET_STOP_ONLY), a request for a
+  reset overrides that, and the GPU is then reset;
+- a job that completes between the timeout handler's fence check and its
+  JS_STATUS read is not taken for a hung job: with its DONE interrupt
+  pending or being handled, the timeout is spurious;
 - without a reset, the address space references of the jobs cancelled
   from _NEXT are released (a reset has panfrost_mmu_reset() drop them),
   and a runtime PM reference is held across the stop and the
@@ -55,19 +64,19 @@ with the status of every slot.
 With this, on the Mali-G31 the Integer Ops, Thread Dimensions and
 mixedSequence cases pass, and the two vec4 i8/u64 bit_field_insert
 count64 fragment cases, which need several seconds to reach a task
-boundary, pass in 4-5 s.
+boundary, pass in 4-6 s.
 
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- drivers/gpu/drm/panfrost/panfrost_job.c | 168 +++++++++++++++++++-----
- 1 file changed, 138 insertions(+), 30 deletions(-)
+ drivers/gpu/drm/panfrost/panfrost_job.c | 245 ++++++++++++++++++++----
+ 1 file changed, 212 insertions(+), 33 deletions(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index 78d04a4..8398906 100644
+index 15c7e5b..2faea27 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
-@@ -25,6 +25,19 @@
+@@ -25,6 +25,25 @@
  #define MAX_JM_CTX_PER_FILE 64
  #define JOB_TIMEOUT_MS 500
  
@@ -84,10 +93,16 @@ index 78d04a4..8398906 100644
 +#define JOB_SOFT_STOP_TIMEOUT_MS 5000
 +#define JOB_HARD_STOP_TIMEOUT_MS 500
 +
++/* reset.pending while panfrost_reset() is only to stop the slots, to resume
++ * the jobs of a timeout that found its job still running. A request for a
++ * real reset (1) that comes in meanwhile overrides it.
++ */
++#define PANFROST_RESET_STOP_ONLY 2
++
  #define job_write(dev, reg, data) writel(data, dev->iomem + (reg))
  #define job_read(dev, reg) readl(dev->iomem + (reg))
  
-@@ -163,8 +176,9 @@ panfrost_dequeue_job(struct panfrost_device *pfdev, int slot)
+@@ -163,8 +182,9 @@ panfrost_dequeue_job(struct panfrost_device *pfdev, int slot)
  {
  	struct panfrost_job *job = pfdev->jobs[slot][0];
  
@@ -99,16 +114,35 @@ index 78d04a4..8398906 100644
  	 */
  	if (WARN_ON(!job))
  		return NULL;
-@@ -670,7 +684,7 @@ static bool panfrost_slots_idle(struct panfrost_device *pfdev)
+@@ -671,18 +691,38 @@ static bool panfrost_slots_idle(struct panfrost_device *pfdev)
+ 	return true;
+ }
  
++/* The job running on a slot: the one in _NEXT once the first has completed,
++ * with its interrupt not handled yet.
++ */
++static struct panfrost_job *
++panfrost_running_job(struct panfrost_device *pfdev, unsigned int slot)
++{
++	if (pfdev->jobs[slot][1] &&
++	    (job_read(pfdev, JOB_INT_RAWSTAT) & JOB_INT_MASK_DONE(slot)))
++		return pfdev->jobs[slot][1];
++
++	return pfdev->jobs[slot][0];
++}
++
  static void
  panfrost_reset(struct panfrost_device *pfdev,
 -	       struct drm_sched_job *bad)
 +	       struct drm_sched_job *bad, bool job_active)
  {
+ 	struct panfrost_job *evicted[NUM_JOB_SLOTS] = {};
++	struct panfrost_job *hung[NUM_JOB_SLOTS] = {};
++	bool cookie, idle, stop_failed = false, reset_gpu;
  	unsigned int i, j;
- 	bool cookie, idle;
-@@ -679,6 +693,12 @@ panfrost_reset(struct panfrost_device *pfdev,
+-	bool cookie, idle;
+ 	int ret;
+ 
  	if (!atomic_read(&pfdev->reset.pending))
  		return;
  
@@ -121,7 +155,7 @@ index 78d04a4..8398906 100644
  	/* Stop the schedulers.
  	 *
  	 * FIXME: We temporarily get out of the dma_fence_signalling section
-@@ -697,7 +717,8 @@ panfrost_reset(struct panfrost_device *pfdev,
+@@ -701,7 +741,8 @@ panfrost_reset(struct panfrost_device *pfdev,
  
  	cookie = dma_fence_begin_signalling();
  
@@ -131,9 +165,9 @@ index 78d04a4..8398906 100644
  		drm_sched_increase_karma(bad);
  
  	/* Mask job interrupts and synchronize to make sure we won't be
-@@ -712,43 +733,110 @@ panfrost_reset(struct panfrost_device *pfdev,
- 		job_write(pfdev, JS_COMMAND(i), JS_COMMAND_SOFT_STOP);
+@@ -733,26 +774,90 @@ panfrost_reset(struct panfrost_device *pfdev,
  	}
+ 	spin_unlock(&pfdev->js->job_lock);
  
 -	/* Wait at most 10ms for soft-stops to complete. Every slot must have
 -	 * gone idle before we touch the queues: a job that is still stopping
@@ -159,14 +193,34 @@ index 78d04a4..8398906 100644
 +				job_active ? JOB_SOFT_STOP_TIMEOUT_MS * 1000 : 10000,
  				false, pfdev);
  
--	if (ret)
--		dev_err(pfdev->base.dev, "Soft-stop failed\n");
 +	if (ret && job_active) {
 +		dev_err(pfdev->base.dev,
 +			"Soft-stop failed after %u ms (js status 0x%x 0x%x 0x%x), hard-stopping the active slots\n",
 +			JOB_SOFT_STOP_TIMEOUT_MS,
 +			job_read(pfdev, JS_STATUS(0)), job_read(pfdev, JS_STATUS(1)),
 +			job_read(pfdev, JS_STATUS(2)));
++
++		/* A job that has not reached a task boundary in all that time
++		 * is hung, not long: count it against its context and dump
++		 * it, as a timeout that resets the GPU does.
++		 */
++		for (i = 0; i < NUM_JOB_SLOTS; i++) {
++			if (job_read(pfdev, JS_STATUS(i)) ==
++			    DRM_PANFROST_EXCEPTION_ACTIVE)
++				hung[i] = panfrost_running_job(pfdev, i);
++			if (hung[i])
++				drm_sched_increase_karma(&hung[i]->base);
++		}
++
++		/* The dump allocates memory, which the fence signalling
++		 * section does not allow (see the resubmission below).
++		 */
++		dma_fence_end_signalling(cookie);
++		for (i = 0; i < NUM_JOB_SLOTS; i++) {
++			if (hung[i])
++				panfrost_core_dump(hung[i]);
++		}
++		cookie = dma_fence_begin_signalling();
 +
 +		for (i = 0; i < NUM_JOB_SLOTS; i++) {
 +			if (job_read(pfdev, JS_STATUS(i)) ==
@@ -177,20 +231,27 @@ index 78d04a4..8398906 100644
 +		ret = read_poll_timeout(panfrost_slots_idle, idle, idle, 200,
 +					JOB_HARD_STOP_TIMEOUT_MS * 1000, false,
 +					pfdev);
++		stop_failed = ret;
 +	}
 +
-+	if (ret) {
+ 	if (ret)
+-		dev_err(pfdev->base.dev, "Soft-stop failed\n");
 +		dev_err(pfdev->base.dev,
 +			"%s failed (js status 0x%x 0x%x 0x%x), resetting the GPU\n",
 +			job_active ? "Hard-stop" : "Soft-stop",
 +			job_read(pfdev, JS_STATUS(0)), job_read(pfdev, JS_STATUS(1)),
 +			job_read(pfdev, JS_STATUS(2)));
-+		job_active = false;
-+	}
  
  	/* Handle the remaining interrupts before we reset. */
  	panfrost_jm_handle_irqs(pfdev);
  
++	/* Reset the GPU unless the slots only had to be stopped and did stop,
++	 * and nobody asked for a reset meanwhile: a job fault that needs one
++	 * (in the interrupts just handled) or the MMU.
++	 */
++	reset_gpu = !job_active || stop_failed ||
++		    atomic_read(&pfdev->reset.pending) != PANFROST_RESET_STOP_ONLY;
++
  	/* Remaining interrupts have been handled, but we might still have
 -	 * stuck jobs. Let's make sure the PM counters stay balanced by
 +	 * stuck jobs, and jobs that were waiting in _NEXT when it was
@@ -204,6 +265,9 @@ index 78d04a4..8398906 100644
  	 */
  	spin_lock(&pfdev->js->job_lock);
  	for (i = 0; i < NUM_JOB_SLOTS; i++) {
+@@ -763,22 +868,59 @@ panfrost_reset(struct panfrost_device *pfdev,
+ 			pfdev->jobs[i][pfdev->jobs[i][0] ? 1 : 0] = evicted[i];
+ 
  		for (j = 0; j < ARRAY_SIZE(pfdev->jobs[0]) && pfdev->jobs[i][j]; j++) {
 -			if (pfdev->jobs[i][j]->requirements & PANFROST_JD_REQ_CYCLE_COUNT ||
 -			    pfdev->jobs[i][j]->is_profiled)
@@ -220,24 +284,23 @@ index 78d04a4..8398906 100644
 +			 * without one, release the reference the submission
 +			 * took, or the address space can never be reassigned.
 +			 */
-+			if (job_active)
++			if (!reset_gpu)
 +				panfrost_mmu_as_put(pfdev, job->mmu);
 +
 +			/* The job still running on a slot that neither stop
 +			 * took effect on is what forces the reset. Fail it,
 +			 * as the Arm driver fails every atom on the hardware
 +			 * at a reset: restarted from scratch it would hit the
-+			 * timeout and the reset again.
++			 * timeout and the reset again. A job that was only
++			 * given the 10 ms is restarted, as before.
 +			 */
-+			if (!job_active && j == 0 &&
-+			    job_read(pfdev, JS_STATUS(i)) ==
-+			    DRM_PANFROST_EXCEPTION_ACTIVE)
++			if (stop_failed && job == hung[i])
 +				dma_fence_set_error(&job->base.s_fence->finished,
 +						    -ECANCELED);
  		}
  	}
 -	pfdev->reset.count++;
-+	if (!job_active)
++	if (reset_gpu)
 +		pfdev->reset.count++;
  	memset(pfdev->jobs, 0, sizeof(pfdev->jobs));
  	spin_unlock(&pfdev->js->job_lock);
@@ -253,12 +316,24 @@ index 78d04a4..8398906 100644
 +	 * completes with stale data in the buffers it had still to write and
 +	 * no error reported (panfrost_job_run() fails such a job instead).
 +	 */
-+	if (!job_active)
++	if (reset_gpu) {
 +		panfrost_device_reset(pfdev, false);
  
- 	/* GPU has been reset, we can clear the reset pending bit. */
- 	atomic_set(&pfdev->reset.pending, 0);
-@@ -773,6 +861,8 @@ panfrost_reset(struct panfrost_device *pfdev,
+-	/* GPU has been reset, we can clear the reset pending bit. */
+-	atomic_set(&pfdev->reset.pending, 0);
++		/* GPU has been reset, we can clear the reset pending bit. */
++		atomic_set(&pfdev->reset.pending, 0);
++	} else {
++		/* Leave a reset that was asked for since we looked to the
++		 * reset work or timeout handler that asked for it.
++		 */
++		atomic_cmpxchg(&pfdev->reset.pending,
++			       PANFROST_RESET_STOP_ONLY, 0);
++	}
+ 
+ 	/* Now resubmit jobs that were previously queued but didn't have a
+ 	 * chance to finish.
+@@ -800,6 +942,8 @@ panfrost_reset(struct panfrost_device *pfdev,
  	panfrost_jm_enable_interrupts(pfdev);
  
  	dma_fence_end_signalling(cookie);
@@ -267,7 +342,7 @@ index 78d04a4..8398906 100644
  }
  
  static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
-@@ -781,6 +871,8 @@ static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
+@@ -808,6 +952,8 @@ static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
  	struct panfrost_job *job = to_panfrost_job(sched_job);
  	struct panfrost_device *pfdev = job->pfdev;
  	int js = panfrost_job_get_slot(job);
@@ -276,7 +351,7 @@ index 78d04a4..8398906 100644
  
  	/*
  	 * If the GPU managed to complete this jobs fence, the timeout has
-@@ -805,18 +897,34 @@ static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
+@@ -832,18 +978,51 @@ static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
  		return DRM_GPU_SCHED_STAT_NO_HANG;
  	}
  
@@ -297,6 +372,18 @@ index 78d04a4..8398906 100644
 +	js_status = job_read(pfdev, JS_STATUS(js));
 +	job_active = js_status == DRM_PANFROST_EXCEPTION_ACTIVE;
 +
++	/* A job that completed after the checks above is not active either:
++	 * its interrupt is then pending, or being handled.
++	 */
++	if (!job_active) {
++		if (job_read(pfdev, JOB_INT_RAWSTAT) & JOB_INT_MASK_DONE(js))
++			return DRM_GPU_SCHED_STAT_NO_HANG;
++
++		synchronize_irq(pfdev->js->irq);
++		if (dma_fence_is_signaled(job->done_fence))
++			return DRM_GPU_SCHED_STAT_NO_HANG;
++	}
++
 +	if (job_active) {
 +		dev_dbg(pfdev->base.dev, "job still active after %u ms, js=%d, head=0x%x, sched_job=%p: soft-stopping it to resume",
 +			JOB_TIMEOUT_MS, js, job_read(pfdev, JS_HEAD_LO(js)),
@@ -314,18 +401,27 @@ index 78d04a4..8398906 100644
 +		panfrost_core_dump(job);
 +	}
  
- 	atomic_set(&pfdev->reset.pending, 1);
+-	atomic_set(&pfdev->reset.pending, 1);
 -	panfrost_reset(pfdev, sched_job);
++	/* Ask for a reset, or only for the stop if no reset is pending. */
++	if (job_active)
++		atomic_cmpxchg(&pfdev->reset.pending, 0,
++			       PANFROST_RESET_STOP_ONLY);
++	else
++		atomic_set(&pfdev->reset.pending, 1);
 +	panfrost_reset(pfdev, sched_job, job_active);
  
  	return DRM_GPU_SCHED_STAT_RESET;
  }
-@@ -826,7 +934,7 @@ static void panfrost_reset_work(struct work_struct *work)
- 	struct panfrost_device *pfdev;
+@@ -866,7 +1045,7 @@ static void panfrost_reset_work(struct work_struct *work)
+ 		return;
+ 	}
  
- 	pfdev = container_of(work, struct panfrost_device, reset.work);
 -	panfrost_reset(pfdev, NULL);
 +	panfrost_reset(pfdev, NULL, false);
+ 	pm_runtime_put_autosuspend(pfdev->base.dev);
  }
  
- static const struct drm_sched_backend_ops panfrost_sched_ops = {
+-- 
+2.55.0
+

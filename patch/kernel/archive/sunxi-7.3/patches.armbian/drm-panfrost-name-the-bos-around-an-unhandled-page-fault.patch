@@ -1,19 +1,23 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 5f41edf365b88f9718dfaf6285416f41d804ece3 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 05:00:27 +0000
-Subject: [PATCH 7/7] drm/panfrost: Name the BOs around an unhandled page fault
+Subject: [PATCH 12/12] drm/panfrost: Name the BOs around an unhandled page
+ fault
 
 An unhandled GPU page fault only reports the faulting VA. That does not
 tell a GPU access just past the end of a buffer (a userspace or hardware
-overrun) from an access to a buffer that is no longer mapped (a kernel
-bug) or from a garbage pointer.
+overrun) from a stale or garbage pointer.
 
 After the fault report, look the address up in the faulting address
 space and print the BO that contains it, or else the nearest BO below
-and above it: VA range, size, the distance of the fault from it, whether
-it is still mapped, heap/noexec, and the label userspace gave it (Mesa
-labels its BOs with their use, format and size). For an OpenCL image
-read on a Mali-G31 this gave:
+and above it: VA range, size, the distance of the fault from it,
+heap/noexec, and the label userspace gave it (Mesa labels its BOs with
+their use, format and size). A BO that has been freed is no longer in the
+address space, so an access to it shows up as a hole between its
+neighbours. Mappings whose last reference is gone, which stay in the
+address space until their teardown takes mm_lock, are skipped. For an
+OpenCL image read on a Mali-G31 this gave (with an earlier version of
+this patch, which also printed whether the BO was mapped):
 
   panfrost 1800000.gpu: Unhandled Page fault in AS0 at VA 0x000000000A181000
   ...
@@ -27,14 +31,14 @@ Only the unhandled fault path is affected; heap growth faults are not.
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- drivers/gpu/drm/panfrost/panfrost_mmu.c | 81 +++++++++++++++++++++++++
- 1 file changed, 81 insertions(+)
+ drivers/gpu/drm/panfrost/panfrost_mmu.c | 88 +++++++++++++++++++++++++
+ 1 file changed, 88 insertions(+)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_mmu.c b/drivers/gpu/drm/panfrost/panfrost_mmu.c
-index fbbb745..8a1a80c 100644
+index c9ade97..34ff2ca 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_mmu.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_mmu.c
-@@ -590,6 +590,86 @@ out:
+@@ -596,6 +596,93 @@ out:
  	return mapping;
  }
  
@@ -49,10 +53,9 @@ index fbbb745..8a1a80c 100644
 +
 +	mutex_lock(&bo->label.lock);
 +	dev_err(pfdev->base.dev,
-+		"fault bo: %s: VA [0x%llx-0x%llx) size 0x%zx, fault at %s0x%llx, %s%s%s, label \"%s\"\n",
++		"fault bo: %s: VA [0x%llx-0x%llx) size 0x%zx, fault at %s0x%llx%s%s, label \"%s\"\n",
 +		where, start, end, bo->base.base.size,
 +		addr < start ? "-" : addr >= end ? "end+" : "start+", dist,
-+		m->active ? "mapped" : "NOT mapped",
 +		bo->is_heap ? ", heap" : "", bo->noexec ? ", noexec" : "",
 +		bo->label.str ? bo->label.str : "");
 +	mutex_unlock(&bo->label.lock);
@@ -62,9 +65,9 @@ index fbbb745..8a1a80c 100644
 + * Report the BOs around an unhandled fault address in the faulting address
 + * space: the one containing it (if any), else the nearest one below and above.
 + * An access just past the end of a BO that a hole follows is a GPU overrun of
-+ * that BO (userspace or hardware), a fault inside a BO whose mapping is gone
-+ * points at the kernel, an address far from any BO at a stale or garbage
-+ * pointer.
++ * that BO (userspace or hardware); an address far from any BO is a garbage
++ * pointer, or a stale one: a BO that has been freed has left the address
++ * space, and its range shows up as a hole between its neighbours.
 + */
 +static void panfrost_mmu_report_fault_bos(struct panfrost_device *pfdev,
 +					  int as, u64 addr)
@@ -86,22 +89,30 @@ index fbbb745..8a1a80c 100644
 +
 +found_mmu:
 +	spin_lock(&mmu->mm_lock);
-+	/* The node list is sorted by address. */
++	/* The node list is sorted by address. A mapping whose last reference
++	 * is gone is being freed, and only waits for mm_lock to leave the
++	 * list: skip it.
++	 */
 +	drm_mm_for_each_node(node, &mmu->mm) {
++		struct panfrost_gem_mapping *m = drm_mm_node_to_panfrost_mapping(node);
++
++		if (!kref_read(&m->refcount))
++			continue;
 +		if (node->start > offset) {
-+			above = drm_mm_node_to_panfrost_mapping(node);
++			above = m;
 +			break;
 +		}
-+		below = drm_mm_node_to_panfrost_mapping(node);
++		below = m;
 +	}
 +	if (below) {
 +		inside = offset < below->mmnode.start + below->mmnode.size;
-+		kref_get(&below->refcount);
 +		if (inside)
 +			above = NULL;
++		if (!kref_get_unless_zero(&below->refcount))
++			below = NULL;
 +	}
-+	if (above)
-+		kref_get(&above->refcount);
++	if (above && !kref_get_unless_zero(&above->refcount))
++		above = NULL;
 +	spin_unlock(&mmu->mm_lock);
 +	spin_unlock(&pfdev->as_lock);
 +
@@ -120,8 +131,8 @@ index fbbb745..8a1a80c 100644
 +
  #define NUM_FAULT_PAGES (SZ_2M / PAGE_SIZE)
  
- static void panfrost_heap_put_chunk(struct page **pages, pgoff_t start,
-@@ -960,6 +1040,7 @@ static irqreturn_t panfrost_mmu_irq_handler_thread(int irq, void *data)
+ /*
+@@ -979,6 +1066,7 @@ static irqreturn_t panfrost_mmu_irq_handler_thread(int irq, void *data)
  				exception_type, panfrost_exception_name(exception_type),
  				access_type, access_type_name(pfdev, fault_status),
  				source_id);
@@ -129,3 +140,6 @@ index fbbb745..8a1a80c 100644
  
  			spin_lock(&pfdev->as_lock);
  			/* Ignore MMU interrupts on this AS until it's been
+-- 
+2.55.0
+
