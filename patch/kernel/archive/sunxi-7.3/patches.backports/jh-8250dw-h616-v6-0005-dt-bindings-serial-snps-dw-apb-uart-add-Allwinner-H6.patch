@@ -1,0 +1,33 @@
+From a9545fec26dc7942e2642a93b85e019e3dd5f612 Mon Sep 17 00:00:00 2001
+From: James Hilliard <james.hilliard1@gmail.com>
+Date: Mon, 2 Nov 2026 12:55:18 -0700
+Subject: [PATCH 5/9] dt-bindings: serial: snps-dw-apb-uart: add Allwinner H616
+
+The H616 UART has 256-byte transmit and receive FIFOs, but its DesignWare
+component parameter register does not report the FIFO depth. Its optional
+register layout also differs from the generic DesignWare integration.
+
+Add a specific compatible to identify this fixed configuration, retaining
+snps,dw-apb-uart as a fallback.
+
+Signed-off-by: James Hilliard <james.hilliard1@gmail.com>
+Acked-by: Krzysztof Kozlowski <krzysztof.kozlowski@oss.qualcomm.com>
+---
+ Documentation/devicetree/bindings/serial/snps-dw-apb-uart.yaml | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/Documentation/devicetree/bindings/serial/snps-dw-apb-uart.yaml b/Documentation/devicetree/bindings/serial/snps-dw-apb-uart.yaml
+index 664305d..d359988 100644
+--- a/Documentation/devicetree/bindings/serial/snps-dw-apb-uart.yaml
++++ b/Documentation/devicetree/bindings/serial/snps-dw-apb-uart.yaml
+@@ -51,6 +51,7 @@ properties:
+           - const: renesas,rzn1-uart
+       - items:
+           - enum:
++              - allwinner,sun50i-h616-uart
+               - anlogic,dr1v90-uart
+               - brcm,bcm11351-dw-apb-uart
+               - brcm,bcm21664-dw-apb-uart
+-- 
+2.55.0
+
