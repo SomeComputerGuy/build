@@ -3,9 +3,11 @@ From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 12:00:00 +0000
 Subject: arm64: dts: allwinner: h616: Add the AVS counters and the PWM interrupt
 
-Describe the AVS counters of the timer block, and the interrupt of the
-PWM controller (GIC SPI 16, H616 user manual v1.0, 3.8.1 interrupt sources:
-PWM is interrupt 48), which the PWM capture uses.
+Describe the AVS counters of the timer block, clocked by the CCU AVS gate
+(the counters only run with that gate open, H616 user manual v1.0,
+3.6.3.3.3), and the interrupt of the PWM controller (GIC SPI 16, H616
+user manual v1.0, 3.8.1 interrupt sources: PWM is interrupt 48), which
+the PWM capture uses.
 
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
@@ -20,7 +22,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +		avs_counter: counter@30090c0 {
 +			compatible = "allwinner,sun50i-h616-avs-counter";
 +			reg = <0x030090c0 0x10>;
-+			clocks = <&osc24M>;
++			clocks = <&ccu CLK_AVS>;
 +		};
 +
  		pwm: pwm@300a000 {
