@@ -25,6 +25,16 @@ this EMAC:
 These paths are enabled by a new platform flag, STMMAC_FLAG_NDESC_JUMBO,
 which only dwmac-sun8i sets.
 
+In threshold mode the transmission starts with 256 bytes in the TX FIFO,
+the largest threshold of this EMAC. dwmac-sun8i mapped the threshold off
+by one step (64 bytes gave 128, 256 bytes and more gave 64); it now uses
+the smallest threshold of at least the requested size, as the vendor
+driver does. The OWN bit of the first descriptor of a frame is set after
+a dma_wmb(), so that the other descriptors of a multi-descriptor frame
+are visible to the DMA first, and the jabber/length, frame flushed and
+checksum error bits of normal TX descriptors are counted, as with
+enhanced descriptors.
+
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
@@ -98,7 +108,22 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	return ret;
 --- a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
-@@ -68,16 +68,13 @@
+@@ -31,6 +31,14 @@
+ 		if (unlikely(tdes0 & TDES0_UNDERFLOW_ERROR)) {
+ 			x->tx_underflow++;
+ 		}
++		if (unlikely(tdes0 & TDES0_JABBER_TIMEOUT))
++			x->tx_jabber++;
++		if (unlikely(tdes0 & TDES0_FRAME_FLUSHED))
++			x->tx_frame_flushed++;
++		if (unlikely(tdes0 & TDES0_PAYLOAD_ERROR))
++			x->tx_payload_error++;
++		if (unlikely(tdes0 & TDES0_IP_HEADER_ERROR))
++			x->tx_ip_header_error++;
+ 		if (unlikely(tdes0 & TDES0_NO_CARRIER)) {
+ 			x->tx_carrier++;
+ 		}
+@@ -68,16 +76,13 @@
  	if (unlikely(rdes0 & RDES0_OWN))
  		return dma_own;
  
@@ -121,6 +146,18 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  
  	if (unlikely(rdes0 & RDES0_ERROR_SUMMARY)) {
  		if (unlikely(rdes0 & RDES0_DESCRIPTOR_ERROR))
+@@ -144,6 +149,11 @@
+ 
+ static void ndesc_set_tx_owner(struct dma_desc *p)
+ {
++	/* This is the first descriptor of a frame: the other descriptors of
++	 * the frame, already owned by the DMA, and the control word of this
++	 * one must be visible to the DMA before it may start on the frame.
++	 */
++	dma_wmb();
+ 	p->des0 |= cpu_to_le32(TDES0_OWN);
+ }
+ 
 --- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 @@ -2565,6 +2565,24 @@
@@ -148,23 +185,26 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  /**
   *  stmmac_dma_operation_mode - HW DMA operation mode
   *  @priv: driver private structure
-@@ -2612,6 +2630,15 @@
+@@ -2612,6 +2630,18 @@
  		rxmode = SF_DMA_MODE;
  	}
  
 +	/* A frame larger than the TX FIFO cannot be sent in store-and-forward
 +	 * mode, and checksum insertion needs store-and-forward: use the
 +	 * threshold mode and insert checksums in software (stmmac_xmit()).
++	 * Start the transmission only with the largest threshold in the FIFO
++	 * (256 bytes), the most margin against an underflow while the DMA
++	 * moves on from one 2040 byte buffer to the next.
 +	 */
 +	priv->tx_jumbo_thresh = (priv->plat->flags & STMMAC_FLAG_NDESC_JUMBO) &&
 +		priv->dma_conf.max_frame > stmmac_tx_fifo_per_queue(priv);
 +	if (priv->tx_jumbo_thresh)
-+		txmode = tc;
++		txmode = max(tc, 256);
 +
  	/* configure all channels */
  	for (chan = 0; chan < rx_channels_count; chan++) {
  		struct stmmac_rx_queue *rx_q = &priv->dma_conf.rx_queue[chan];
-@@ -4088,7 +4115,14 @@
+@@ -4088,7 +4118,14 @@
  	if (bfsize < BUF_SIZE_16KiB)
  		bfsize = stmmac_set_bfsize(len);
  
@@ -179,7 +219,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	/* Chose the tx/rx size from the already defined one in the
  	 * priv struct. (if defined)
  	 */
-@@ -4840,6 +4874,23 @@
+@@ -4840,6 +4877,23 @@
  		}
  	}
  
@@ -203,7 +243,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	if (unlikely(stmmac_tx_avail(priv, queue) < nfrags + 1)) {
  		if (!netif_tx_queue_stopped(netdev_get_tx_queue(dev, queue))) {
  			netif_tx_stop_queue(netdev_get_tx_queue(priv->dev,
-@@ -4870,7 +4921,7 @@
+@@ -4870,7 +4924,7 @@
  
  	enh_desc = priv->plat->enh_desc;
  	/* To program the descriptors according to the size of the frame */
@@ -212,7 +252,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  		is_jumbo = stmmac_is_jumbo_frm(priv, skb->len, enh_desc);
  
  	csum_insertion = skb->ip_summed == CHECKSUM_PARTIAL;
-@@ -6194,7 +6245,9 @@
+@@ -6194,7 +6248,9 @@
  	new_mtu = STMMAC_ALIGN(new_mtu);
  
  	/* If condition true, FIFO is too small or MTU too large */
@@ -223,7 +263,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  		return -EINVAL;
  
  	if (netif_running(dev)) {
-@@ -6247,6 +6300,14 @@
+@@ -6247,6 +6303,14 @@
  	if (priv->plat->bugged_jumbo && (dev->mtu > ETH_DATA_LEN))
  		features &= ~NETIF_F_CSUM_MASK;
  
@@ -238,7 +278,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	if (priv->plat->core_type == DWMAC_CORE_XGMAC) {
  		if (features & NETIF_F_HW_VLAN_CTAG_RX)
  			features |= NETIF_F_HW_VLAN_STAG_RX;
-@@ -8064,6 +8125,8 @@
+@@ -8064,6 +8128,8 @@
  		ndev->max_mtu = XGMAC_JUMBO_LEN;
  	else if (priv->plat->enh_desc || priv->synopsys_id >= DWMAC_CORE_4_00)
  		ndev->max_mtu = JUMBO_LEN;
@@ -285,7 +325,28 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  
  /* Used in EMAC_TX_FLOW_CTL */
  #define EMAC_TX_FLOW_CTL_EN             BIT(0)
-@@ -672,12 +673,16 @@
+@@ -592,13 +593,16 @@
+ 	} else {
+ 		v &= ~EMAC_TX_MD;
+ 		v &= ~EMAC_TX_TH_MASK;
+-		if (mode < 64)
++		/* the smallest threshold of at least @mode bytes (as the
++		 * vendor driver does), 256 bytes for anything larger
++		 */
++		if (mode <= 64)
+ 			v |= EMAC_TX_TH_64;
+-		else if (mode < 128)
++		else if (mode <= 128)
+ 			v |= EMAC_TX_TH_128;
+-		else if (mode < 192)
++		else if (mode <= 192)
+ 			v |= EMAC_TX_TH_192;
+-		else if (mode < 256)
++		else
+ 			v |= EMAC_TX_TH_256;
+ 	}
+ 	writel(v, ioaddr + EMAC_TX_CTL1);
+@@ -672,12 +676,16 @@
  
  	/* Without JUMBO_FRM_EN the receiver flags every frame longer than
  	 * 1518 bytes (1522 with a VLAN tag) as a length error, so any MTU
@@ -305,7 +366,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  }
  
  static void sun8i_dwmac_set_mac(void __iomem *ioaddr, bool enable)
-@@ -1284,14 +1289,14 @@
+@@ -1284,14 +1292,14 @@
  	 */
  	plat_dat->rx_coe = STMMAC_RX_COE_TYPE2;
  	plat_dat->tx_coe = true;
