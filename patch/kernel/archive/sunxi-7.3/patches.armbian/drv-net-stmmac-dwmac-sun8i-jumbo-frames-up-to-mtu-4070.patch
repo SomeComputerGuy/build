@@ -15,7 +15,9 @@ Support jumbo frames up to MTU 4070 on this EMAC:
   stmmac_rx() as rx_not_ls, as with enhanced descriptors.
 - TX: in chain mode the linear part of a frame is split over several
   descriptors of 2040 bytes; paged frames longer than that are
-  linearised.
+  linearised. The EMAC does not insert checksums correctly into such
+  frames (the receiver drops them), so their checksums are computed in
+  software; shorter frames keep checksum insertion.
 These paths are enabled by a new platform flag, STMMAC_FLAG_NDESC_JUMBO,
 which only dwmac-sun8i sets. RX_CTL0/TX_CTL0 FRM_LEN_CTL are set as well
 (frame length limit 16384 bytes in both directions, H616 user manual
@@ -169,7 +171,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	dma_conf->dma_buf_sz = bfsize;
  	/* Chose the tx/rx size from the already defined one in the
  	 * priv struct. (if defined)
-@@ -4840,6 +4853,17 @@
+@@ -4840,6 +4853,27 @@
  		}
  	}
  
@@ -184,10 +186,20 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +		nopaged_len = skb_headlen(skb);
 +	}
 +
++	/* The sun8i EMAC does not insert checksums correctly into frames
++	 * longer than one TX buffer, and the receiver drops them: compute
++	 * their checksums in software.
++	 */
++	if (unlikely((priv->plat->flags & STMMAC_FLAG_NDESC_JUMBO) &&
++		     skb->len > BUF_SIZE_NDESC &&
++		     skb->ip_summed == CHECKSUM_PARTIAL &&
++		     skb_checksum_help(skb)))
++		goto max_sdu_err;
++
  	if (unlikely(stmmac_tx_avail(priv, queue) < nfrags + 1)) {
  		if (!netif_tx_queue_stopped(netdev_get_tx_queue(dev, queue))) {
  			netif_tx_stop_queue(netdev_get_tx_queue(priv->dev,
-@@ -4870,7 +4894,7 @@
+@@ -4870,7 +4904,7 @@
  
  	enh_desc = priv->plat->enh_desc;
  	/* To program the descriptors according to the size of the frame */
@@ -196,7 +208,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  		is_jumbo = stmmac_is_jumbo_frm(priv, skb->len, enh_desc);
  
  	csum_insertion = skb->ip_summed == CHECKSUM_PARTIAL;
-@@ -8064,6 +8088,8 @@
+@@ -8064,6 +8098,8 @@
  		ndev->max_mtu = XGMAC_JUMBO_LEN;
  	else if (priv->plat->enh_desc || priv->synopsys_id >= DWMAC_CORE_4_00)
  		ndev->max_mtu = JUMBO_LEN;
