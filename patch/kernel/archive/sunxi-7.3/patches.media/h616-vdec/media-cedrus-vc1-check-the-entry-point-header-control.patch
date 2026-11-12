@@ -25,3 +25,6 @@ index cb1e6c0..155f6e1 100644
  		},
  		.capabilities	= CEDRUS_CAPABILITY_VC1_DEC,
  	},
+-- 
+Armbian
+
