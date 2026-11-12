@@ -1,0 +1,34 @@
+From 48f0b8033af4372ac8095394b507aa9a04ebe911 Mon Sep 17 00:00:00 2001
+From: James Hilliard <james.hilliard1@gmail.com>
+Date: Mon, 2 Nov 2026 12:55:21 -0700
+Subject: [PATCH 8/9] dt-bindings: serial: snps-dw-apb-uart: add Allwinner A523
+
+The A523 UART integration has different FIFO depths across its controllers
+and reports each controller's depth in the FIFO Clock Control register.
+Its receive thresholds are fractions of that depth, and its optional
+register layout differs from the generic DesignWare integration.
+
+Add a compatible for this integration, also used by A527 and T527, with
+snps,dw-apb-uart as a fallback.
+
+Acked-by: Krzysztof Kozlowski <krzysztof.kozlowski@oss.qualcomm.com>
+Signed-off-by: James Hilliard <james.hilliard1@gmail.com>
+---
+ Documentation/devicetree/bindings/serial/snps-dw-apb-uart.yaml | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/Documentation/devicetree/bindings/serial/snps-dw-apb-uart.yaml b/Documentation/devicetree/bindings/serial/snps-dw-apb-uart.yaml
+index d359988..f6e2fe6 100644
+--- a/Documentation/devicetree/bindings/serial/snps-dw-apb-uart.yaml
++++ b/Documentation/devicetree/bindings/serial/snps-dw-apb-uart.yaml
+@@ -52,6 +52,7 @@ properties:
+       - items:
+           - enum:
+               - allwinner,sun50i-h616-uart
++              - allwinner,sun55i-a523-uart
+               - anlogic,dr1v90-uart
+               - brcm,bcm11351-dw-apb-uart
+               - brcm,bcm21664-dw-apb-uart
+-- 
+2.55.0
+
