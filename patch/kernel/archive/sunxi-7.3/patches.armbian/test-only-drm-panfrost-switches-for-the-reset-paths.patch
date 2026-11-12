@@ -1,0 +1,95 @@
+From 5a87ccd5a1e0b9328322919d2b4777538a84f69d Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 12 Nov 2026 07:03:51 +0000
+Subject: [PATCH] TEST ONLY: drm/panfrost: switches for the reset paths
+
+Not for upstream and not for the image. Two module parameters, off by
+default, for the board test of the reset paths that userspace cannot
+reach:
+- test_reset (write only): queue the reset work, as the MMU code does,
+  without a runtime PM reference;
+- test_no_hard_stop: withhold the hard stop of a job that did not
+  soft-stop, so that the stop fails and the GPU is reset under the job.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/panfrost/panfrost_job.c | 34 ++++++++++++++++++++++++-
+ 1 file changed, 33 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
+index 6f9b386..f6a5a4c 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_job.c
++++ b/drivers/gpu/drm/panfrost/panfrost_job.c
+@@ -5,6 +5,7 @@
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
++#include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
+ #include <linux/dma-resv.h>
+@@ -23,6 +24,32 @@
+ #include "panfrost_dump.h"
+ 
+ #define MAX_JM_CTX_PER_FILE 64
++
++/* TEST ONLY, not for upstream: switches for the reset paths that userspace
++ * cannot reach. test_reset queues the reset work the way the MMU code does
++ * (no runtime PM reference held); test_no_hard_stop withholds the hard stop,
++ * so that it "fails" and the GPU is reset under the job that did not stop.
++ */
++static struct panfrost_device *panfrost_test_pfdev;
++static bool panfrost_test_no_hard_stop;
++module_param_named(test_no_hard_stop, panfrost_test_no_hard_stop, bool, 0600);
++
++static int panfrost_test_reset_set(const char *val,
++				   const struct kernel_param *kp)
++{
++	struct panfrost_device *pfdev = READ_ONCE(panfrost_test_pfdev);
++
++	if (!pfdev)
++		return -ENODEV;
++
++	panfrost_device_schedule_reset(pfdev);
++	return 0;
++}
++
++static const struct kernel_param_ops panfrost_test_reset_ops = {
++	.set = panfrost_test_reset_set,
++};
++module_param_cb(test_reset, &panfrost_test_reset_ops, NULL, 0200);
+ #define JOB_TIMEOUT_MS 500
+ 
+ /* How long a soft-stopped slot gets to reach a task boundary before its job is
+@@ -812,7 +839,8 @@ panfrost_reset(struct panfrost_device *pfdev,
+ 
+ 		for (i = 0; i < NUM_JOB_SLOTS; i++) {
+ 			if (job_read(pfdev, JS_STATUS(i)) ==
+-			    DRM_PANFROST_EXCEPTION_ACTIVE)
++			    DRM_PANFROST_EXCEPTION_ACTIVE &&
++			    !panfrost_test_no_hard_stop)
+ 				job_write(pfdev, JS_COMMAND(i), JS_COMMAND_HARD_STOP);
+ 		}
+ 
+@@ -1128,6 +1156,8 @@ int panfrost_jm_init(struct panfrost_device *pfdev)
+ 	panfrost_jm_reset_interrupts(pfdev);
+ 	panfrost_jm_enable_interrupts(pfdev);
+ 
++	WRITE_ONCE(panfrost_test_pfdev, pfdev);
++
+ 	return 0;
+ 
+ err_sched:
+@@ -1143,6 +1173,8 @@ void panfrost_jm_fini(struct panfrost_device *pfdev)
+ 	struct panfrost_job_slot *js = pfdev->js;
+ 	int j;
+ 
++	WRITE_ONCE(panfrost_test_pfdev, NULL);
++
+ 	job_write(pfdev, JOB_INT_MASK, 0);
+ 
+ 	for (j = 0; j < NUM_JOB_SLOTS; j++) {
+-- 
+2.55.0
+
