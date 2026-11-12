@@ -1,7 +1,7 @@
 From 3eeffeb4f5b0d79a37fab6f5303706b6ad32bc1c Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 08:29:22 +0000
-Subject: [PATCH 01/12] drm/panfrost: Power the GPU up for a reset queued from
+Subject: [PATCH 01/11] drm/panfrost: Power the GPU up for a reset queued from
  the MMU code
 
 panfrost_reset_work() calls panfrost_reset() without a runtime PM

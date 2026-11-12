@@ -1,7 +1,7 @@
 From f7cf059a2ed48817ff1feaafb577c6c6e947268a Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 08:32:38 +0000
-Subject: [PATCH 03/12] drm/panfrost: Don't take a reference on a mapping that
+Subject: [PATCH 03/11] drm/panfrost: Don't take a reference on a mapping that
  is being freed
 
 addr_to_mapping() looks up the mapping that contains a faulting GPU
