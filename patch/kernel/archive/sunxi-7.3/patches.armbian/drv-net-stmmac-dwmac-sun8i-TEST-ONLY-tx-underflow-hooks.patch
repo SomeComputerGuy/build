@@ -1,0 +1,268 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 12 Nov 2026 23:35:44 +0000
+Subject: [PATCH] net: stmmac: dwmac-sun8i: TEST ONLY TX underflow hooks
+
+TEST ONLY, never for the image or upstream: knobs and counters for the
+TX FIFO underflow analysis (work-list item 37).
+
+stmmac module parameters: test_tx_chunk (TX bytes per normal descriptor,
+read at open), test_uf_retries (-1 = platform default), test_uf_log,
+counters test_uf_frames/retried/dropped, test_tx_err_frames,
+test_tx_len_err, test_tx_frames; every TX error frame (up to
+test_uf_log) is logged with its descriptors.
+dwmac_sun8i: test_uf_irq_log + counter test_uf_irq (TX DMA state,
+current descriptor and buffer at the underflow interrupt),
+test_coe_jumbo (keep TX checksum insertion above MTU 1500, read at
+open).
+
+Assisted-by: Claude
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../net/ethernet/stmicro/stmmac/chain_mode.c  |  7 +-
+ .../net/ethernet/stmicro/stmmac/dwmac-sun8i.c | 33 +++++++
+ drivers/net/ethernet/stmicro/stmmac/stmmac.h  |  2 +
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c | 90 ++++++++++++++++++-
+ 4 files changed, 128 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/chain_mode.c b/drivers/net/ethernet/stmicro/stmmac/chain_mode.c
+index 42bf7a5..33cc03d 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/chain_mode.c
++++ b/drivers/net/ethernet/stmicro/stmmac/chain_mode.c
+@@ -14,6 +14,9 @@
+ 
+ #include "stmmac.h"
+ 
++/* TEST ONLY (work-list item 37): TX buffer size per normal descriptor */
++unsigned int stmmac_test_ndesc_bmax = BUF_SIZE_NDESC;
++
+ static int jumbo_frm(struct stmmac_tx_queue *tx_q, struct sk_buff *skb,
+ 		     int csum)
+ {
+@@ -30,7 +33,7 @@ static int jumbo_frm(struct stmmac_tx_queue *tx_q, struct sk_buff *skb,
+ 	if (priv->plat->enh_desc)
+ 		bmax = BUF_SIZE_8KiB;
+ 	else
+-		bmax = BUF_SIZE_NDESC;
++		bmax = stmmac_test_ndesc_bmax;
+ 
+ 	buf_len = min_t(unsigned int, nopaged_len, bmax);
+ 	len = nopaged_len - buf_len;
+@@ -90,7 +93,7 @@ static bool is_jumbo_frm(unsigned int len, bool enh_desc)
+ 	bool ret = false;
+ 
+ 	if ((enh_desc && (len > BUF_SIZE_8KiB)) ||
+-	    (!enh_desc && (len > BUF_SIZE_NDESC)))
++	    (!enh_desc && (len > stmmac_test_ndesc_bmax)))
+ 		ret = true;
+ 
+ 	return ret;
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
+index a8d5899..eddf58a 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
+@@ -302,6 +302,14 @@ static const struct emac_variant emac_variant_h6 = {
+ #define SYSCON_ETCS_EXT_GMII	0x1
+ #define SYSCON_ETCS_INT_GMII	0x2
+ 
++/* TEST ONLY (work-list item 37, harness/research/emac-tx-underflow) */
++static int test_uf_irq_log = 30;	/* underflow interrupts still to log */
++module_param(test_uf_irq_log, int, 0644);
++static unsigned long test_uf_irq;
++module_param(test_uf_irq, ulong, 0444);
++static bool test_coe_jumbo;		/* keep TX COE above MTU 1500; read at open */
++module_param(test_coe_jumbo, bool, 0644);
++
+ static int sun8i_dwmac_reset(void __iomem *ioaddr)
+ {
+ 	u32 v;
+@@ -518,6 +526,28 @@ static int sun8i_dwmac_dma_interrupt(struct stmmac_priv *priv,
+ 	 * next frame instead of resetting the whole TX ring.
+ 	 */
+ 	if (v & EMAC_TX_UNDERFLOW_INT) {
++		test_uf_irq++;
++		if (test_uf_irq_log > 0) {
++			struct stmmac_tx_queue *q = &priv->dma_conf.tx_queue[0];
++			u32 sta = readl(ioaddr + EMAC_TX_DMA_STA);
++			u32 cd = readl(ioaddr + EMAC_TX_CUR_DESC);
++			u32 cb = readl(ioaddr + EMAC_TX_CUR_BUF);
++			u32 idx = (cd - lower_32_bits(q->dma_tx_phy)) /
++				  sizeof(struct dma_desc);
++			struct dma_desc *d = NULL;
++
++			if (q->dma_tx && idx < priv->dma_conf.dma_tx_size)
++				d = q->dma_tx + idx;
++			test_uf_irq_log--;
++			pr_info("sun8i-test: uf irq int_sta %08x tx_dma_sta %u cur_desc %08x idx %u cur_buf %08x tx_ctl1 %08x basic1 %08x tx_ctl0 %08x desc %08x/%08x/%08x cur_tx %u dirty_tx %u\n",
++				readl(ioaddr + EMAC_INT_STA), sta & 7, cd, idx, cb,
++				readl(ioaddr + EMAC_TX_CTL1),
++				readl(ioaddr + EMAC_BASIC_CTL1),
++				readl(ioaddr + EMAC_TX_CTL0),
++				d ? le32_to_cpu(d->des0) : 0,
++				d ? le32_to_cpu(d->des1) : 0,
++				d ? le32_to_cpu(d->des2) : 0, q->cur_tx, q->dirty_tx);
++		}
+ 		writel(readl(ioaddr + EMAC_TX_CTL1) | EMAC_TX_DMA_START,
+ 		       ioaddr + EMAC_TX_CTL1);
+ 		ret |= handle_tx;
+@@ -677,6 +707,9 @@ static void sun8i_dwmac_core_init(struct mac_device_info *hw,
+ 	void __iomem *ioaddr = hw->pcsr;
+ 	u32 v;
+ 
++	/* TEST ONLY: TX COE above MTU 1500 (fix_features runs after open) */
++	((struct stmmac_priv *)netdev_priv(dev))->plat->bugged_jumbo = !test_coe_jumbo;
++
+ 	v = (8 << EMAC_BURSTLEN_SHIFT); /* burst len */
+ 	writel(v, ioaddr + EMAC_BASIC_CTL1);
+ 
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac.h b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+index e8376d9..dfbc1a8 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac.h
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
+@@ -218,6 +218,8 @@ struct stmmac_rfs_entry {
+ 	int tc;
+ };
+ 
++extern unsigned int stmmac_test_ndesc_bmax;
++
+ struct stmmac_dma_conf {
+ 	unsigned int dma_buf_sz;
+ 	/* largest frame of the MTU: with two VLAN tags and the FCS */
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 588d6cf..5d69d82 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -106,6 +106,84 @@ MODULE_PARM_DESC(pause, "Flow Control Pause Time (units of 512 bit times)");
+ #define TC_DEFAULT 64
+ static int tc = TC_DEFAULT;
+ module_param(tc, int, 0644);
++
++/* TEST ONLY (work-list item 37, harness/research/emac-tx-underflow): knobs and
++ * counters for the TX FIFO underflow analysis of the sun8i EMAC.
++ */
++static unsigned int test_tx_chunk;	/* TX bytes per normal descriptor, 0 = 2032; read at open */
++module_param(test_tx_chunk, uint, 0644);
++static int test_uf_retries = -1;	/* -1 = platform default */
++module_param(test_uf_retries, int, 0644);
++static int test_uf_log = 30;		/* frames with a TX error still to log */
++module_param(test_uf_log, int, 0644);
++static unsigned long test_uf_frames;	/* frames with TDES0 underflow */
++module_param(test_uf_frames, ulong, 0444);
++static unsigned long test_uf_retried;
++module_param(test_uf_retried, ulong, 0444);
++static unsigned long test_uf_dropped;
++module_param(test_uf_dropped, ulong, 0444);
++static unsigned long test_tx_err_frames;	/* frames with any TX error */
++module_param(test_tx_err_frames, ulong, 0444);
++static unsigned long test_tx_len_err;	/* TDES0 bit 14 (jabber / TX_LENGTH_ERR) */
++module_param(test_tx_len_err, ulong, 0444);
++static unsigned long test_tx_frames;	/* frames completed (last segment) */
++module_param(test_tx_frames, ulong, 0444);
++
++#define TEST_SEGS	12
++static struct {
++	unsigned int n, first;
++	u32 d0[TEST_SEGS], d1[TEST_SEGS];
++	dma_addr_t buf[TEST_SEGS];
++} test_fr;
++
++/* every cleaned descriptor, before its buffer is unmapped */
++static void stmmac_test_seg(struct stmmac_tx_queue *tx_q, unsigned int entry,
++			    struct dma_desc *p)
++{
++	u32 d1 = le32_to_cpu(p->des1);
++
++	if (d1 & BIT(29)) {			/* TDES1 first segment */
++		test_fr.n = 0;
++		test_fr.first = entry;
++	}
++	if (test_fr.n < TEST_SEGS) {
++		test_fr.d0[test_fr.n] = le32_to_cpu(p->des0);
++		test_fr.d1[test_fr.n] = d1;
++		test_fr.buf[test_fr.n] = tx_q->tx_skbuff_dma[entry].buf;
++		test_fr.n++;
++	}
++}
++
++/* the last segment of a frame */
++static void stmmac_test_frame(unsigned int entry, struct dma_desc *p,
++			      int status, struct sk_buff *skb, bool retried)
++{
++	u32 d0 = le32_to_cpu(p->des0);
++	char b[TEST_SEGS * 40], *s = b;
++	unsigned int i;
++
++	test_tx_frames++;
++	if (!(status & tx_err))
++		return;
++	test_tx_err_frames++;
++	if (d0 & BIT(14))
++		test_tx_len_err++;
++	if (status & tx_err_underflow) {
++		test_uf_frames++;
++		if (retried)
++			test_uf_retried++;
++		else
++			test_uf_dropped++;
++	}
++	if (test_uf_log <= 0)
++		return;
++	test_uf_log--;
++	for (i = 0; i < test_fr.n; i++)
++		s += scnprintf(s, b + sizeof(b) - s, " %08x/%08x/%pad", test_fr.d0[i],
++			       test_fr.d1[i], &test_fr.buf[i]);
++	pr_info("stmmac-test: txerr len %u first %u last %u segs %u retried %d d0/d1/buf:%s\n",
++		skb ? skb->len : 0, test_fr.first, entry, test_fr.n, retried, b);
++}
+ MODULE_PARM_DESC(tc, "DMA threshold control value");
+ 
+ /* This is unused */
+@@ -2839,7 +2917,8 @@ static bool stmmac_tx_underflow_retry(struct stmmac_priv *priv,
+ 		tx_q->uf_skb = skb;
+ 		tx_q->uf_tries = 0;
+ 	}
+-	if (tx_q->uf_tries >= priv->plat->tx_underflow_retries) {
++	if (tx_q->uf_tries >= (test_uf_retries >= 0 ? test_uf_retries :
++			       priv->plat->tx_underflow_retries)) {
+ 		tx_q->uf_skb = NULL;
+ 		return false;
+ 	}
+@@ -2907,6 +2986,8 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
+ 		 */
+ 		dma_rmb();
+ 
++		stmmac_test_seg(tx_q, entry, p);
++
+ 		/* Just consider the last segment and ...*/
+ 		if (likely(!(status & tx_not_ls))) {
+ 			/* ... verify the status error condition */
+@@ -2978,8 +3059,10 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
+ 				bytes_compl += skb->len;
+ 				if (unlikely(status & tx_err_underflow) &&
+ 				    stmmac_tx_underflow_retry(priv, tx_q, skb)) {
++					stmmac_test_frame(entry, p, status, skb, true);
+ 					__skb_queue_tail(&uf_list, skb);
+ 				} else {
++					stmmac_test_frame(entry, p, status, skb, false);
+ 					if (unlikely(skb == tx_q->uf_skb))
+ 						tx_q->uf_skb = NULL;
+ 					dev_consume_skb_any(skb);
+@@ -4213,6 +4296,9 @@ static int __stmmac_open(struct net_device *dev,
+ 			dma_conf->tx_queue[i].tbs = priv->dma_conf.tx_queue[i].tbs;
+ 	memcpy(&priv->dma_conf, dma_conf, sizeof(*dma_conf));
+ 
++	stmmac_test_ndesc_bmax = (test_tx_chunk >= 256 && test_tx_chunk <= 2044) ?
++				 ALIGN_DOWN(test_tx_chunk, 4) : BUF_SIZE_NDESC;
++
+ 	/* The PHY is suspended when the interface is reopened without
+ 	 * disconnecting the PHY, e.g. on MTU change. IEEE 802.3 allows PHYs
+ 	 * to stop their receive clock while powered down, but the DMA
+@@ -4905,7 +4991,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	 */
+ 	if (priv->descriptor_mode == STMMAC_CHAIN_MODE &&
+ 	    priv->hw->desc == &ndesc_ops && nfrags &&
+-	    skb->len > BUF_SIZE_NDESC) {
++	    skb->len > stmmac_test_ndesc_bmax) {
+ 		if (skb_linearize(skb))
+ 			goto max_sdu_err;
+ 		nfrags = 0;
