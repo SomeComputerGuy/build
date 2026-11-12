@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 10 Nov 2026 10:21:19 +0000
+Subject: [PATCH] drm/sun4i: dw-hdmi: Follow the TCON clock and redo the engine
+ mode on format changes
+
+Changing only the "max bpc" property (10-bit RGB to 8-bit RGB at the
+same mode) sets connectors_changed, not mode_changed. The atomic helpers
+then run the encoder mode set but skip mode_set_nofb(), so the display
+engine formatter and the TCON stay on the previous output format while
+dw-hdmi switches to the new one. Force mode_changed when the negotiated
+format or YCbCr encoding changes.
+
+The HDMI module clock was set to the TMDS rate, 5/4 of the pixel clock
+for 10-bit. That rate is not reachable from the video PLL that clocks
+the TCON (1080p60 10-bit got 169.7 MHz instead of 185.6 MHz). The
+vendor driver sets this clock to the TCON TV clock rate for every
+colour depth, and the Synopsys PHY PLL applies the deep colour factor
+from its MPLL table. Do the same: the pixel clock, halved for YUV 4:2:0.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/sun4i/sun8i_dw_hdmi.c | 29 ++++++++++++++-------------
+ 1 file changed, 15 insertions(+), 14 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun8i_dw_hdmi.c b/drivers/gpu/drm/sun4i/sun8i_dw_hdmi.c
+index 1bbd63e7c..a826ade4d 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_dw_hdmi.c
++++ b/drivers/gpu/drm/sun4i/sun8i_dw_hdmi.c
+@@ -87,9 +87,16 @@ static int sun8i_hdmi_enc_atomic_check(struct drm_bridge *bridge,
+ 	old_scrtc_state = drm_crtc_state_to_sun4i_crtc_state(
+ 		drm_atomic_get_old_crtc_state(crtc_state->state, crtc_state->crtc));
+ 	if (scrtc_state->format != old_scrtc_state->format ||
+-	    scrtc_state->encoding != old_scrtc_state->encoding)
++	    scrtc_state->encoding != old_scrtc_state->encoding) {
++		/*
++		 * A max bpc change alone only sets connectors_changed, which
++		 * skips mode_set_nofb(), where the engine and TCON take the
++		 * new format.
++		 */
++		crtc_state->mode_changed = true;
+ 		return drm_atomic_add_affected_planes(crtc_state->state,
+ 						      crtc_state->crtc);
++	}
+ 
+ 	return 0;
+ }
+@@ -141,22 +148,16 @@ sun8i_dw_hdmi_encoder_atomic_mode_set(struct drm_encoder *encoder,
+ 	unsigned long rate = mode->crtc_clock * 1000UL;
+ 
+ 	/*
+-	 * The TMDS character rate is derived from the pixel clock: deep
+-	 * color multiplies it (10-bit: 5/4), except for YUV 4:2:2, which
+-	 * always uses 12-bit containers at the pixel rate, and YUV 4:2:0
+-	 * halves it again since two horizontal samples share one TMDS
+-	 * period.
++	 * This clock feeds the controller with the TCON output, like the
++	 * vendor driver, which sets it to the TCON TV clock rate: the pixel
++	 * clock, halved for YUV 4:2:0 as the TCON halves it. Deep colour
++	 * does not change it (the PHY PLL multiplies the TMDS rate), and a
++	 * 5/4 rate is not reachable from the video PLL that clocks the TCON.
+ 	 */
+ 	switch (scrtc_state->link_format) {
+-	case MEDIA_BUS_FMT_RGB101010_1X30:
+-	case MEDIA_BUS_FMT_YUV10_1X30:
+-		rate = rate * 5 / 4;
+-		break;
+-	case MEDIA_BUS_FMT_UYYVYY10_0_5X30:
+-		rate = rate * 5 / 4 / 2;
+-		break;
+ 	case MEDIA_BUS_FMT_UYYVYY8_0_5X24:
+-		rate = rate / 2;
++	case MEDIA_BUS_FMT_UYYVYY10_0_5X30:
++		rate /= 2;
+ 		break;
+ 	default:
+ 		break;
+-- 
+2.55.0
+

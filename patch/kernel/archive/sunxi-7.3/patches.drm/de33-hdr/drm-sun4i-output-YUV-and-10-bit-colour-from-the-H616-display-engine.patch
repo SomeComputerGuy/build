@@ -1,0 +1,954 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 10 Nov 2026 02:02:03 +0000
+Subject: [PATCH 15/16] drm/sun4i: Output YUV and 10-bit colour from the H616
+ display engine
+
+The display engine always outputs 8-bit RGB to the HDMI controller,
+which rules out YUV output, YUV 4:2:0 modes and deep colour, and with
+it 10-bit video and HDR.
+
+Give the engine an output media bus format and YCbCr encoding, carried
+in a CRTC state subclass and latched into the engine when the mode is
+set, before the TCON, the mixer and the planes are programmed:
+
+- The H616 (DE33) mixer has a formatter after the blender, which
+  subsamples to YUV 4:2:0 and outputs 10 bits per component. Program
+  it with the clamp values of the vendor driver, and report the
+  formats it can produce through a new format_valid engine callback.
+  Everything else keeps outputting 8-bit RGB only.
+- For YUV output the blender works in YUV, so each channel CSC unit
+  converts its plane into limited range YCbCr of the output encoding
+  (BT.601, BT.709 or BT.2020), and the background is YUV black. This
+  extends the BT.601-only YUV blending of the TV encoder path.
+- For YUV 4:2:0 two pixels are sent per TCON cycle, so the TCON TV
+  dot clock and horizontal timings are halved.
+- The writeback unit converts YUV blender output of any encoding.
+
+Based on the DE3/DE33 HDMI output series by Jernej Skrabec in
+LibreELEC, ported to the register shadow of this driver and to the
+TV encoder YUV path.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/sun4i/Makefile       |   1 +
+ drivers/gpu/drm/sun4i/sun4i_crtc.c   |  62 ++++++++-
+ drivers/gpu/drm/sun4i/sun4i_crtc.h   |  25 ++++
+ drivers/gpu/drm/sun4i/sun4i_tcon.c   |  31 +++--
+ drivers/gpu/drm/sun4i/sun50i_fmt.c   |  67 ++++++++++
+ drivers/gpu/drm/sun4i/sun50i_fmt.h   |  41 ++++++
+ drivers/gpu/drm/sun4i/sun50i_wb.c    |  19 ++-
+ drivers/gpu/drm/sun4i/sun8i_csc.c    | 193 +++++++++++++++++++++------
+ drivers/gpu/drm/sun4i/sun8i_csc.h    |   3 +-
+ drivers/gpu/drm/sun4i/sun8i_mixer.c  |  40 +++++-
+ drivers/gpu/drm/sun4i/sun8i_mixer.h  |   2 +
+ drivers/gpu/drm/sun4i/sunxi_engine.h |  50 +++++++
+ 12 files changed, 467 insertions(+), 67 deletions(-)
+ create mode 100644 drivers/gpu/drm/sun4i/sun50i_fmt.c
+ create mode 100644 drivers/gpu/drm/sun4i/sun50i_fmt.h
+
+diff --git a/drivers/gpu/drm/sun4i/Makefile b/drivers/gpu/drm/sun4i/Makefile
+index 592b8bacb..01422c2e3 100644
+--- a/drivers/gpu/drm/sun4i/Makefile
++++ b/drivers/gpu/drm/sun4i/Makefile
+@@ -20,6 +20,7 @@ sun8i-drm-hdmi-y		+= sun8i_hdmi_phy_clk.o
+ sun8i-mixer-y			+= sun50i_afbc.o
+ sun8i-mixer-y			+= sun50i_shadow.o
+ sun8i-mixer-y			+= sun50i_wb.o
++sun8i-mixer-y			+= sun50i_fmt.o
+ sun8i-mixer-y			+= sun8i_mixer.o sun8i_ui_layer.o \
+ 				   sun8i_vi_layer.o sun8i_ui_scaler.o \
+ 				   sun8i_vi_scaler.o sun8i_csc.o \
+diff --git a/drivers/gpu/drm/sun4i/sun4i_crtc.c b/drivers/gpu/drm/sun4i/sun4i_crtc.c
+index 2f7856c38..f191ad1de 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_crtc.c
++++ b/drivers/gpu/drm/sun4i/sun4i_crtc.c
+@@ -12,6 +12,7 @@
+ #include <linux/of_graph.h>
+ #include <linux/of_irq.h>
+ #include <linux/regmap.h>
++#include <linux/slab.h>
+ 
+ #include <video/videomode.h>
+ 
+@@ -178,10 +179,20 @@ static void sun4i_crtc_atomic_enable(struct drm_crtc *crtc,
+ 
+ static void sun4i_crtc_mode_set_nofb(struct drm_crtc *crtc)
+ {
++	struct sun4i_crtc_state *scrtc_state =
++		drm_crtc_state_to_sun4i_crtc_state(crtc->state);
+ 	struct drm_display_mode *mode = &crtc->state->adjusted_mode;
+ 	struct drm_encoder *encoder = sun4i_crtc_get_encoder(crtc);
+ 	struct sun4i_crtc *scrtc = drm_crtc_to_sun4i_crtc(crtc);
+ 
++	/*
++	 * The negotiated output format and encoding are stable for the
++	 * lifetime of the mode, so they can be latched into the engine
++	 * here, before TCON, engine and plane updates are committed.
++	 */
++	scrtc->engine->format = scrtc_state->format;
++	scrtc->engine->encoding = scrtc_state->encoding;
++
+ 	sun4i_tcon_mode_set(scrtc->tcon, encoder, mode);
+ 	sunxi_engine_mode_set(scrtc->engine, mode);
+ 
+@@ -225,12 +236,57 @@ static void sun4i_crtc_disable_vblank(struct drm_crtc *crtc)
+ 	sun4i_tcon_enable_vblank(scrtc->tcon, false);
+ }
+ 
++static void sun4i_crtc_destroy_state(struct drm_crtc *crtc,
++				     struct drm_crtc_state *state)
++{
++	__drm_atomic_helper_crtc_destroy_state(state);
++	kfree(drm_crtc_state_to_sun4i_crtc_state(state));
++}
++
++static void sun4i_crtc_reset(struct drm_crtc *crtc)
++{
++	struct sun4i_crtc_state *state;
++
++	if (crtc->state) {
++		sun4i_crtc_destroy_state(crtc, crtc->state);
++		crtc->state = NULL;
++	}
++
++	state = kzalloc_obj(*state);
++	if (!state)
++		return;
++
++	state->format = MEDIA_BUS_FMT_RGB888_1X24;
++	state->link_format = MEDIA_BUS_FMT_RGB888_1X24;
++	state->encoding = DRM_COLOR_YCBCR_BT709;
++	__drm_atomic_helper_crtc_reset(crtc, &state->base);
++}
++
++static struct drm_crtc_state *
++sun4i_crtc_duplicate_state(struct drm_crtc *crtc)
++{
++	struct sun4i_crtc_state *current_state =
++		drm_crtc_state_to_sun4i_crtc_state(crtc->state);
++	struct sun4i_crtc_state *state;
++
++	state = kzalloc_obj(*state);
++	if (!state)
++		return NULL;
++
++	__drm_atomic_helper_crtc_duplicate_state(crtc, &state->base);
++	state->format = current_state->format;
++	state->link_format = current_state->link_format;
++	state->encoding = current_state->encoding;
++
++	return &state->base;
++}
++
+ static const struct drm_crtc_funcs sun4i_crtc_funcs = {
+-	.atomic_destroy_state	= drm_atomic_helper_crtc_destroy_state,
+-	.atomic_duplicate_state	= drm_atomic_helper_crtc_duplicate_state,
++	.atomic_destroy_state	= sun4i_crtc_destroy_state,
++	.atomic_duplicate_state	= sun4i_crtc_duplicate_state,
+ 	.destroy		= drm_crtc_cleanup,
+ 	.page_flip		= drm_atomic_helper_page_flip,
+-	.reset			= drm_atomic_helper_crtc_reset,
++	.reset			= sun4i_crtc_reset,
+ 	.set_config		= drm_atomic_helper_set_config,
+ 	.enable_vblank		= sun4i_crtc_enable_vblank,
+ 	.disable_vblank		= sun4i_crtc_disable_vblank,
+diff --git a/drivers/gpu/drm/sun4i/sun4i_crtc.h b/drivers/gpu/drm/sun4i/sun4i_crtc.h
+index ed7aa7ce4..8e775e677 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_crtc.h
++++ b/drivers/gpu/drm/sun4i/sun4i_crtc.h
+@@ -9,6 +9,9 @@
+ #ifndef _SUN4I_CRTC_H_
+ #define _SUN4I_CRTC_H_
+ 
++#include <drm/drm_color_mgmt.h>
++#include <drm/drm_crtc.h>
++
+ struct sun4i_crtc {
+ 	struct drm_crtc			crtc;
+ 	struct drm_pending_vblank_event	*event;
+@@ -17,11 +20,33 @@ struct sun4i_crtc {
+ 	struct sun4i_tcon		*tcon;
+ };
+ 
++/**
++ * struct sun4i_crtc_state - CRTC state subclass
++ * @base: base CRTC state
++ * @format: negotiated output media bus format of the display engine
++ * @link_format: media bus format on the HDMI link, which differs from
++ *	@format when the HDMI controller subsamples YUV 4:4:4 to 4:2:2
++ * @encoding: negotiated output YCbCr encoding, meaningless when @format
++ *	is RGB
++ */
++struct sun4i_crtc_state {
++	struct drm_crtc_state		base;
++	u32				format;
++	u32				link_format;
++	enum drm_color_encoding		encoding;
++};
++
+ static inline struct sun4i_crtc *drm_crtc_to_sun4i_crtc(struct drm_crtc *crtc)
+ {
+ 	return container_of(crtc, struct sun4i_crtc, crtc);
+ }
+ 
++static inline struct sun4i_crtc_state *
++drm_crtc_state_to_sun4i_crtc_state(struct drm_crtc_state *state)
++{
++	return container_of(state, struct sun4i_crtc_state, base);
++}
++
+ struct sun4i_crtc *sun4i_crtc_init(struct drm_device *drm,
+ 				   struct sunxi_engine *engine,
+ 				   struct sun4i_tcon *tcon);
+diff --git a/drivers/gpu/drm/sun4i/sun4i_tcon.c b/drivers/gpu/drm/sun4i/sun4i_tcon.c
+index 93dbc2502..cf0aa415d 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_tcon.c
++++ b/drivers/gpu/drm/sun4i/sun4i_tcon.c
+@@ -770,14 +770,29 @@ static void sun4i_tcon0_mode_set_rgb(struct sun4i_tcon *tcon,
+ static void sun4i_tcon1_mode_set(struct sun4i_tcon *tcon,
+ 				 const struct drm_display_mode *mode)
+ {
+-	unsigned int bp, hsync, vsync, vtotal;
++	unsigned int bp, hsync, vsync, vtotal, div;
+ 	u8 clk_delay;
+ 	u32 val;
+ 
+ 	WARN_ON(!tcon->quirks->has_channel_1);
+ 
++	/*
++	 * For YUV 4:2:0 output, two horizontally adjacent pixels are
++	 * transferred in one cycle, so the dot clock and all horizontal
++	 * timings are halved.
++	 */
++	switch (tcon->crtc->engine->format) {
++	case MEDIA_BUS_FMT_UYYVYY8_0_5X24:
++	case MEDIA_BUS_FMT_UYYVYY10_0_5X30:
++		div = 2;
++		break;
++	default:
++		div = 1;
++		break;
++	}
++
+ 	/* Configure the dot clock */
+-	clk_set_rate(tcon->sclk1, mode->crtc_clock * 1000);
++	clk_set_rate(tcon->sclk1, mode->crtc_clock * 1000 / div);
+ 
+ 	/* Adjust clock delay */
+ 	clk_delay = sun4i_tcon_get_clk_delay(mode, 1);
+@@ -796,17 +811,17 @@ static void sun4i_tcon1_mode_set(struct sun4i_tcon *tcon,
+ 
+ 	/* Set the input resolution */
+ 	regmap_write(tcon->regs, SUN4I_TCON1_BASIC0_REG,
+-		     SUN4I_TCON1_BASIC0_X(mode->crtc_hdisplay) |
++		     SUN4I_TCON1_BASIC0_X(mode->crtc_hdisplay / div) |
+ 		     SUN4I_TCON1_BASIC0_Y(mode->crtc_vdisplay));
+ 
+ 	/* Set the upscaling resolution */
+ 	regmap_write(tcon->regs, SUN4I_TCON1_BASIC1_REG,
+-		     SUN4I_TCON1_BASIC1_X(mode->crtc_hdisplay) |
++		     SUN4I_TCON1_BASIC1_X(mode->crtc_hdisplay / div) |
+ 		     SUN4I_TCON1_BASIC1_Y(mode->crtc_vdisplay));
+ 
+ 	/* Set the output resolution */
+ 	regmap_write(tcon->regs, SUN4I_TCON1_BASIC2_REG,
+-		     SUN4I_TCON1_BASIC2_X(mode->crtc_hdisplay) |
++		     SUN4I_TCON1_BASIC2_X(mode->crtc_hdisplay / div) |
+ 		     SUN4I_TCON1_BASIC2_Y(mode->crtc_vdisplay));
+ 
+ 	/* Set horizontal display timings */
+@@ -814,8 +829,8 @@ static void sun4i_tcon1_mode_set(struct sun4i_tcon *tcon,
+ 	DRM_DEBUG_DRIVER("Setting horizontal total %d, backporch %d\n",
+ 			 mode->htotal, bp);
+ 	regmap_write(tcon->regs, SUN4I_TCON1_BASIC3_REG,
+-		     SUN4I_TCON1_BASIC3_H_TOTAL(mode->crtc_htotal) |
+-		     SUN4I_TCON1_BASIC3_H_BACKPORCH(bp));
++		     SUN4I_TCON1_BASIC3_H_TOTAL(mode->crtc_htotal / div) |
++		     SUN4I_TCON1_BASIC3_H_BACKPORCH(bp / div));
+ 
+ 	bp = mode->crtc_vtotal - mode->crtc_vsync_start;
+ 	DRM_DEBUG_DRIVER("Setting vertical total %d, backporch %d\n",
+@@ -844,7 +859,7 @@ static void sun4i_tcon1_mode_set(struct sun4i_tcon *tcon,
+ 		     SUN4I_TCON1_BASIC4_V_BACKPORCH(bp));
+ 
+ 	/* Set Hsync and Vsync length */
+-	hsync = mode->crtc_hsync_end - mode->crtc_hsync_start;
++	hsync = (mode->crtc_hsync_end - mode->crtc_hsync_start) / div;
+ 	vsync = mode->crtc_vsync_end - mode->crtc_vsync_start;
+ 	DRM_DEBUG_DRIVER("Setting HSYNC %d, VSYNC %d\n", hsync, vsync);
+ 	regmap_write(tcon->regs, SUN4I_TCON1_BASIC5_REG,
+diff --git a/drivers/gpu/drm/sun4i/sun50i_fmt.c b/drivers/gpu/drm/sun4i/sun50i_fmt.c
+new file mode 100644
+index 000000000..25b40cfbe
+--- /dev/null
++++ b/drivers/gpu/drm/sun4i/sun50i_fmt.c
+@@ -0,0 +1,67 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * Copyright (C) 2026 Jernej Skrabec <jernej.skrabec@gmail.com>
++ */
++
++#include <linux/regmap.h>
++
++#include "sun50i_fmt.h"
++#include "sunxi_engine.h"
++
++static u32 sun50i_fmt_get_colorspace(u32 format)
++{
++	switch (format) {
++	case MEDIA_BUS_FMT_UYYVYY8_0_5X24:
++	case MEDIA_BUS_FMT_UYYVYY10_0_5X30:
++		return SUN50I_FMT_CS_YUV420;
++	default:
++		return SUN50I_FMT_CS_YUV444RGB;
++	}
++}
++
++static bool sun50i_fmt_is_10bit(u32 format)
++{
++	return format == MEDIA_BUS_FMT_UYYVYY10_0_5X30 ||
++	       format == MEDIA_BUS_FMT_RGB101010_1X30 ||
++	       format == MEDIA_BUS_FMT_YUV10_1X30;
++}
++
++void sun50i_fmt_setup(struct sun8i_mixer *mixer, u16 width,
++		      u16 height, u32 format)
++{
++	struct regmap *regs = mixer->engine.regs;
++	u32 colorspace = sun50i_fmt_get_colorspace(format);
++	bool yuv = sunxi_engine_format_is_yuv(format);
++	bool is_10bit = sun50i_fmt_is_10bit(format);
++	u32 base = SUN50I_FMT_DE33;
++
++	regmap_write(regs, base + SUN50I_FMT_SIZE,
++		     SUN8I_MIXER_SIZE(width, height));
++	regmap_write(regs, base + SUN50I_FMT_SWAP, 0);
++	regmap_write(regs, base + SUN50I_FMT_DEPTH, is_10bit);
++	regmap_write(regs, base + SUN50I_FMT_FORMAT, colorspace);
++	regmap_write(regs, base + SUN50I_FMT_COEF, 0);
++
++	/* Like the vendor driver, only clamp when subsampling chroma. */
++	if (colorspace == SUN50I_FMT_CS_YUV444RGB) {
++		regmap_write(regs, base + SUN50I_FMT_LMT_Y,
++			     SUN50I_FMT_LIMIT_BYPASS);
++		regmap_write(regs, base + SUN50I_FMT_LMT_C0,
++			     SUN50I_FMT_LIMIT_BYPASS);
++		regmap_write(regs, base + SUN50I_FMT_LMT_C1,
++			     SUN50I_FMT_LIMIT_BYPASS);
++	} else {
++		regmap_write(regs, base + SUN50I_FMT_LMT_Y,
++			     SUN50I_FMT_LIMIT_Y);
++		regmap_write(regs, base + SUN50I_FMT_LMT_C0,
++			     SUN50I_FMT_LIMIT_C);
++		regmap_write(regs, base + SUN50I_FMT_LMT_C1,
++			     SUN50I_FMT_LIMIT_C);
++	}
++
++	/*
++	 * 8-bit RGB bypasses the formatter, which keeps the upper 8 bits of
++	 * the 10-bit pipeline. YUV and deep color output go through it.
++	 */
++	regmap_write(regs, base + SUN50I_FMT_CTRL, yuv || is_10bit);
++}
+diff --git a/drivers/gpu/drm/sun4i/sun50i_fmt.h b/drivers/gpu/drm/sun4i/sun50i_fmt.h
+new file mode 100644
+index 000000000..b94cc2de2
+--- /dev/null
++++ b/drivers/gpu/drm/sun4i/sun50i_fmt.h
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++/*
++ * Copyright (C) 2026 Jernej Skrabec <jernej.skrabec@gmail.com>
++ */
++
++#ifndef _SUN50I_FMT_H_
++#define _SUN50I_FMT_H_
++
++#include "sun8i_mixer.h"
++
++/* offset of the formatter in the per-display register region of DE33 */
++#define SUN50I_FMT_DE33		0x5000
++
++#define SUN50I_FMT_CTRL		0x00
++#define SUN50I_FMT_SIZE		0x04
++#define SUN50I_FMT_SWAP		0x08
++#define SUN50I_FMT_DEPTH	0x0c
++#define SUN50I_FMT_FORMAT	0x10
++#define SUN50I_FMT_COEF		0x14
++#define SUN50I_FMT_LMT_Y	0x20
++#define SUN50I_FMT_LMT_C0	0x24
++#define SUN50I_FMT_LMT_C1	0x28
++
++#define SUN50I_FMT_CS_YUV444RGB	0
++#define SUN50I_FMT_CS_YUV422	1
++#define SUN50I_FMT_CS_YUV420	2
++
++/*
++ * Clamp values for the RGB/YUV444 bypass case and the YUV422/YUV420
++ * subsampling case, taken verbatim from the vendor driver. They are
++ * the same for 8-bit and 10-bit output, so the formatter clamps in a
++ * fixed 12-bit internal precision rather than the output width.
++ */
++#define SUN50I_FMT_LIMIT_BYPASS	0x0fff0000
++#define SUN50I_FMT_LIMIT_Y	0x0eb00100
++#define SUN50I_FMT_LIMIT_C	0x0f000100
++
++void sun50i_fmt_setup(struct sun8i_mixer *mixer, u16 width,
++		      u16 height, u32 format);
++
++#endif /* _SUN50I_FMT_H_ */
+diff --git a/drivers/gpu/drm/sun4i/sun50i_wb.c b/drivers/gpu/drm/sun4i/sun50i_wb.c
+index 82fb2ec02..a7de6eb55 100644
+--- a/drivers/gpu/drm/sun4i/sun50i_wb.c
++++ b/drivers/gpu/drm/sun4i/sun50i_wb.c
+@@ -448,15 +448,26 @@ static void sun50i_wb_job_scaler(struct sun50i_wb_job *job,
+ }
+ 
+ /*
+- * The blender works in RGB, or in BT.601 limited-range YCbCr on the TV
+- * encoder path (sun50i_mixer_set_output_yuv()). Convert when the output
+- * format is in the other space.
++ * The blender works in RGB, in BT.601 limited-range YCbCr on the TV encoder
++ * path (sun50i_mixer_set_output_yuv()), or in limited-range YCbCr of the
++ * engine's encoding when a YUV output format was negotiated with the HDMI
++ * bridge. Convert when the output format is in the other space: RGB capture
++ * converts the blender output back to full range RGB, and YUV capture of
++ * RGB blender output is BT.601 limited range, as before. YUV capture of YUV
++ * blender output is stored verbatim, in the blender output encoding.
+  */
+ static void sun50i_wb_job_csc(struct sun50i_wb_job *job,
+ 			      const struct drm_format_info *format)
+ {
++	struct sunxi_engine *engine = &job->mixer->engine;
++	enum drm_color_encoding encoding = DRM_COLOR_YCBCR_BT601;
+ 	bool in_yuv = job->mixer->output_yuv;
+ 
++	if (!in_yuv && sunxi_engine_format_is_yuv(engine->format)) {
++		in_yuv = true;
++		encoding = engine->encoding;
++	}
++
+ 	if (format->format == DRM_FORMAT_XRGB2101010 ||
+ 	    in_yuv == format->is_yuv)
+ 		return;
+@@ -464,7 +475,7 @@ static void sun50i_wb_job_csc(struct sun50i_wb_job *job,
+ 	job->csc = true;
+ 	sun8i_de33_csc_get_table(format->is_yuv ? SUN8I_CSC_MODE_RGB2YUV :
+ 						  SUN8I_CSC_MODE_YUV2RGB,
+-				 job->csc_coeff);
++				 encoding, job->csc_coeff);
+ }
+ 
+ /* Stop and reset the unit (vendor de_wb_stop) and detach it from the mux. */
+diff --git a/drivers/gpu/drm/sun4i/sun8i_csc.c b/drivers/gpu/drm/sun4i/sun8i_csc.c
+index e31b0f633..87a3566f1 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_csc.c
++++ b/drivers/gpu/drm/sun4i/sun8i_csc.c
+@@ -134,49 +134,136 @@ void sun8i_de3_ccsc_init(struct regmap *map)
+ }
+ 
+ /*
+- * Conversions into limited range BT.601 YCbCr, the only output colour space
+- * the TV encoder accepts. Same layout as the yuv2rgb_de3 tables above.
++ * Conversions of full range RGB into limited range YCbCr of the given
++ * encoding. Same layout as the yuv2rgb_de3 tables above.
+  */
+-static const u32 rgb2yuv_de3[12] = {
+-	0x0000837A, 0x0001021D, 0x00003221, 0x00000040,
+-	0xFFFFB41C, 0xFFFF6B03, 0x0000E0E1, 0x00000200,
+-	0x0000E0E1, 0xFFFF43B1, 0xFFFFDB6E, 0x00000200,
++static const u32 rgb2yuv_de3[3][12] = {
++	[DRM_COLOR_YCBCR_BT601] = {
++		0x0000837A, 0x0001021D, 0x00003221, 0x00000040,
++		0xFFFFB41C, 0xFFFF6B03, 0x0000E0E1, 0x00000200,
++		0x0000E0E1, 0xFFFF43B1, 0xFFFFDB6E, 0x00000200,
++	},
++	[DRM_COLOR_YCBCR_BT709] = {
++		0x00005D7C, 0x00013A7C, 0x00001FBF, 0x00000040,
++		0xFFFFCC78, 0xFFFF52A7, 0x0000E0E1, 0x00000200,
++		0x0000E0E1, 0xFFFF33BE, 0xFFFFEB61, 0x00000200,
++	},
++	[DRM_COLOR_YCBCR_BT2020] = {
++		0x00007384, 0x00012A21, 0x00001A13, 0x00000040,
++		0xFFFFC133, 0xFFFF5DEC, 0x0000E0E1, 0x00000200,
++		0x0000E0E1, 0xFFFF3135, 0xFFFFEDEA, 0x00000200,
++	},
+ };
+ 
+-static const u32 yuv2yuv_de3[2][3][12] = {
++/*
++ * YCbCr encoding and range conversions, always into limited range.
++ * Indexed by input range, input encoding and output encoding.
++ */
++static const u32 yuv2yuv_de3[2][3][3][12] = {
+ 	[DRM_COLOR_YCBCR_LIMITED_RANGE] = {
+-		/* Identity, only used to swap the chroma planes of YVU formats */
+ 		[DRM_COLOR_YCBCR_BT601] = {
+-			0x00020000, 0x00000000, 0x00000000, 0x00000000,
+-			0x00000000, 0x00020000, 0x00000000, 0x00000000,
+-			0x00000000, 0x00000000, 0x00020000, 0x00000000,
++			[DRM_COLOR_YCBCR_BT601] = {
++				0x00020000, 0x00000000, 0x00000000, 0x00000000,
++				0x00000000, 0x00020000, 0x00000000, 0x00000000,
++				0x00000000, 0x00000000, 0x00020000, 0x00000000,
++			},
++			[DRM_COLOR_YCBCR_BT709] = {
++				0x00020000, 0xFFFFC4D7, 0xFFFF9589, 0xFFC00040,
++				0x00000000, 0x0002098B, 0x00003AAF, 0xFE000200,
++				0x00000000, 0x0000266D, 0x00020CF8, 0xFE000200,
++			},
++			[DRM_COLOR_YCBCR_BT2020] = {
++				0x00020000, 0xFFFFBFCE, 0xFFFFC5FF, 0xFFC00040,
++				0x00000000, 0x00020521, 0x00001F89, 0xFE000200,
++				0x00000000, 0x00002C87, 0x00020F07, 0xFE000200,
++			},
+ 		},
+ 		[DRM_COLOR_YCBCR_BT709] = {
+-			0x00020000, 0x000032D9, 0x00006226, 0xFFC00040,
+-			0x00000000, 0x0001FACE, 0xFFFFC759, 0xFE000200,
+-			0x00000000, 0xFFFFDAE7, 0x0001F780, 0xFE000200,
++			[DRM_COLOR_YCBCR_BT601] = {
++				0x00020000, 0x000032D9, 0x00006226, 0xFFC00040,
++				0x00000000, 0x0001FACE, 0xFFFFC759, 0xFE000200,
++				0x00000000, 0xFFFFDAE7, 0x0001F780, 0xFE000200,
++			},
++			[DRM_COLOR_YCBCR_BT709] = {
++				0x00020000, 0x00000000, 0x00000000, 0x00000000,
++				0x00000000, 0x00020000, 0x00000000, 0x00000000,
++				0x00000000, 0x00000000, 0x00020000, 0x00000000,
++			},
++			[DRM_COLOR_YCBCR_BT2020] = {
++				0x00020000, 0xFFFFF782, 0x00003036, 0xFFC00040,
++				0x00000000, 0x0001FD99, 0xFFFFE5CA, 0xFE000200,
++				0x00000000, 0x000005E4, 0x0002015A, 0xFE000200,
++			},
+ 		},
+ 		[DRM_COLOR_YCBCR_BT2020] = {
+-			0x00020000, 0x00003B03, 0x000034D2, 0xFFC00040,
+-			0x00000000, 0x0001FD8C, 0xFFFFE183, 0xFE000200,
+-			0x00000000, 0xFFFFD4F3, 0x0001F3FA, 0xFE000200,
++			[DRM_COLOR_YCBCR_BT601] = {
++				0x00020000, 0x00003B03, 0x000034D2, 0xFFC00040,
++				0x00000000, 0x0001FD8C, 0xFFFFE183, 0xFE000200,
++				0x00000000, 0xFFFFD4F3, 0x0001F3FA, 0xFE000200,
++			},
++			[DRM_COLOR_YCBCR_BT709] = {
++				0x00020000, 0x00000916, 0xFFFFD061, 0xFFC00040,
++				0x00000000, 0x0002021C, 0x00001A40, 0xFE000200,
++				0x00000000, 0xFFFFFA19, 0x0001FE5A, 0xFE000200,
++			},
++			[DRM_COLOR_YCBCR_BT2020] = {
++				0x00020000, 0x00000000, 0x00000000, 0x00000000,
++				0x00000000, 0x00020000, 0x00000000, 0x00000000,
++				0x00000000, 0x00000000, 0x00020000, 0x00000000,
++			},
+ 		},
+ 	},
+ 	[DRM_COLOR_YCBCR_FULL_RANGE] = {
+ 		[DRM_COLOR_YCBCR_BT601] = {
+-			0x0001B7B8, 0x00000000, 0x00000000, 0x00000040,
+-			0x00000000, 0x0001C1C2, 0x00000000, 0xFE000200,
+-			0x00000000, 0x00000000, 0x0001C1C2, 0xFE000200,
++			[DRM_COLOR_YCBCR_BT601] = {
++				0x0001B7B8, 0x00000000, 0x00000000, 0x00000040,
++				0x00000000, 0x0001C1C2, 0x00000000, 0xFE000200,
++				0x00000000, 0x00000000, 0x0001C1C2, 0xFE000200,
++			},
++			[DRM_COLOR_YCBCR_BT709] = {
++				0x0001B7B8, 0xFFFFCC08, 0xFFFFA27B, 0x00000040,
++				0x00000000, 0x0001CA24, 0x0000338D, 0xFE000200,
++				0x00000000, 0x000021C1, 0x0001CD26, 0xFE000200,
++			},
++			[DRM_COLOR_YCBCR_BT2020] = {
++				0x0001B7B8, 0xFFFFC79C, 0xFFFFCD0C, 0x00000040,
++				0x00000000, 0x0001C643, 0x00001BB4, 0xFE000200,
++				0x00000000, 0x0000271D, 0x0001CEF5, 0xFE000200,
++			},
+ 		},
+ 		[DRM_COLOR_YCBCR_BT709] = {
+-			0x0001B7B8, 0x00002CAB, 0x00005638, 0x00000040,
+-			0x00000000, 0x0001BD32, 0xFFFFCE3C, 0xFE000200,
+-			0x00000000, 0xFFFFDF6A, 0x0001BA4A, 0xFE000200,
++			[DRM_COLOR_YCBCR_BT601] = {
++				0x0001B7B8, 0x00002CAB, 0x00005638, 0x00000040,
++				0x00000000, 0x0001BD32, 0xFFFFCE3C, 0xFE000200,
++				0x00000000, 0xFFFFDF6A, 0x0001BA4A, 0xFE000200,
++			},
++			[DRM_COLOR_YCBCR_BT709] = {
++				0x0001B7B8, 0x00000000, 0x00000000, 0x00000040,
++				0x00000000, 0x0001C1C2, 0x00000000, 0xFE000200,
++				0x00000000, 0x00000000, 0x0001C1C2, 0xFE000200,
++			},
++			[DRM_COLOR_YCBCR_BT2020] = {
++				0x0001B7B8, 0xFFFFF88A, 0x00002A5A, 0x00000040,
++				0x00000000, 0x0001BFA5, 0xFFFFE8FA, 0xFE000200,
++				0x00000000, 0x0000052D, 0x0001C2F1, 0xFE000200,
++			},
+ 		},
+ 		[DRM_COLOR_YCBCR_BT2020] = {
+-			0x0001B7B8, 0x000033D6, 0x00002E66, 0x00000040,
+-			0x00000000, 0x0001BF9A, 0xFFFFE538, 0xFE000200,
+-			0x00000000, 0xFFFFDA2F, 0x0001B732, 0xFE000200,
++			[DRM_COLOR_YCBCR_BT601] = {
++				0x0001B7B8, 0x000033D6, 0x00002E66, 0x00000040,
++				0x00000000, 0x0001BF9A, 0xFFFFE538, 0xFE000200,
++				0x00000000, 0xFFFFDA2F, 0x0001B732, 0xFE000200,
++			},
++			[DRM_COLOR_YCBCR_BT709] = {
++				0x0001B7B8, 0x000007FB, 0xFFFFD62B, 0x00000040,
++				0x00000000, 0x0001C39D, 0x0000170F, 0xFE000200,
++				0x00000000, 0xFFFFFAD1, 0x0001C04F, 0xFE000200,
++			},
++			[DRM_COLOR_YCBCR_BT2020] = {
++				0x0001B7B8, 0x00000000, 0x00000000, 0x00000040,
++				0x00000000, 0x0001C1C2, 0x00000000, 0xFE000200,
++				0x00000000, 0x00000000, 0x0001C1C2, 0xFE000200,
++			},
+ 		},
+ 	},
+ };
+@@ -287,20 +374,20 @@ static void sun8i_de33_convert_table(const u32 *src, u32 *dst)
+ 
+ /*
+  * The register image the DE33 write-back unit's CSC takes (same layout as
+- * the layer CSC): full-range RGB to limited-range BT.601 YCbCr, which is
+- * what the blender itself produces when it works in YUV, or the inverse.
++ * the layer CSC): full-range RGB to limited-range YCbCr of @encoding, the
++ * inverse, or the identity.
+  */
+-void sun8i_de33_csc_get_table(enum sun8i_csc_mode mode, u32 *dst)
++void sun8i_de33_csc_get_table(enum sun8i_csc_mode mode,
++			      enum drm_color_encoding encoding, u32 *dst)
+ {
+ 	const u32 *table;
+ 
+ 	switch (mode) {
+ 	case SUN8I_CSC_MODE_RGB2YUV:
+-		table = rgb2yuv_de3;
++		table = rgb2yuv_de3[encoding];
+ 		break;
+ 	case SUN8I_CSC_MODE_YUV2RGB:
+-		table = yuv2rgb_de3[DRM_COLOR_YCBCR_LIMITED_RANGE]
+-				   [DRM_COLOR_YCBCR_BT601];
++		table = yuv2rgb_de3[DRM_COLOR_YCBCR_LIMITED_RANGE][encoding];
+ 		break;
+ 	default:
+ 		table = identity_de3;
+@@ -313,7 +400,8 @@ void sun8i_de33_csc_get_table(enum sun8i_csc_mode mode, u32 *dst)
+ static void sun8i_de33_ccsc_setup(struct regmap *map, int layer,
+ 				  enum sun8i_csc_mode mode,
+ 				  enum drm_color_encoding encoding,
+-				  enum drm_color_range range)
++				  enum drm_color_range range,
++				  enum drm_color_encoding out_encoding)
+ {
+ 	u32 addr, val, base, csc[15];
+ 	const u32 *table;
+@@ -321,11 +409,11 @@ static void sun8i_de33_ccsc_setup(struct regmap *map, int layer,
+ 
+ 	switch (mode) {
+ 	case SUN8I_CSC_MODE_RGB2YUV:
+-		table = rgb2yuv_de3;
++		table = rgb2yuv_de3[out_encoding];
+ 		break;
+ 	case SUN8I_CSC_MODE_YUV2YUV:
+ 	case SUN8I_CSC_MODE_YVU2YUV:
+-		table = yuv2yuv_de3[range][encoding];
++		table = yuv2yuv_de3[range][encoding][out_encoding];
+ 		break;
+ 	default:
+ 		table = yuv2rgb_de3[range][encoding];
+@@ -368,32 +456,48 @@ static void sun8i_de33_ccsc_setup(struct regmap *map, int layer,
+ 	regmap_write(map, SUN8I_CSC_CTRL(base), val);
+ }
+ 
++/*
++ * The colour space the blender works in. Only DE33 can blend in YUV: for
++ * the TV encoder (BT.601, sun50i_mixer_set_output_yuv()) and for a YUV
++ * output format negotiated with the HDMI bridge (the engine's encoding).
++ * Planes are converted into it by their channel CSC.
++ */
+ static bool sun8i_csc_output_is_yuv(struct sun8i_layer *layer,
+-				    struct drm_plane_state *state)
++				    struct drm_plane_state *state,
++				    enum drm_color_encoding *out_encoding)
+ {
+ 	struct sun4i_crtc *scrtc;
+ 	struct sun8i_mixer *mixer;
+ 
+-	/* Only DE33 can blend in YUV, see sun50i_mixer_set_output_yuv() */
+ 	if (layer->cfg->de_type != SUN8I_MIXER_DE33 || !state->crtc)
+ 		return false;
+ 
+ 	scrtc = drm_crtc_to_sun4i_crtc(state->crtc);
+ 	mixer = engine_to_sun8i_mixer(scrtc->engine);
+ 
+-	return mixer->output_yuv;
++	if (mixer->output_yuv) {
++		*out_encoding = DRM_COLOR_YCBCR_BT601;
++		return true;
++	}
++
++	*out_encoding = scrtc->engine->encoding;
++
++	return sunxi_engine_format_is_yuv(scrtc->engine->format);
+ }
+ 
+ static u32 sun8i_csc_get_mode(struct sun8i_layer *layer,
+-			      struct drm_plane_state *state)
++			      struct drm_plane_state *state,
++			      enum drm_color_encoding *out_encoding)
+ {
+ 	const struct drm_format_info *format;
+ 	bool yvu, output_yuv;
+ 
++	*out_encoding = DRM_COLOR_YCBCR_BT601;
++
+ 	if (!state->crtc || !state->visible)
+ 		return SUN8I_CSC_MODE_OFF;
+ 
+-	output_yuv = sun8i_csc_output_is_yuv(layer, state);
++	output_yuv = sun8i_csc_output_is_yuv(layer, state, out_encoding);
+ 
+ 	format = state->fb->format;
+ 	if (!format->is_yuv)
+@@ -414,8 +518,8 @@ static u32 sun8i_csc_get_mode(struct sun8i_layer *layer,
+ 	if (!output_yuv)
+ 		return yvu ? SUN8I_CSC_MODE_YVU2RGB : SUN8I_CSC_MODE_YUV2RGB;
+ 
+-	/* The output is limited range BT.601, pass matching planes through */
+-	if (!yvu && state->color_encoding == DRM_COLOR_YCBCR_BT601 &&
++	/* The output is limited range YCbCr, pass matching planes through */
++	if (!yvu && state->color_encoding == *out_encoding &&
+ 	    state->color_range == DRM_COLOR_YCBCR_LIMITED_RANGE)
+ 		return SUN8I_CSC_MODE_OFF;
+ 
+@@ -425,7 +529,8 @@ static u32 sun8i_csc_get_mode(struct sun8i_layer *layer,
+ void sun8i_csc_config(struct sun8i_layer *layer,
+ 		      struct drm_plane_state *state)
+ {
+-	u32 mode = sun8i_csc_get_mode(layer, state);
++	enum drm_color_encoding out_encoding;
++	u32 mode = sun8i_csc_get_mode(layer, state, &out_encoding);
+ 	u32 base;
+ 
+ 	if (layer->cfg->de_type == SUN8I_MIXER_DE3) {
+@@ -436,7 +541,7 @@ void sun8i_csc_config(struct sun8i_layer *layer,
+ 	} else if (layer->cfg->de_type == SUN8I_MIXER_DE33) {
+ 		sun8i_de33_ccsc_setup(layer->regs, layer->channel,
+ 				      mode, state->color_encoding,
+-				      state->color_range);
++				      state->color_range, out_encoding);
+ 		return;
+ 	}
+ 
+diff --git a/drivers/gpu/drm/sun4i/sun8i_csc.h b/drivers/gpu/drm/sun4i/sun8i_csc.h
+index cf7f048bd..788812cd6 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_csc.h
++++ b/drivers/gpu/drm/sun4i/sun8i_csc.h
+@@ -43,6 +43,7 @@ void sun8i_csc_config(struct sun8i_layer *layer,
+ void sun8i_de3_ccsc_init(struct regmap *map);
+ /* DE33 CSC register image: 3 input constants and 3x4 coefficients */
+ #define SUN8I_DE33_CSC_TABLE_LEN	15
+-void sun8i_de33_csc_get_table(enum sun8i_csc_mode mode, u32 *dst);
++void sun8i_de33_csc_get_table(enum sun8i_csc_mode mode,
++			      enum drm_color_encoding encoding, u32 *dst);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+index 0f315c76a..74252819f 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -30,6 +30,7 @@
+ #include <drm/drm_vblank.h>
+ 
+ #include "sun4i_drv.h"
++#include "sun50i_fmt.h"
+ #include "sun50i_planes.h"
+ #include "sun50i_shadow.h"
+ #include "sun50i_wb.h"
+@@ -844,6 +845,25 @@ static void sun8i_mixer_mode_set(struct sunxi_engine *engine,
+ 
+ 	DRM_DEBUG_DRIVER("Switching display mixer interlaced mode %s\n",
+ 			 interlaced ? "on" : "off");
++
++	if (mixer->cfg->has_formatter)
++		sun50i_fmt_setup(mixer, mode->hdisplay, mode->vdisplay,
++				 engine->format);
++}
++
++static bool sun8i_mixer_format_valid(struct sunxi_engine *engine, u32 format)
++{
++	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
++
++	if (mixer->cfg->has_formatter &&
++	    (format == MEDIA_BUS_FMT_UYYVYY8_0_5X24 ||
++	     format == MEDIA_BUS_FMT_UYYVYY10_0_5X30 ||
++	     format == MEDIA_BUS_FMT_RGB101010_1X30 ||
++	     format == MEDIA_BUS_FMT_YUV8_1X24 ||
++	     format == MEDIA_BUS_FMT_YUV10_1X30))
++		return true;
++
++	return format == MEDIA_BUS_FMT_RGB888_1X24;
+ }
+ 
+ static void sun8i_mixer_vblank_quirk(struct sunxi_engine *engine,
+@@ -883,9 +903,11 @@ static const struct sunxi_engine_ops sun8i_engine_ops = {
+ 
+ /*
+  * DE33 has no CSC stage after the blender. YUV output is obtained by
+- * blending in YUV space and having every layer CSC convert into it, so
+- * record the request here and let the layers pick it up on their next
+- * update (see sun8i_csc_config()).
++ * blending in YUV space and having every layer CSC convert into it (see
++ * sun8i_csc_config()). The TV encoder asks for BT.601 YUV here; a YUV
++ * output format negotiated with the HDMI bridge comes in engine->format.
++ * Either way the blender output space and the background colour follow,
++ * after sun8i_mixer_mode_set() has rewritten the output control.
+  */
+ static void sun50i_mixer_set_output_yuv(struct sunxi_engine *engine, bool yuv)
+ {
+@@ -899,12 +921,11 @@ static void sun50i_mixer_set_output_yuv(struct sunxi_engine *engine, bool yuv)
+ 		return;
+ 	}
+ 
+-	if (mixer->output_yuv == yuv)
+-		return;
++	mixer->output_yuv = yuv;
++	yuv |= sunxi_engine_format_is_yuv(engine->format);
+ 
+-	DRM_DEBUG_DRIVER("Switching mixer output to %s\n", yuv ? "YUV" : "RGB");
++	DRM_DEBUG_DRIVER("Mixer output is %s\n", yuv ? "YUV" : "RGB");
+ 
+-	mixer->output_yuv = yuv;
+ 	black = yuv ? SUN50I_MIXER_BLEND_COLOR_BLACK_YUV :
+ 		      SUN8I_MIXER_BLEND_COLOR_BLACK;
+ 
+@@ -935,6 +956,7 @@ static const struct sunxi_engine_ops sun50i_engine_ops = {
+ 	.vblank_quirk		= sun50i_mixer_vblank_quirk,
+ 	.hold_event		= sun50i_mixer_hold_event,
+ 	.drain			= sun50i_mixer_drain,
++	.format_valid		= sun8i_mixer_format_valid,
+ };
+ 
+ static const struct regmap_config sun8i_mixer_regmap_config = {
+@@ -1083,6 +1105,9 @@ static int sun8i_mixer_bind(struct device *dev, struct device *master,
+ 	/* v35x DE (RCQ) needs a device for clk/dma/irq */
+ 	mixer->dev = dev;
+ 	mixer->engine.node = dev->of_node;
++	/* default output format, supported by all mixers */
++	mixer->engine.format = MEDIA_BUS_FMT_RGB888_1X24;
++	mixer->engine.encoding = DRM_COLOR_YCBCR_BT709;
+ 	mixer->drv = drv;
+ 
+ 	/*
+@@ -1593,6 +1618,7 @@ static const struct sun8i_mixer_cfg sun50i_h6_mixer0_cfg = {
+ static const struct sun8i_mixer_cfg sun50i_h616_mixer0_cfg = {
+ 	.de_type	= SUN8I_MIXER_DE33,
+ 	.mod_rate	= 600000000,
++	.has_formatter	= 1,
+ };
+ 
+ /*
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.h b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+index 37e2876ff..f4959f230 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+@@ -264,6 +264,8 @@ struct sun8i_mixer_cfg {
+ 	unsigned long		mod_rate;
+ 	/* v35x DE commits the pipeline via the RCQ DMA, not plain MMIO */
+ 	bool			uses_rcq;
++	/* formatter block, needed for YUV 4:2:0 and 10-bit output */
++	unsigned int		has_formatter : 1;
+ };
+ 
+ struct sun8i_mixer {
+diff --git a/drivers/gpu/drm/sun4i/sunxi_engine.h b/drivers/gpu/drm/sun4i/sunxi_engine.h
+index 930eb3697..1dfbc506e 100644
+--- a/drivers/gpu/drm/sun4i/sunxi_engine.h
++++ b/drivers/gpu/drm/sun4i/sunxi_engine.h
+@@ -6,6 +6,11 @@
+ #ifndef _SUNXI_ENGINE_H_
+ #define _SUNXI_ENGINE_H_
+ 
++#include <linux/media-bus-format.h>
++#include <linux/types.h>
++
++#include <drm/drm_color_mgmt.h>
++
+ struct drm_plane;
+ struct drm_crtc;
+ struct drm_device;
+@@ -155,6 +160,17 @@ struct sunxi_engine_ops {
+ 	 * This function is optional.
+ 	 */
+ 	void (*drain)(struct sunxi_engine *engine);
++
++	/**
++	 * @format_valid:
++	 *
++	 * This callback checks if the engine supports given output
++	 * media bus format. It is used for bridge format negotiation.
++	 *
++	 * This function is optional. When it is not implemented, only
++	 * MEDIA_BUS_FMT_RGB888_1X24 is considered supported.
++	 */
++	bool (*format_valid)(struct sunxi_engine *engine, u32 format);
+ };
+ 
+ /**
+@@ -163,6 +179,9 @@ struct sunxi_engine_ops {
+  * @node:	the of device node of the engine
+  * @regs:	the regmap of the engine
+  * @id:		the id of the engine (-1 if not used)
++ * @format:	the output media bus format of the engine
++ * @encoding:	the output YCbCr encoding of the engine, meaningless
++ *		when @format is RGB
+  * @list:	engine list management
+  */
+ struct sunxi_engine {
+@@ -172,6 +191,8 @@ struct sunxi_engine {
+ 	struct regmap			*regs;
+ 
+ 	int id;
++	u32 format;
++	enum drm_color_encoding encoding;
+ 
+ 	struct list_head		list;
+ };
+@@ -290,4 +311,33 @@ sunxi_engine_mode_set(struct sunxi_engine *engine,
+ 	if (engine->ops && engine->ops->mode_set)
+ 		engine->ops->mode_set(engine, mode);
+ }
++
++/**
++ * sunxi_engine_format_valid - Check if engine supports output format
++ * @engine:	pointer to the engine
++ * @format:	output media bus format
++ */
++static inline bool
++sunxi_engine_format_valid(struct sunxi_engine *engine, u32 format)
++{
++	if (engine->ops && engine->ops->format_valid)
++		return engine->ops->format_valid(engine, format);
++
++	return format == MEDIA_BUS_FMT_RGB888_1X24;
++}
++
++/**
++ * sunxi_engine_format_is_yuv - Check if an output format is YUV
++ * @format:	output media bus format
++ *
++ * Engines only ever output RGB, YUV 4:4:4 or YUV 4:2:0, so anything else
++ * is RGB.
++ */
++static inline bool sunxi_engine_format_is_yuv(u32 format)
++{
++	return format == MEDIA_BUS_FMT_YUV8_1X24 ||
++	       format == MEDIA_BUS_FMT_YUV10_1X30 ||
++	       format == MEDIA_BUS_FMT_UYYVYY8_0_5X24 ||
++	       format == MEDIA_BUS_FMT_UYYVYY10_0_5X30;
++}
+ #endif /* _SUNXI_ENGINE_H_ */
