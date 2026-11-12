@@ -1,0 +1,66 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 12 Nov 2026 13:00:00 +0000
+Subject: media: cedrus: AVS2: write the weighting quantization matrices in
+ the engine order
+
+The driver copied the 4x4 and 8x8 weighting quantization matrices into
+the entry point buffer in raster scan order, as the vendor library
+does. The engine does not read them that way: changing one table byte
+at a time and decoding an intra picture shows that it reads each matrix
+in bands of four rows, each band as a run of column pairs, each column
+pair as four rows of two bytes. Pictures with weighting quantization
+therefore decoded with the weights at the wrong frequencies, and none
+of them matched another decoder applying the weights.
+
+Reorder the matrices when writing the table. Flat matrices (weighting
+quantization off) are not affected.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+  .../staging/media/sunxi/cedrus/cedrus_avs2.c  | 20 +++++++++++++++++--
+  1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c b/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
+index 7cccc2c..1394c55 100644
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_avs2.c
+@@ -52,6 +52,11 @@ struct cedrus_avs2_alf_table {
+ 	u8	region[8];
+ } __packed;
+ 
++/*
++ * The engine reads each matrix in bands of four rows. A band holds the
++ * column pairs one after the other, and a column pair holds its four rows
++ * as two bytes each (left column first). See cedrus_avs2_copy_wqm().
++ */
+ struct cedrus_avs2_wqm_table {
+ 	u8	matrix_4x4[16];
+ 	u8	matrix_8x8[64];
+@@ -380,12 +385,23 @@ static void cedrus_avs2_write_alf_table(const struct v4l2_ctrl_avs2_alf *alf,
+ 				 (alf->luma_region_filter[2 * i + 1] << 4);
+ }
+ 
++/* Copy an n x n matrix from raster scan order to the engine order. */
++static void cedrus_avs2_copy_wqm(u8 *dst, const u8 *src, unsigned int n)
++{
++	unsigned int x, y;
++
++	for (y = 0; y < n; y++)
++		for (x = 0; x < n; x++)
++			dst[(y / 4) * 4 * n + (x / 2) * 8 + (y % 4) * 2 + x % 2] =
++				src[y * n + x];
++}
++
+ static void cedrus_avs2_write_wqm_table(const struct v4l2_ctrl_avs2_weight_quant *wq,
+ 					struct cedrus_avs2_wqm_table *tbl)
+ {
+ 	if (wq) {
+-		memcpy(tbl->matrix_4x4, wq->matrix_4x4, sizeof(tbl->matrix_4x4));
+-		memcpy(tbl->matrix_8x8, wq->matrix_8x8, sizeof(tbl->matrix_8x8));
++		cedrus_avs2_copy_wqm(tbl->matrix_4x4, wq->matrix_4x4, 4);
++		cedrus_avs2_copy_wqm(tbl->matrix_8x8, wq->matrix_8x8, 8);
+ 	} else {
+ 		memset(tbl, 64, sizeof(*tbl));
+ 	}
