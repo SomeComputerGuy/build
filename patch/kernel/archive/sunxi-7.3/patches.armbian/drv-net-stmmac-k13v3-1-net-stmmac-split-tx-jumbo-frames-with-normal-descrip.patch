@@ -22,9 +22,8 @@ set enh_desc either, and must not take this path.
 jumbo_frm() only splits the linear part of a frame and marks its last
 descriptor as the last segment, so in chain mode linearize longer frames
 that have fragments; this also keeps every fragment within one
-descriptor. On dwmac-sun8i this path is only reached by frames of 2033
-to 2040 bytes at MTU 2018, which carry VLAN tags; above MTU 2018,
-scatter-gather is off together with checksum offload.
+descriptor. On dwmac-sun8i this path is not reached: scatter-gather is
+off above MTU 1500, together with TX checksum offload.
 
 As a frame now often spans several descriptors, set the OWN bit of the
 first one after a dma_wmb(), as enh_desc_prepare_tx_desc() does.
