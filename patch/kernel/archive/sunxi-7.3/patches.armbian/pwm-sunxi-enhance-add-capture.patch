@@ -1,0 +1,326 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0000
+Subject: pwm: sunxi-enhance: Add input capture
+
+Each H616 PWM channel can capture an input signal (H616 user manual v1.0,
+9.9.3.9): on rising and falling edges the counter value is latched into
+PWM_CRLR/PWM_CFLR and the capture interrupt of the channel is raised.
+The driver has no capture support.
+
+Implement the .capture operation with the PWM interrupt: enable the
+rising edge interrupt, then the falling one after the first rising
+edge, and take the high time from the falling edge and the low time
+from the next rising edge. A first pass with the largest prescaler finds
+the range of the signal, a second pass uses the smallest prescaler that
+does not overflow the 16-bit counter. A channel that is generating PWM
+output cannot capture and returns -EBUSY; without an interrupt in the
+devicetree capture returns -EOPNOTSUPP.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+
+--- a/drivers/pwm/pwm-sunxi-enhance.c
++++ b/drivers/pwm/pwm-sunxi-enhance.c
+@@ -30,6 +30,10 @@
+ #include <linux/io.h>
+ #include <linux/clk.h>
+ #include <linux/reset.h>
++#include <linux/completion.h>
++#include <linux/interrupt.h>
++#include <linux/ktime.h>
++#include <linux/spinlock.h>
+ #include "pwm-sunxi-enhance.h"
+ 
+ #define PWM_NUM_MAX 4
+@@ -60,6 +64,20 @@
+     unsigned int clk_bypass_output;
+ };
+ 
++/* state of one capture measurement, shared with the interrupt handler */
++struct sunxi_pwm_capture_state
++{
++    spinlock_t lock;
++    struct completion done;
++    int channel;
++    /* 0: wait for a rising edge, 1: falling edge, 2: rising edge, 3: done */
++    unsigned int stage;
++    int error;
++    u32 high;
++    u32 low;
++    ktime_t edge[3];
++};
++
+ struct sunxi_pwm_chip
+ {
+     void __iomem *base;
+@@ -67,6 +85,8 @@
+     struct clk *bus_clk;
+     struct clk *clk;
+     struct reset_control *pwm_rst_clk;
++    int irq;
++    struct sunxi_pwm_capture_state cap;
+ };
+ 
+ static inline struct sunxi_pwm_chip *to_sunxi_pwm_chip(struct pwm_chip *chip)
+@@ -987,8 +1007,232 @@
+ 	return err;
+ }
+ 
++/*
++ * Capture input.
++ *
++ * With its rise (fall) interrupt enabled, a capture channel latches its
++ * 16-bit up-counter into CRLR (CFLR) on a rising (falling) edge of the pin
++ * and restarts the counter from zero. After a first rising edge, the
++ * falling edge therefore latches the high time and the next rising edge
++ * the low time, in counter clock cycles. The counter clock is the clock of
++ * the channel pair (PCCR: source and DIV_M, shared with the other channel
++ * of the pair and left alone here) divided by the channel's own prescaler
++ * PWM_PRESCAL_K + 1.
++ */
++#define PWM_CAP_RISE(ch)	BIT(2 * (ch))
++#define PWM_CAP_FALL(ch)	BIT(2 * (ch) + 1)
++#define PWM_CCR_CRLF		BIT(2)
++#define PWM_CCR_CFLF		BIT(1)
++#define PWM_CAP_CNT_MAX		0xffff
++/* aim for at most this many counts per phase in the fine measurement */
++#define PWM_CAP_CNT_TARGET	60000
++
++static irqreturn_t sunxi_pwm_irq(int irq, void *dev_id)
++{
++    struct pwm_chip *chip = dev_id;
++    struct sunxi_pwm_chip *pc = to_sunxi_pwm_chip(chip);
++    struct sunxi_pwm_capture_state *cap = &pc->cap;
++    u32 cisr, ccr, ch_bits;
++    int ch;
++
++    spin_lock(&cap->lock);
++    cisr = sunxi_pwm_readl(chip, PWM_CISR);
++    ch = cap->channel;
++    if (ch < 0)
++    {
++        /* nothing is being captured: acknowledge and ignore */
++        sunxi_pwm_writel(chip, PWM_CISR, cisr);
++        spin_unlock(&cap->lock);
++        return cisr ? IRQ_HANDLED : IRQ_NONE;
++    }
++
++    ch_bits = cisr & (PWM_CAP_RISE(ch) | PWM_CAP_FALL(ch));
++    sunxi_pwm_writel(chip, PWM_CISR, cisr);
++    ccr = PWM_CCR_BASE + 0x20 * ch;
++
++    if (ch_bits == (PWM_CAP_RISE(ch) | PWM_CAP_FALL(ch)) && cap->stage > 0)
++    {
++        /* both edges since the last interrupt: the input is too fast */
++        cap->error = -ERANGE;
++        cap->stage = 3;
++    }
++    else if ((ch_bits & PWM_CAP_RISE(ch)) && cap->stage == 0)
++    {
++        /* first rising edge: the counter restarts, now catch the fall */
++        cap->edge[0] = ktime_get();
++        cap->stage = 1;
++        sunxi_pwm_writel(chip, ccr, PWM_CCR_CRLF | PWM_CCR_CFLF);
++        sunxi_pwm_writel(chip, PWM_CIER,
++                         sunxi_pwm_readl(chip, PWM_CIER) | PWM_CAP_FALL(ch));
++    }
++    else if ((ch_bits & PWM_CAP_FALL(ch)) && cap->stage == 1)
++    {
++        cap->edge[1] = ktime_get();
++        cap->high = sunxi_pwm_readl(chip, PWM_CFLR_BASE + 0x20 * ch) &
++                    PWM_CAP_CNT_MAX;
++        cap->stage = 2;
++        sunxi_pwm_writel(chip, ccr, PWM_CCR_CFLF);
++    }
++    else if ((ch_bits & PWM_CAP_RISE(ch)) && cap->stage == 2)
++    {
++        cap->edge[2] = ktime_get();
++        cap->low = sunxi_pwm_readl(chip, PWM_CRLR_BASE + 0x20 * ch) &
++                   PWM_CAP_CNT_MAX;
++        cap->stage = 3;
++        sunxi_pwm_writel(chip, ccr, PWM_CCR_CRLF);
++    }
++
++    if (cap->stage == 3)
++    {
++        sunxi_pwm_writel(chip, PWM_CIER, sunxi_pwm_readl(chip, PWM_CIER) &
++                         ~(PWM_CAP_RISE(ch) | PWM_CAP_FALL(ch)));
++        complete(&cap->done);
++    }
++    spin_unlock(&cap->lock);
++
++    return IRQ_HANDLED;
++}
++
++/* one high/low measurement with the channel prescaler set to @k (1..256) */
++static int sunxi_pwm_capture_once(struct pwm_chip *chip, unsigned int ch,
++                                  unsigned int k, unsigned long deadline)
++{
++    struct sunxi_pwm_chip *pc = to_sunxi_pwm_chip(chip);
++    struct sunxi_pwm_capture_state *cap = &pc->cap;
++    u32 pcr = PWM_PCR_BASE + 0x20 * ch;
++    long left;
++    int ret;
++
++    sunxi_pwm_writel(chip, pcr,
++                     SET_BITS(PWM_PRESCAL_SHIFT, PWM_PRESCAL_WIDTH,
++                              sunxi_pwm_readl(chip, pcr), (k - 1)));
++
++    spin_lock_irq(&cap->lock);
++    reinit_completion(&cap->done);
++    cap->channel = ch;
++    cap->stage = 0;
++    cap->error = 0;
++    /* no inversion, clear stale lock flags and pending interrupts */
++    sunxi_pwm_writel(chip, PWM_CCR_BASE + 0x20 * ch,
++                     PWM_CCR_CRLF | PWM_CCR_CFLF);
++    sunxi_pwm_writel(chip, PWM_CISR, PWM_CAP_RISE(ch) | PWM_CAP_FALL(ch));
++    sunxi_pwm_writel(chip, PWM_CIER, (sunxi_pwm_readl(chip, PWM_CIER) &
++                     ~PWM_CAP_FALL(ch)) | PWM_CAP_RISE(ch));
++    sunxi_pwm_writel(chip, PWM_CER, sunxi_pwm_readl(chip, PWM_CER) | BIT(ch));
++    spin_unlock_irq(&cap->lock);
++
++    left = deadline - jiffies;
++    wait_for_completion_timeout(&cap->done, left > 0 ? left : 1);
++
++    spin_lock_irq(&cap->lock);
++    sunxi_pwm_writel(chip, PWM_CIER, sunxi_pwm_readl(chip, PWM_CIER) &
++                     ~(PWM_CAP_RISE(ch) | PWM_CAP_FALL(ch)));
++    sunxi_pwm_writel(chip, PWM_CER, sunxi_pwm_readl(chip, PWM_CER) & ~BIT(ch));
++    sunxi_pwm_writel(chip, PWM_CISR, PWM_CAP_RISE(ch) | PWM_CAP_FALL(ch));
++    ret = cap->stage == 3 ? cap->error : -ETIMEDOUT;
++    cap->channel = -1;
++    spin_unlock_irq(&cap->lock);
++
++    return ret;
++}
++
++static int sunxi_pwm_capture(struct pwm_chip *chip, struct pwm_device *pwm,
++                             struct pwm_capture *result, unsigned long timeout)
++{
++    struct sunxi_pwm_chip *pc = to_sunxi_pwm_chip(chip);
++    struct sunxi_pwm_capture_state *cap = &pc->cap;
++    unsigned int ch = pwm->hwpwm, k, k_saved;
++    unsigned long deadline = jiffies + msecs_to_jiffies(timeout);
++    u32 pccr_off, pccr, pcr, cnt;
++    struct device_node *sub_np;
++    struct platform_device *pwm_pdevice;
++    u64 rate, ns_high, ns_low, max_ns;
++    bool gated;
++    int ret;
++
++    if (pc->irq <= 0)
++        return -EOPNOTSUPP;
++
++    /* the pin is either an output or a capture input */
++    if (sunxi_pwm_readl(chip, PWM_PER) & BIT(ch))
++        return -EBUSY;
++
++    sub_np = of_parse_phandle(pwmchip_parent(chip)->of_node, "sunxi-pwms", ch);
++    if (!sub_np)
++        return -ENODEV;
++    pwm_pdevice = of_find_device_by_node(sub_np);
++    of_node_put(sub_np);
++    if (!pwm_pdevice)
++        return -ENODEV;
++    ret = sunxi_pwm_pin_set_state(&pwm_pdevice->dev, PWM_PIN_STATE_ACTIVE);
++    put_device(&pwm_pdevice->dev);
++    if (ret)
++        return ret;
++
++    get_pccr_reg_offset(ch, &pccr_off);
++    pccr = sunxi_pwm_readl(chip, pccr_off);
++    gated = !GET_BITS(PWM_CLK_GATING_SHIFT, 1, pccr);
++    if (gated)
++        sunxi_pwm_writel(chip, pccr_off,
++                         SET_BITS(PWM_CLK_GATING_SHIFT, 1, pccr, 1));
++    /* clock source 0: OSC24M, 1: APB1 (100 MHz); then DIV_M: 2^n */
++    rate = GET_BITS(PWM_CLK_SRC_SHIFT, PWM_CLK_SRC_WIDTH, pccr) ?
++           100000000 : 24000000;
++    rate >>= GET_BITS(PWM_DIV_M_SHIFT, PWM_DIV_M_WIDTH, pccr);
++
++    pcr = PWM_PCR_BASE + 0x20 * ch;
++    k_saved = GET_BITS(PWM_PRESCAL_SHIFT, PWM_PRESCAL_WIDTH,
++                       sunxi_pwm_readl(chip, pcr)) + 1;
++
++    /*
++     * Coarse measurement at the slowest counter clock. A phase longer
++     * than the 16-bit counter wraps it; the interrupt timestamps catch
++     * that.
++     */
++    k = PRESCALE_MAX;
++    ret = sunxi_pwm_capture_once(chip, ch, k, deadline);
++    if (ret)
++        goto out;
++    max_ns = div64_u64((u64)PWM_CAP_CNT_MAX * k * NSEC_PER_SEC, rate);
++    if (ktime_to_ns(ktime_sub(cap->edge[1], cap->edge[0])) > max_ns ||
++        ktime_to_ns(ktime_sub(cap->edge[2], cap->edge[1])) > max_ns)
++    {
++        ret = -ERANGE;
++        goto out;
++    }
++
++    /* fine measurement with the smallest prescaler that cannot wrap */
++    cnt = max(cap->high, cap->low) + 1;
++    k = DIV_ROUND_UP(cnt * PRESCALE_MAX, PWM_CAP_CNT_TARGET);
++    k = clamp_t(unsigned int, k, 1, PRESCALE_MAX);
++    if (k < PRESCALE_MAX)
++    {
++        ret = sunxi_pwm_capture_once(chip, ch, k, deadline);
++        if (ret)
++            goto out;
++    }
++
++    ns_high = div64_u64((u64)cap->high * k * NSEC_PER_SEC, rate);
++    ns_low = div64_u64((u64)cap->low * k * NSEC_PER_SEC, rate);
++    result->period = ns_high + ns_low;
++    result->duty_cycle = ns_high;
++
++out:
++    sunxi_pwm_writel(chip, pcr,
++                     SET_BITS(PWM_PRESCAL_SHIFT, PWM_PRESCAL_WIDTH,
++                              sunxi_pwm_readl(chip, pcr), (k_saved - 1)));
++    if (gated)
++    {
++        pccr = sunxi_pwm_readl(chip, pccr_off);
++        sunxi_pwm_writel(chip, pccr_off,
++                         SET_BITS(PWM_CLK_GATING_SHIFT, 1, pccr, 0));
++    }
++    return ret;
++}
++
+ static const struct pwm_ops sunxi_pwm_ops = {
+ 	.apply = sunxi_pwm_apply,
++	.capture = sunxi_pwm_capture,
+ };
+ 
+ static int sunxi_pwm_probe(struct platform_device *pdev)
+@@ -1039,6 +1283,23 @@
+     chip->dev.parent = &pdev->dev;
+     chip->ops = &sunxi_pwm_ops;
+ 
++    /* capture input interrupt (optional: no capture without it) */
++    spin_lock_init(&pwm->cap.lock);
++    init_completion(&pwm->cap.done);
++    pwm->cap.channel = -1;
++    pwm->irq = platform_get_irq_optional(pdev, 0);
++    if (pwm->irq > 0)
++    {
++        ret = devm_request_irq(&pdev->dev, pwm->irq, sunxi_pwm_irq, 0,
++                               dev_name(&pdev->dev), chip);
++        if (ret)
++        {
++            dev_err(&pdev->dev, "failed to request irq %d: %d\n",
++                    pwm->irq, ret);
++            goto err_add;
++        }
++    }
++
+     /* add pwm chip to pwm-core */
+     ret = pwmchip_add(chip);
+     if (ret < 0)
+-- 
+Armbian
+

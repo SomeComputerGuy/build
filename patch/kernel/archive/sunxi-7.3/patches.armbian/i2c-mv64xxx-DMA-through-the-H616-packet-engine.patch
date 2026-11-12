@@ -1,0 +1,488 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 10 Nov 2026 12:00:00 +0000
+Subject: i2c: mv64xxx: Use DMA through the H616 TWI packet engine
+
+Next to the classic TWI engine, the H616 TWI has a master-only packet
+engine (TWI_DRV, H616 user manual v1.0, 9.1.6.10 to 9.1.6.19) that sends
+a whole transfer from a 32 byte FIFO and can be fed by DMA. The
+devicetree already gives each TWI its DMA request line.
+
+On allwinner,sun50i-h616-i2c controllers, request the "tx" and "rx" DMA
+channels and send through the packet engine and DMA the transfers it
+can handle that carry 32 data bytes or more: a single write, a single
+read, or a write of up to 32 register address bytes followed by a read
+from the same device with a repeated start. All other transfers, atomic
+transfers and target mode keep using the classic engine. The vendor
+driver uses the same engine and the same threshold. Without DMA
+channels the driver works as before.
+
+The packet engine reports a byte that is not acknowledged as status 0x01,
+"timeout when sending 9th SCL clk" (TIMEOUT_N SCL cycles without an ACK);
+it is reported as -ENXIO like a NAK on the classic engine. If SCL is
+still held low after both engines are reset and a STOP is sent, a target
+holds the clock and the transfer fails with -ETIMEDOUT instead.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+
+--- a/drivers/i2c/busses/i2c-mv64xxx.c
++++ b/drivers/i2c/busses/i2c-mv64xxx.c
+@@ -26,6 +26,10 @@
+ #include <linux/clk.h>
+ #include <linux/err.h>
+ #include <linux/delay.h>
++#include <linux/completion.h>
++#include <linux/dma-mapping.h>
++#include <linux/dmaengine.h>
++#include <linux/iopoll.h>
+ 
+ #define MV64XXX_I2C_BAUD_DIV_N(val)			(val & 0x7)
+ #define MV64XXX_I2C_BAUD_DIV_M(val)			((val & 0xf) << 3)
+@@ -110,6 +114,57 @@
+ /* Bridge Status values */
+ #define	MV64XXX_I2C_BRIDGE_STATUS_ERROR			BIT(0)
+ 
++/*
++ * Allwinner "TWI_DRV" packet engine (H616 UM 9.1.6.10-19): a master-only
++ * engine next to the classic one that sends a whole packet (address,
++ * register address bytes, data) from a 32-byte FIFO and can be fed by DMA.
++ */
++/* line control register: current state of SCL */
++#define	SUNXI_TWI_LCR					0x20
++#define	SUNXI_TWI_LCR_SCL_STATE				BIT(5)
++#define	SUNXI_TWI_DRV_CTRL				0x200
++#define	SUNXI_TWI_DRV_CFG				0x204
++#define	SUNXI_TWI_DRV_SLV				0x208
++#define	SUNXI_TWI_DRV_FMT				0x20c
++#define	SUNXI_TWI_DRV_BUS_CTRL				0x210
++#define	SUNXI_TWI_DRV_INT_CTRL				0x214
++#define	SUNXI_TWI_DRV_DMA_CFG				0x218
++#define	SUNXI_TWI_DRV_FIFO_CON				0x21c
++#define	SUNXI_TWI_DRV_SEND_FIFO				0x300
++#define	SUNXI_TWI_DRV_RECV_FIFO				0x304
++
++#define	SUNXI_TWI_DRV_CTRL_START			BIT(31)
++#define	SUNXI_TWI_DRV_CTRL_READ_MODE			BIT(28)
++#define	SUNXI_TWI_DRV_CTRL_STA(v)			(((v) >> 16) & 0xff)
++/* no ACK within TIMEOUT_N SCL cycles at the 9th clock of a byte */
++#define	SUNXI_TWI_DRV_STA_ACK_TIMEOUT			0x01
++#define	SUNXI_TWI_DRV_CTRL_TIMEOUT(n)			((n) << 8)
++#define	SUNXI_TWI_DRV_CTRL_SOFT_RESET			BIT(1)
++#define	SUNXI_TWI_DRV_CTRL_EN				BIT(0)
++#define	SUNXI_TWI_DRV_SLV_ID(addr)			((addr) << 9)
++#define	SUNXI_TWI_DRV_SLV_READ				BIT(8)
++#define	SUNXI_TWI_DRV_FMT_ADDR_BYTES(n)			((n) << 16)
++#define	SUNXI_TWI_DRV_BUS_CLK_DUTY_40			BIT(15)
++#define	SUNXI_TWI_DRV_BUS_CLK_N(n)			((n) << 12)
++#define	SUNXI_TWI_DRV_BUS_CLK_M(m)			((m) << 8)
++#define	SUNXI_TWI_DRV_INT_ERR_EN			BIT(17)
++#define	SUNXI_TWI_DRV_INT_COM_EN			BIT(16)
++#define	SUNXI_TWI_DRV_INT_PENDING			GENMASK(3, 0)
++#define	SUNXI_TWI_DRV_INT_ERR				BIT(1)
++#define	SUNXI_TWI_DRV_INT_COM				BIT(0)
++#define	SUNXI_TWI_DRV_DMA_RX_EN				BIT(24)
++#define	SUNXI_TWI_DRV_DMA_RX_TRIG(n)			((n) << 16)
++#define	SUNXI_TWI_DRV_DMA_TX_EN				BIT(8)
++#define	SUNXI_TWI_DRV_DMA_TX_TRIG(n)			(n)
++#define	SUNXI_TWI_DRV_FIFO_RECV_CLEAR			BIT(22)
++#define	SUNXI_TWI_DRV_FIFO_SEND_CLEAR			BIT(6)
++
++#define	SUNXI_TWI_DRV_FIFO_SIZE				32
++#define	SUNXI_TWI_DRV_DMA_BURST				16
++/* messages from this length on go through the packet engine and DMA */
++#define	SUNXI_TWI_DRV_DMA_MIN_LEN			32
++#define	SUNXI_TWI_DRV_MAX_LEN				0xffff
++
+ /* Driver states */
+ enum {
+ 	MV64XXX_I2C_STATE_INVALID,
+@@ -185,6 +240,12 @@
+ 	/* Allwinner variant: the engine can be addressed as a target */
+ 	bool			has_target;
+ 	struct i2c_client	*target;
++	/* Allwinner TWI_DRV packet engine with DMA */
++	struct dma_chan		*dma_tx;
++	struct dma_chan		*dma_rx;
++	bool			drv_active;
++	bool			drv_ack_timeout;
++	struct completion	dma_done;
+ };
+ 
+ static struct mv64xxx_i2c_regs mv64xxx_i2c_regs_mv64xxx = {
+@@ -721,6 +782,55 @@
+ 
+ 	spin_lock(&drv_data->lock);
+ 
++	if (drv_data->drv_active) {
++		u32 st = readl(drv_data->reg_base + SUNXI_TWI_DRV_INT_CTRL);
++		u32 ctrl, sta;
++
++		if (!(st & SUNXI_TWI_DRV_INT_PENDING)) {
++			spin_unlock(&drv_data->lock);
++			return IRQ_NONE;
++		}
++		/*
++		 * Latch the bus state of a failed packet before the pending
++		 * bits are cleared, which lets the engine go idle again.
++		 */
++		ctrl = readl(drv_data->reg_base + SUNXI_TWI_DRV_CTRL);
++		sta = SUNXI_TWI_DRV_CTRL_STA(ctrl);
++		/* write the pending bits back to clear them */
++		writel(st, drv_data->reg_base + SUNXI_TWI_DRV_INT_CTRL);
++		if (drv_data->block && (st & SUNXI_TWI_DRV_INT_ERR)) {
++			/*
++			 * A byte that is not acknowledged, as on the classic
++			 * engine. The packet engine reports it as a timeout at
++			 * the 9th clock of the byte (TIMEOUT_N SCL cycles
++			 * without an ACK); mv64xxx_i2c_dma_xfer() tells a
++			 * target that holds SCL low apart afterwards.
++			 */
++			if (sta == MV64XXX_I2C_STATUS_MAST_WR_ADDR_NO_ACK ||
++			    sta == MV64XXX_I2C_STATUS_MAST_WR_NO_ACK ||
++			    sta == MV64XXX_I2C_STATUS_MAST_RD_ADDR_NO_ACK) {
++				drv_data->rc = -ENXIO;
++			} else if (sta == SUNXI_TWI_DRV_STA_ACK_TIMEOUT) {
++				drv_data->rc = -ENXIO;
++				drv_data->drv_ack_timeout = true;
++			} else if (sta == MV64XXX_I2C_STATUS_MAST_LOST_ARB) {
++				drv_data->rc = -EAGAIN;
++			} else {
++				drv_data->rc = -EIO;
++				dev_warn_ratelimited(&drv_data->adapter.dev,
++						     "packet engine error: int 0x%08x ctrl 0x%08x status 0x%02x\n",
++						     st, ctrl, sta);
++			}
++			drv_data->block = 0;
++			wake_up(&drv_data->waitq);
++		} else if (drv_data->block && (st & SUNXI_TWI_DRV_INT_COM)) {
++			drv_data->block = 0;
++			wake_up(&drv_data->waitq);
++		}
++		spin_unlock(&drv_data->lock);
++		return IRQ_HANDLED;
++	}
++
+ 	if (drv_data->offload_enabled)
+ 		rc = mv64xxx_i2c_intr_offload(drv_data);
+ 
+@@ -946,6 +1056,257 @@
+ }
+ 
+ /*
++ * The TWI_DRV engine handles a single write, a single read, or a write of
++ * up to 32 register address bytes followed by a read from the same device
++ * with a repeated start. Use it, with DMA, for the long data phases only;
++ * everything else stays on the classic engine.
++ */
++static bool
++mv64xxx_i2c_can_dma(struct mv64xxx_i2c_data *drv_data)
++{
++	struct i2c_msg *msgs = drv_data->msgs;
++	struct i2c_msg *data_msg = &msgs[drv_data->num_msgs - 1];
++	int i;
++
++	if (!drv_data->dma_tx || !drv_data->dma_rx || drv_data->atomic ||
++	    drv_data->target)
++		return false;
++
++	if (drv_data->num_msgs < 1 || drv_data->num_msgs > 2)
++		return false;
++
++	for (i = 0; i < drv_data->num_msgs; i++)
++		if (msgs[i].flags & ~(I2C_M_RD | I2C_M_DMA_SAFE))
++			return false;
++
++	if (data_msg->len < SUNXI_TWI_DRV_DMA_MIN_LEN ||
++	    data_msg->len > SUNXI_TWI_DRV_MAX_LEN)
++		return false;
++
++	if (drv_data->num_msgs == 2 &&
++	    ((msgs[0].flags & I2C_M_RD) || !(msgs[1].flags & I2C_M_RD) ||
++	     msgs[0].addr != msgs[1].addr || !msgs[0].len ||
++	     msgs[0].len > SUNXI_TWI_DRV_FIFO_SIZE))
++		return false;
++
++	return true;
++}
++
++static void
++mv64xxx_i2c_dma_callback(void *arg)
++{
++	struct mv64xxx_i2c_data *drv_data = arg;
++
++	complete(&drv_data->dma_done);
++}
++
++static int
++mv64xxx_i2c_dma_xfer(struct mv64xxx_i2c_data *drv_data)
++{
++	struct i2c_msg *msgs = drv_data->msgs;
++	int num = drv_data->num_msgs;
++	struct i2c_msg *data_msg = &msgs[num - 1];
++	bool rd = data_msg->flags & I2C_M_RD;
++	struct dma_chan *chan = rd ? drv_data->dma_rx : drv_data->dma_tx;
++	enum dma_data_direction dir = rd ? DMA_FROM_DEVICE : DMA_TO_DEVICE;
++	struct dma_async_tx_descriptor *desc;
++	void __iomem *base = drv_data->reg_base;
++	u32 ctrl, fmt, bus, dma_cfg;
++	unsigned long flags;
++	dma_addr_t dma_addr;
++	long time_left;
++	u8 *buf;
++	int i, rc;
++
++	buf = i2c_get_dma_safe_msg_buf(data_msg, SUNXI_TWI_DRV_DMA_MIN_LEN);
++	if (!buf)
++		return -ENOMEM;
++
++	dma_addr = dma_map_single(chan->device->dev, buf, data_msg->len, dir);
++	if (dma_mapping_error(chan->device->dev, dma_addr)) {
++		i2c_put_dma_safe_msg_buf(buf, data_msg, false);
++		return -ENOMEM;
++	}
++
++	desc = dmaengine_prep_slave_single(chan, dma_addr, data_msg->len,
++					   rd ? DMA_DEV_TO_MEM : DMA_MEM_TO_DEV,
++					   DMA_PREP_INTERRUPT | DMA_CTRL_ACK);
++	if (!desc) {
++		rc = -ENOMEM;
++		goto out_unmap;
++	}
++	desc->callback = mv64xxx_i2c_dma_callback;
++	desc->callback_param = drv_data;
++	reinit_completion(&drv_data->dma_done);
++
++	/*
++	 * Packet: START, address + W, the register address bytes from the
++	 * FIFO, then for a read a repeated START, address + R and the data.
++	 * A single read sends no address + W phase at all. A single write
++	 * is sent as one address byte plus data, as the vendor driver does.
++	 */
++	ctrl = SUNXI_TWI_DRV_CTRL_EN | SUNXI_TWI_DRV_CTRL_TIMEOUT(0x10);
++	if (num == 2)
++		fmt = SUNXI_TWI_DRV_FMT_ADDR_BYTES(msgs[0].len) | data_msg->len;
++	else if (rd)
++		fmt = data_msg->len;
++	else
++		fmt = SUNXI_TWI_DRV_FMT_ADDR_BYTES(1) | (data_msg->len - 1);
++	if (num == 1 && rd)
++		ctrl |= SUNXI_TWI_DRV_CTRL_READ_MODE;
++	bus = SUNXI_TWI_DRV_BUS_CLK_N(drv_data->freq_n) |
++	      SUNXI_TWI_DRV_BUS_CLK_M(drv_data->freq_m);
++	if (drv_data->clk_duty_40)
++		bus |= SUNXI_TWI_DRV_BUS_CLK_DUTY_40;
++	dma_cfg = rd ? SUNXI_TWI_DRV_DMA_RX_EN |
++		       SUNXI_TWI_DRV_DMA_RX_TRIG(SUNXI_TWI_DRV_DMA_BURST) :
++		       SUNXI_TWI_DRV_DMA_TX_EN |
++		       SUNXI_TWI_DRV_DMA_TX_TRIG(SUNXI_TWI_DRV_DMA_BURST);
++
++	spin_lock_irqsave(&drv_data->lock, flags);
++	writel(ctrl, base + SUNXI_TWI_DRV_CTRL);
++	writel(bus, base + SUNXI_TWI_DRV_BUS_CTRL);
++	writel(1, base + SUNXI_TWI_DRV_CFG);
++	writel(SUNXI_TWI_DRV_SLV_ID(data_msg->addr) |
++	       (rd ? SUNXI_TWI_DRV_SLV_READ : 0), base + SUNXI_TWI_DRV_SLV);
++	writel(fmt, base + SUNXI_TWI_DRV_FMT);
++	writel(SUNXI_TWI_DRV_FIFO_RECV_CLEAR | SUNXI_TWI_DRV_FIFO_SEND_CLEAR,
++	       base + SUNXI_TWI_DRV_FIFO_CON);
++	writel(SUNXI_TWI_DRV_INT_PENDING, base + SUNXI_TWI_DRV_INT_CTRL);
++	writel(SUNXI_TWI_DRV_INT_COM_EN | SUNXI_TWI_DRV_INT_ERR_EN,
++	       base + SUNXI_TWI_DRV_INT_CTRL);
++	writel(dma_cfg, base + SUNXI_TWI_DRV_DMA_CFG);
++	drv_data->rc = 0;
++	drv_data->block = 1;
++	drv_data->drv_active = true;
++	drv_data->drv_ack_timeout = false;
++	writel(ctrl | SUNXI_TWI_DRV_CTRL_START, base + SUNXI_TWI_DRV_CTRL);
++	/* the register address bytes of a write + read go in by the CPU */
++	if (num == 2)
++		for (i = 0; i < msgs[0].len; i++)
++			writel(msgs[0].buf[i], base + SUNXI_TWI_DRV_SEND_FIFO);
++	spin_unlock_irqrestore(&drv_data->lock, flags);
++
++	if (dma_submit_error(dmaengine_submit(desc))) {
++		rc = -EIO;
++		goto out_stop;
++	}
++	dma_async_issue_pending(chan);
++
++	time_left = wait_event_timeout(drv_data->waitq, !drv_data->block,
++				       drv_data->adapter.timeout);
++	spin_lock_irqsave(&drv_data->lock, flags);
++	rc = time_left ? drv_data->rc : -ETIMEDOUT;
++	spin_unlock_irqrestore(&drv_data->lock, flags);
++
++	/* on success the RX DMA may still be draining the FIFO */
++	if (!rc && !wait_for_completion_timeout(&drv_data->dma_done,
++						drv_data->adapter.timeout))
++		rc = -ETIMEDOUT;
++
++out_stop:
++	if (rc)
++		dmaengine_terminate_sync(chan);
++
++	spin_lock_irqsave(&drv_data->lock, flags);
++	writel(0, base + SUNXI_TWI_DRV_DMA_CFG);
++	writel(SUNXI_TWI_DRV_INT_PENDING, base + SUNXI_TWI_DRV_INT_CTRL);
++	if (rc) {
++		/* the manual asks for a reset of the engine after a failure */
++		writel(ctrl | SUNXI_TWI_DRV_CTRL_SOFT_RESET,
++		       base + SUNXI_TWI_DRV_CTRL);
++		writel(ctrl, base + SUNXI_TWI_DRV_CTRL);
++	}
++	writel(0, base + SUNXI_TWI_DRV_CTRL);
++	drv_data->drv_active = false;
++	drv_data->block = 0;
++	spin_unlock_irqrestore(&drv_data->lock, flags);
++
++	if (rc)
++		mv64xxx_i2c_hw_init(drv_data);
++
++	/*
++	 * After the reset of both engines and a STOP, SCL is released unless
++	 * a target holds it low: then the 9th clock timeout was a stuck bus
++	 * or clock stretching beyond TIMEOUT_N, not a missing ACK.
++	 */
++	if (rc == -ENXIO && drv_data->drv_ack_timeout) {
++		u32 lcr;
++
++		if (readl_poll_timeout(base + SUNXI_TWI_LCR, lcr,
++				       lcr & SUNXI_TWI_LCR_SCL_STATE, 10, 1000)) {
++			dev_warn_ratelimited(&drv_data->adapter.dev,
++					     "packet engine: SCL held low (line control 0x%02x)\n",
++					     lcr);
++			rc = -ETIMEDOUT;
++		}
++	}
++
++out_unmap:
++	dma_unmap_single(chan->device->dev, dma_addr, data_msg->len, dir);
++	i2c_put_dma_safe_msg_buf(buf, data_msg, !rc);
++
++	return rc;
++}
++
++static int
++mv64xxx_i2c_dma_init(struct mv64xxx_i2c_data *drv_data, struct device *dev,
++		     phys_addr_t phys)
++{
++	struct dma_slave_config cfg = {
++		.src_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE,
++		.dst_addr_width = DMA_SLAVE_BUSWIDTH_1_BYTE,
++		.src_maxburst = SUNXI_TWI_DRV_DMA_BURST,
++		.dst_maxburst = SUNXI_TWI_DRV_DMA_BURST,
++	};
++	struct dma_chan *tx, *rx;
++	int rc;
++
++	tx = dma_request_chan(dev, "tx");
++	if (IS_ERR(tx))
++		return PTR_ERR(tx);
++
++	rx = dma_request_chan(dev, "rx");
++	if (IS_ERR(rx)) {
++		dma_release_channel(tx);
++		return PTR_ERR(rx);
++	}
++
++	cfg.direction = DMA_MEM_TO_DEV;
++	cfg.dst_addr = phys + SUNXI_TWI_DRV_SEND_FIFO;
++	rc = dmaengine_slave_config(tx, &cfg);
++	if (!rc) {
++		cfg.direction = DMA_DEV_TO_MEM;
++		cfg.src_addr = phys + SUNXI_TWI_DRV_RECV_FIFO;
++		rc = dmaengine_slave_config(rx, &cfg);
++	}
++	if (rc) {
++		dma_release_channel(rx);
++		dma_release_channel(tx);
++		return rc;
++	}
++
++	drv_data->dma_tx = tx;
++	drv_data->dma_rx = rx;
++	init_completion(&drv_data->dma_done);
++	dev_dbg(dev, "packet engine DMA: tx %s, rx %s\n",
++		dma_chan_name(tx), dma_chan_name(rx));
++
++	return 0;
++}
++
++static void
++mv64xxx_i2c_dma_release(struct mv64xxx_i2c_data *drv_data)
++{
++	if (drv_data->dma_rx)
++		dma_release_channel(drv_data->dma_rx);
++	if (drv_data->dma_tx)
++		dma_release_channel(drv_data->dma_tx);
++	drv_data->dma_rx = NULL;
++	drv_data->dma_tx = NULL;
++}
++
++/*
+  *****************************************************************************
+  *
+  *	I2C Core Support Routines (Interface to higher level I2C code)
+@@ -980,6 +1341,8 @@
+ 
+ 	if (mv64xxx_i2c_can_offload(drv_data) && !drv_data->atomic)
+ 		rc = mv64xxx_i2c_offload_xfer(drv_data);
++	else if (mv64xxx_i2c_can_dma(drv_data))
++		rc = mv64xxx_i2c_dma_xfer(drv_data);
+ 	else
+ 		rc = mv64xxx_i2c_execute_msg(drv_data, &msgs[0], num == 1);
+ 
+@@ -1225,6 +1588,7 @@
+ {
+ 	struct mv64xxx_i2c_data		*drv_data;
+ 	struct mv64xxx_i2c_pdata	*pdata = dev_get_platdata(&pd->dev);
++	struct resource			*res;
+ 	int	rc;
+ 
+ 	if ((!pdata && !pd->dev.of_node))
+@@ -1235,7 +1599,7 @@
+ 	if (!drv_data)
+ 		return -ENOMEM;
+ 
+-	drv_data->reg_base = devm_platform_ioremap_resource(pd, 0);
++	drv_data->reg_base = devm_platform_get_and_ioremap_resource(pd, 0, &res);
+ 	if (IS_ERR(drv_data->reg_base))
+ 		return PTR_ERR(drv_data->reg_base);
+ 
+@@ -1280,6 +1644,15 @@
+ 	if (rc == -EPROBE_DEFER)
+ 		return rc;
+ 
++	/* H616: DMA through the TWI_DRV packet engine, master mode only */
++	if (of_device_is_compatible(pd->dev.of_node, "allwinner,sun50i-h616-i2c")) {
++		rc = mv64xxx_i2c_dma_init(drv_data, &pd->dev, res->start);
++		if (rc == -EPROBE_DEFER)
++			return rc;
++		if (rc)
++			dev_info(&pd->dev, "no DMA (%d), using PIO\n", rc);
++	}
++
+ 	drv_data->adapter.dev.parent = &pd->dev;
+ 	drv_data->adapter.algo = &mv64xxx_i2c_algo;
+ 	drv_data->adapter.owner = THIS_MODULE;
+@@ -1328,6 +1701,7 @@
+ 	pm_runtime_disable(&pd->dev);
+ 	if (!pm_runtime_status_suspended(&pd->dev))
+ 		mv64xxx_i2c_runtime_suspend(&pd->dev);
++	mv64xxx_i2c_dma_release(drv_data);
+ 
+ 	return rc;
+ }
+@@ -1344,6 +1718,7 @@
+ 	pm_runtime_disable(&pd->dev);
+ 	if (!pm_runtime_status_suspended(&pd->dev))
+ 		mv64xxx_i2c_runtime_suspend(&pd->dev);
++	mv64xxx_i2c_dma_release(drv_data);
+ }
+ 
+ static const struct dev_pm_ops mv64xxx_i2c_pm_ops = {
+-- 
+Armbian
+
