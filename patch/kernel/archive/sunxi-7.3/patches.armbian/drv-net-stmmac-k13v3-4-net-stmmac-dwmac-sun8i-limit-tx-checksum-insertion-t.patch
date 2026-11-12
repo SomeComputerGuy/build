@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
-Date: Thu, 12 Nov 2026 17:26:32 +0000
+Date: Thu, 12 Nov 2026 17:20:21 +0000
 Subject: [PATCH 4/6] net: stmmac: dwmac-sun8i: Limit TX checksum insertion to
  2032 bytes
 
@@ -13,13 +13,17 @@ such a frame. In MAC loopback at MTU 4070, with checksum insertion on:
   4 of 20 intact;
 - 2054-byte raw frames: 1 of 30 had 2 bytes changed at offset 24.
 2032-byte UDP frames at MTU 2018 were fine. With checksum insertion
-off, all of these frames were intact.
+off, all of these frames were intact. I have not found the cause, and
+only the H616 was measured; the limit is set for all dwmac-sun8i
+variants, as they share the EMAC design.
 
 Add tx_coe_max_len to plat_stmmacenet_data, the longest frame (without
 the FCS) the TX checksum engine handles. stmmac_fix_features() turns
 TX checksum offload off for MTUs that allow longer frames, and
 stmmac_features_check() asks for software checksums for longer frames,
-which VLAN tags can still produce below that MTU.
+which VLAN tags can still produce below that MTU. For a GSO frame it
+checks the length of the segments, so that TCP keeps checksum offload.
+The length does not include a VLAN tag the MAC inserts itself.
 
 Set it to 2032 bytes for dwmac-sun8i, which keeps checksum offload up to
 MTU 2018.
@@ -27,10 +31,10 @@ MTU 2018.
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c | 4 ++++
- drivers/net/ethernet/stmicro/stmmac/stmmac_main.c | 9 +++++++++
- include/linux/stmmac.h                            | 2 ++
- 3 files changed, 15 insertions(+)
+ .../net/ethernet/stmicro/stmmac/dwmac-sun8i.c    |  4 ++++
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c    | 16 ++++++++++++++++
+ include/linux/stmmac.h                           |  2 ++
+ 3 files changed, 22 insertions(+)
 
 diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
 index 3de46f8..33ec037 100644
@@ -55,22 +59,36 @@ index 3de46f8..33ec037 100644
  	plat_dat->bsp_priv = gmac;
  	plat_dat->init = sun8i_dwmac_init;
 diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-index 466c711..101df45 100644
+index 6acfb67..812426e 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-@@ -5073,6 +5073,11 @@ static netdev_features_t stmmac_features_check(struct sk_buff *skb,
+@@ -42,6 +42,7 @@
+ #include <linux/udp.h>
+ #include <linux/bpf_trace.h>
+ #include <net/devlink.h>
++#include <net/gso.h>
+ #include <net/page_pool/helpers.h>
+ #include <net/pkt_cls.h>
+ #include <net/xdp_sock_drv.h>
+@@ -5077,6 +5078,17 @@ static netdev_features_t stmmac_features_check(struct sk_buff *skb,
  	    !stmmac_has_ip_ethertype(skb))
  		features &= ~(NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM);
  
-+	/* VLAN tags can make a frame longer than the MTU allows for */
-+	if (priv->plat->tx_coe_max_len &&
-+	    skb->len > priv->plat->tx_coe_max_len)
-+		features &= ~NETIF_F_CSUM_MASK;
++	/* VLAN tags can make a frame longer than the MTU allows for. A GSO
++	 * frame is segmented in software later on: check its segments.
++	 */
++	if (priv->plat->tx_coe_max_len) {
++		unsigned int max_len = priv->plat->tx_coe_max_len;
++
++		if (skb_is_gso(skb) ? !skb_gso_validate_mac_len(skb, max_len) :
++				      skb->len > max_len)
++			features &= ~NETIF_F_CSUM_MASK;
++	}
 +
  	if (skb_is_gso(skb)) {
  		if (!stmmac_tso_channel_permitted(priv, queue) ||
  		    !stmmac_tso_valid_packet(skb))
-@@ -6265,6 +6270,10 @@ static netdev_features_t stmmac_fix_features(struct net_device *dev,
+@@ -6284,6 +6296,10 @@ static netdev_features_t stmmac_fix_features(struct net_device *dev,
  	if (priv->plat->bugged_jumbo && (dev->mtu > ETH_DATA_LEN))
  		features &= ~NETIF_F_CSUM_MASK;
  

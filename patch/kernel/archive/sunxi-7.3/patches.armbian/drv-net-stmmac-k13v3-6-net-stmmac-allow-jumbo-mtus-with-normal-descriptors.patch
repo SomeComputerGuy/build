@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
-Date: Thu, 12 Nov 2026 17:26:41 +0000
+Date: Thu, 12 Nov 2026 17:21:25 +0000
 Subject: [PATCH 6/6] net: stmmac: Allow jumbo MTUs with normal descriptors in
  chain mode
 
@@ -9,6 +9,12 @@ NET_IP_ALIGN), 3712 with 4 KiB pages. That is not a hardware limit.
 In chain mode, frames now span several descriptors in both directions,
 so allow the same JUMBO_LEN as with enhanced descriptors. The TX FIFO
 size check in stmmac_change_mtu() and plat->maxmtu still apply.
+
+Chain mode with normal descriptors is only used by dwmac-sun8i, unless
+the chain_mode module parameter is set. With that parameter, dwmac100,
+whose core_init does not enable jumbo frames, gets the same limit as
+enhanced descriptors already allow; stmmac_change_mtu() still refuses
+an MTU above its TX FIFO size.
 
 Ring mode with normal descriptors keeps the old limit: it sends frames
 above 2047 bytes with a second buffer in the descriptor, whose address
@@ -21,10 +27,10 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 2 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-index 101df45..8191d5e 100644
+index 812426e..9ae1171 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-@@ -8089,7 +8089,8 @@ static int __stmmac_dvr_probe(struct device *device,
+@@ -8115,7 +8115,8 @@ static int __stmmac_dvr_probe(struct device *device,
  
  	if (priv->plat->core_type == DWMAC_CORE_XGMAC)
  		ndev->max_mtu = XGMAC_JUMBO_LEN;
