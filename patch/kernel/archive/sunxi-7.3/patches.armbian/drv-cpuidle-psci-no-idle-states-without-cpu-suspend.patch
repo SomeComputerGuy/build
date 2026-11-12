@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 12 Nov 2026 14:00:00 +0000
+Subject: cpuidle: psci: register no idle states when the firmware has no
+ CPU_SUSPEND
+
+PSCI 1.0 and later firmware reports through PSCI_FEATURES whether it
+implements CPU_SUSPEND. psci_init_cpu_suspend() already asks, but only
+keeps the feature flags of a positive answer; NOT_SUPPORTED is dropped.
+The PSCI cpuidle driver then registers every idle state the device tree
+describes, although the firmware rejects each CPU_SUSPEND call.
+
+This happens when a device tree with idle states meets a firmware
+without CPU_SUSPEND, for example a TF-A platform port that has no
+pwr_domain_suspend handler (TF-A then answers PSCI_FEATURES and the call
+itself with NOT_SUPPORTED), or a kernel and DTB update on a board that
+still runs an older firmware.
+
+A rejected entry returns at once, without WFI. Measured on an Orange Pi
+Zero 2 (Allwinner H616) with TF-A lts-v2.14.11 and one idle state in the
+DT: about 39000 rejected entries per second on every idle CPU, 92 % of
+the idle time spent in no idle state at all. Suspend-to-idle takes the
+deepest state without asking the governor, so the CPUs loop through
+rejected entries for the whole suspend.
+
+Remember the NOT_SUPPORTED answer and do not register the cpuidle driver
+in that case, with one line in the log. The CPUs then idle in WFI through
+the default idle routine, as they do without idle states in the DT.
+Nothing changes when CPU_SUSPEND is supported, nor for firmware older
+than PSCI 1.0, which has no PSCI_FEATURES call.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/cpuidle/cpuidle-psci.c | 12 ++++++++++++
+ drivers/firmware/psci/psci.c   | 13 +++++++++++++
+ include/linux/psci.h           |  1 +
+ 3 files changed, 26 insertions(+)
+
+diff --git a/drivers/cpuidle/cpuidle-psci.c b/drivers/cpuidle/cpuidle-psci.c
+index 111111111111..222222222222 100644
+--- a/drivers/cpuidle/cpuidle-psci.c
++++ b/drivers/cpuidle/cpuidle-psci.c
+@@ -400,6 +400,18 @@ static int psci_idle_init_cpu(struct device *dev, int cpu)
+ 	if (ret <= 0)
+ 		return ret ? : -ENODEV;
+ 
++	/*
++	 * The firmware rejects every CPU_SUSPEND call it does not implement.
++	 * An idle state that can never be entered must not be registered: the
++	 * governor would keep selecting it, and suspend-to-idle always takes
++	 * the deepest state, so the CPU would spin through failed entries
++	 * instead of resting in WFI.
++	 */
++	if (!psci_has_cpu_suspend()) {
++		pr_info("CPU_SUSPEND not supported by the firmware, DT idle states ignored\n");
++		return -ENODEV;
++	}
++
+ 	/*
+ 	 * Initialize PSCI idle states.
+ 	 */
+diff --git a/drivers/firmware/psci/psci.c b/drivers/firmware/psci/psci.c
+index 111111111111..222222222222 100644
+--- a/drivers/firmware/psci/psci.c
++++ b/drivers/firmware/psci/psci.c
+@@ -77,6 +77,7 @@ struct psci_0_1_function_ids get_psci_0_1_function_ids(void)
+ 				PSCI_1_0_EXT_POWER_STATE_TYPE_MASK)
+ 
+ static u32 psci_cpu_suspend_feature;
++static bool psci_cpu_suspend_not_supported;
+ static bool psci_system_reset2_supported;
+ static bool psci_system_off2_hibernate_supported;
+ 
+@@ -91,6 +92,16 @@ bool psci_has_osi_support(void)
+ 	return psci_cpu_suspend_feature & PSCI_1_0_OS_INITIATED;
+ }
+ 
++/*
++ * False only when the firmware said, through PSCI_FEATURES, that it does not
++ * implement CPU_SUSPEND. Firmware older than PSCI 1.0 has no PSCI_FEATURES
++ * call and cannot say so, hence CPU_SUSPEND is assumed to work there.
++ */
++bool psci_has_cpu_suspend(void)
++{
++	return !psci_cpu_suspend_not_supported;
++}
++
+ static inline bool psci_power_state_loses_context(u32 state)
+ {
+ 	const u32 mask = psci_has_ext_power_state() ?
+@@ -598,6 +609,8 @@ static void __init psci_init_cpu_suspend(void)
+ 
+ 	if (feature != PSCI_RET_NOT_SUPPORTED)
+ 		psci_cpu_suspend_feature = feature;
++	else
++		psci_cpu_suspend_not_supported = true;
+ }
+ 
+ /*
+diff --git a/include/linux/psci.h b/include/linux/psci.h
+index 111111111111..222222222222 100644
+--- a/include/linux/psci.h
++++ b/include/linux/psci.h
+@@ -20,6 +20,7 @@ int psci_cpu_suspend_enter(u32 state);
+ bool psci_power_state_is_valid(u32 state);
+ int psci_set_osi_mode(bool enable);
+ bool psci_has_osi_support(void);
++bool psci_has_cpu_suspend(void);
+ 
+ struct psci_operations {
+ 	u32 (*get_version)(void);
+-- 
+Armbian
+
