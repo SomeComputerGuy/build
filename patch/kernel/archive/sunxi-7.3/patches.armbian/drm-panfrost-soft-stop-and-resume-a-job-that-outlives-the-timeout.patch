@@ -1,7 +1,7 @@
-From 123724bfe67a88ddf46523549fef6834f92faca8 Mon Sep 17 00:00:00 2001
+From b5f06cd08f63ef4e94fb86885378986cf6e8ff89 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 05:00:27 +0000
-Subject: [PATCH 11/12] drm/panfrost: Soft-stop and resume a job that outlives
+Subject: [PATCH 10/11] drm/panfrost: Soft-stop and resume a job that outlives
  the timeout
 
 JOB_TIMEOUT_MS is 500 ms, and when it fires panfrost resets the GPU and
@@ -54,8 +54,8 @@ that (JS_RESET_TICKS_SS = 55). Do the same from the timeout handler:
 - without a reset, the address space references of the jobs cancelled
   from _NEXT are released (a reset has panfrost_mmu_reset() drop them),
   and a runtime PM reference is held across the stop and the
-  resubmission, so that an autosuspend cannot power the L2 off under a
-  soft-stopped job.
+  resubmission, so that an autosuspend cannot power the GPU off between
+  the two.
 
 The timeout of a job that is merely long is now a dev_dbg(); faults,
 jobs that do not stop and the other reset paths are reported as before,
@@ -69,11 +69,11 @@ boundary, pass in 4-6 s.
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- drivers/gpu/drm/panfrost/panfrost_job.c | 245 ++++++++++++++++++++----
- 1 file changed, 212 insertions(+), 33 deletions(-)
+ drivers/gpu/drm/panfrost/panfrost_job.c | 239 ++++++++++++++++++++----
+ 1 file changed, 207 insertions(+), 32 deletions(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index 15c7e5b..2faea27 100644
+index d7f7ff6..6f9b386 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -25,6 +25,25 @@
@@ -114,7 +114,7 @@ index 15c7e5b..2faea27 100644
  	 */
  	if (WARN_ON(!job))
  		return NULL;
-@@ -671,18 +691,38 @@ static bool panfrost_slots_idle(struct panfrost_device *pfdev)
+@@ -658,18 +678,39 @@ static bool panfrost_slots_idle(struct panfrost_device *pfdev)
  	return true;
  }
  
@@ -147,15 +147,16 @@ index 15c7e5b..2faea27 100644
  		return;
  
 +	/* The jobs we stop drop their runtime PM references before we submit
-+	 * them again. Keep the GPU powered in between: a suspend would power
-+	 * the L2 off and lose the dirty lines of a soft-stopped job.
++	 * them again. Keep the GPU powered in between: once they have, nothing
++	 * else keeps it from being runtime suspended under the rest of this
++	 * function.
 +	 */
 +	pm_runtime_get_noresume(pfdev->base.dev);
 +
  	/* Stop the schedulers.
  	 *
  	 * FIXME: We temporarily get out of the dma_fence_signalling section
-@@ -701,7 +741,8 @@ panfrost_reset(struct panfrost_device *pfdev,
+@@ -688,7 +729,8 @@ panfrost_reset(struct panfrost_device *pfdev,
  
  	cookie = dma_fence_begin_signalling();
  
@@ -165,7 +166,7 @@ index 15c7e5b..2faea27 100644
  		drm_sched_increase_karma(bad);
  
  	/* Mask job interrupts and synchronize to make sure we won't be
-@@ -733,26 +774,90 @@ panfrost_reset(struct panfrost_device *pfdev,
+@@ -720,26 +762,90 @@ panfrost_reset(struct panfrost_device *pfdev,
  	}
  	spin_unlock(&pfdev->js->job_lock);
  
@@ -265,7 +266,7 @@ index 15c7e5b..2faea27 100644
  	 */
  	spin_lock(&pfdev->js->job_lock);
  	for (i = 0; i < NUM_JOB_SLOTS; i++) {
-@@ -763,22 +868,59 @@ panfrost_reset(struct panfrost_device *pfdev,
+@@ -750,21 +856,53 @@ panfrost_reset(struct panfrost_device *pfdev,
  			pfdev->jobs[i][pfdev->jobs[i][0] ? 1 : 0] = evicted[i];
  
  		for (j = 0; j < ARRAY_SIZE(pfdev->jobs[0]) && pfdev->jobs[i][j]; j++) {
@@ -299,9 +300,6 @@ index 15c7e5b..2faea27 100644
 +						    -ECANCELED);
  		}
  	}
--	pfdev->reset.count++;
-+	if (reset_gpu)
-+		pfdev->reset.count++;
  	memset(pfdev->jobs, 0, sizeof(pfdev->jobs));
  	spin_unlock(&pfdev->js->job_lock);
  
@@ -310,11 +308,7 @@ index 15c7e5b..2faea27 100644
 +	/* Proceed with reset now, unless the slots were simply busy with long
 +	 * jobs that stopped at a task boundary (or a hard stop ended the one
 +	 * that did not). The stopped jobs will be resumed from JS_TAIL (see
-+	 * panfrost_job_handle_err()). The hardware keeps their resume state in
-+	 * the job header and the results of the tasks that already finished
-+	 * in the L2: a soft reset throws both away, and a job resumed after it
-+	 * completes with stale data in the buffers it had still to write and
-+	 * no error reported (panfrost_job_run() fails such a job instead).
++	 * panfrost_job_handle_err()).
 +	 */
 +	if (reset_gpu) {
 +		panfrost_device_reset(pfdev, false);
@@ -333,7 +327,7 @@ index 15c7e5b..2faea27 100644
  
  	/* Now resubmit jobs that were previously queued but didn't have a
  	 * chance to finish.
-@@ -800,6 +942,8 @@ panfrost_reset(struct panfrost_device *pfdev,
+@@ -786,6 +924,8 @@ panfrost_reset(struct panfrost_device *pfdev,
  	panfrost_jm_enable_interrupts(pfdev);
  
  	dma_fence_end_signalling(cookie);
@@ -342,7 +336,7 @@ index 15c7e5b..2faea27 100644
  }
  
  static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
-@@ -808,6 +952,8 @@ static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
+@@ -794,6 +934,8 @@ static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
  	struct panfrost_job *job = to_panfrost_job(sched_job);
  	struct panfrost_device *pfdev = job->pfdev;
  	int js = panfrost_job_get_slot(job);
@@ -351,7 +345,7 @@ index 15c7e5b..2faea27 100644
  
  	/*
  	 * If the GPU managed to complete this jobs fence, the timeout has
-@@ -832,18 +978,51 @@ static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
+@@ -818,18 +960,51 @@ static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
  		return DRM_GPU_SCHED_STAT_NO_HANG;
  	}
  
@@ -413,7 +407,7 @@ index 15c7e5b..2faea27 100644
  
  	return DRM_GPU_SCHED_STAT_RESET;
  }
-@@ -866,7 +1045,7 @@ static void panfrost_reset_work(struct work_struct *work)
+@@ -852,7 +1027,7 @@ static void panfrost_reset_work(struct work_struct *work)
  		return;
  	}
  

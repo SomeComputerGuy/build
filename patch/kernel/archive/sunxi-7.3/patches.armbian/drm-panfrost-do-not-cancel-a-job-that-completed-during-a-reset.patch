@@ -1,7 +1,7 @@
 From 5849511e6da48905bb299eb94d7d6ec5a5e51309 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 08:39:49 +0000
-Subject: [PATCH 08/12] drm/panfrost: Don't cancel a job that completed during
+Subject: [PATCH 08/11] drm/panfrost: Don't cancel a job that completed during
  a reset
 
 panfrost_reset() stops the schedulers, which detaches them from the done
