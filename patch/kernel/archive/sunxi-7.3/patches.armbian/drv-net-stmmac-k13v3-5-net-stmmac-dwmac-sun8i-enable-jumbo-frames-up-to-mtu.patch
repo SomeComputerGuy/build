@@ -31,7 +31,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 18 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
-index d89e694..8f099c2 100644
+index 42f42ca..6ad13e1 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
 @@ -7,6 +7,7 @@
