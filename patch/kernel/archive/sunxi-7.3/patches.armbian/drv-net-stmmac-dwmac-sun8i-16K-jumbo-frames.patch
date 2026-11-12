@@ -35,6 +35,13 @@ are visible to the DMA first, and the jabber/length, frame flushed and
 checksum error bits of normal TX descriptors are counted, as with
 enhanced descriptors.
 
+dwmac-sun8i wrote TX_DMA_START for every frame queued. That bit restarts
+the TX DMA state machine; written while the DMA moves a multi-descriptor
+frame into the FIFO in threshold mode, it can abort that frame with a
+TX FIFO underflow. A running TX DMA fetches the next descriptor by
+itself, so the bit is now only written when the DMA is stopped or
+suspended (EMAC_TX_DMA_STA).
+
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
@@ -289,8 +296,24 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  
 --- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
-@@ -222,24 +222,25 @@
+@@ -5,6 +5,7 @@
+  * Copyright (C) 2017 Corentin Labbe <clabbe.montjoie@gmail.com>
+  */
  
++#include <linux/bitfield.h>
+ #include <linux/clk.h>
+ #include <linux/etherdevice.h>
+ #include <linux/if_vlan.h>
+@@ -220,26 +221,33 @@
+ #define EMAC_TX_DMA_EN  BIT(30)
+ #define EMAC_TX_DMA_START       BIT(31)
+ 
++/* Used in EMAC_TX_DMA_STA: state of the TX DMA state machine */
++#define EMAC_TX_DMA_STATE		GENMASK(2, 0)
++#define EMAC_TX_DMA_STATE_STOP		0
++#define EMAC_TX_DMA_STATE_FETCH		1
++#define EMAC_TX_DMA_STATE_SUSPEND	6
++
  /* Used in RX_CTL0 */
  #define EMAC_RX_RECEIVER_EN             BIT(31)
 +#define EMAC_RX_FRM_LEN_CTL		BIT(30)
@@ -325,7 +348,35 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  
  /* Used in EMAC_TX_FLOW_CTL */
  #define EMAC_TX_FLOW_CTL_EN             BIT(0)
-@@ -592,13 +593,16 @@
+@@ -439,7 +447,26 @@
+ 
+ static void sun8i_dwmac_enable_dma_transmission(void __iomem *ioaddr, u32 chan)
+ {
+-	u32 v;
++	u32 state, v;
++
++	/* TX_DMA_START restarts the TX DMA state machine. Written while the
++	 * DMA moves a frame of several descriptors into the FIFO in threshold
++	 * mode, it can abort that frame with a TX FIFO underflow. A running
++	 * DMA fetches the next descriptor by itself when it is done with the
++	 * current frame, so only start it when it is stopped or suspended.
++	 * The descriptors just given to the DMA must be visible before the
++	 * state is read, and while the DMA fetches a descriptor, wait for
++	 * the result of that fetch.
++	 */
++	wmb();
++	if (!readl_poll_timeout_atomic(ioaddr + EMAC_TX_DMA_STA, state,
++				       FIELD_GET(EMAC_TX_DMA_STATE, state) !=
++				       EMAC_TX_DMA_STATE_FETCH, 0, 10)) {
++		state = FIELD_GET(EMAC_TX_DMA_STATE, state);
++		if (state != EMAC_TX_DMA_STATE_STOP &&
++		    state != EMAC_TX_DMA_STATE_SUSPEND)
++			return;
++	}
+ 
+ 	v = readl(ioaddr + EMAC_TX_CTL1);
+ 	v |= EMAC_TX_DMA_START;
+@@ -592,13 +619,16 @@
  	} else {
  		v &= ~EMAC_TX_MD;
  		v &= ~EMAC_TX_TH_MASK;
@@ -346,7 +397,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  			v |= EMAC_TX_TH_256;
  	}
  	writel(v, ioaddr + EMAC_TX_CTL1);
-@@ -672,12 +676,16 @@
+@@ -672,12 +702,16 @@
  
  	/* Without JUMBO_FRM_EN the receiver flags every frame longer than
  	 * 1518 bytes (1522 with a VLAN tag) as a length error, so any MTU
@@ -366,7 +417,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  }
  
  static void sun8i_dwmac_set_mac(void __iomem *ioaddr, bool enable)
-@@ -1284,14 +1292,14 @@
+@@ -1284,14 +1318,14 @@
  	 */
  	plat_dat->rx_coe = STMMAC_RX_COE_TYPE2;
  	plat_dat->tx_coe = true;
