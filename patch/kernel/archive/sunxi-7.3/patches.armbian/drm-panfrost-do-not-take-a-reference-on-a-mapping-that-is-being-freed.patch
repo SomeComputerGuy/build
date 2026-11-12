@@ -1,0 +1,58 @@
+From f7cf059a2ed48817ff1feaafb577c6c6e947268a Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Tue, 10 Nov 2026 08:32:38 +0000
+Subject: [PATCH 03/11] drm/panfrost: Don't take a reference on a mapping that
+ is being freed
+
+addr_to_mapping() looks up the mapping that contains a faulting GPU
+address in the address space's drm_mm and takes a reference on it with
+kref_get(). But panfrost_gem_mapping_put() drops the last reference
+before panfrost_gem_mapping_release() -> panfrost_gem_teardown_mapping()
+unmaps the BO and removes its node from the drm_mm under mm_lock, so the
+lookup can find a mapping whose refcount is already zero. kref_get()
+then revives it (refcount_t warns about the addition on zero), the
+release goes on and frees the mapping and drops the BO, and the fault
+handler maps pages into a BO that is being freed.
+
+This takes a GPU fault on a heap BO's address while the last handle and
+the last job reference to that BO go away. Jobs hold a reference on the
+mappings of the BOs they list, so it takes a job that uses a heap BO it
+does not list; userspace on the render node can submit that.
+
+Use kref_get_unless_zero() and treat a mapping that is being freed as
+absent: the fault is then reported as unhandled.
+
+Found by code review: the same pattern in new code of this series was
+reported by Sashiko. Not reproduced.
+
+Fixes: bdefca2d8dc0 ("drm/panfrost: Add the panfrost_gem_mapping concept")
+Cc: stable@vger.kernel.org
+Link: https://lore.kernel.org/all/sashiko-outbox-206570@kernel.org/
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/panfrost/panfrost_mmu.c | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_mmu.c b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+index 4a3162c..6cd1678 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_mmu.c
++++ b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+@@ -571,7 +571,13 @@ found_mmu:
+ 		    offset < (node->start + node->size)) {
+ 			mapping = drm_mm_node_to_panfrost_mapping(node);
+ 
+-			kref_get(&mapping->refcount);
++			/* The last reference to a mapping is dropped before
++			 * panfrost_gem_teardown_mapping() takes its node out
++			 * of the address space: don't revive one that is
++			 * being freed.
++			 */
++			if (!kref_get_unless_zero(&mapping->refcount))
++				mapping = NULL;
+ 			break;
+ 		}
+ 	}
+-- 
+2.55.0
+
