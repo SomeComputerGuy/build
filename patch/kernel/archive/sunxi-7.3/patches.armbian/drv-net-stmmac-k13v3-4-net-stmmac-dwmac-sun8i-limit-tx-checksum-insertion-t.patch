@@ -1,0 +1,96 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 12 Nov 2026 17:26:32 +0000
+Subject: [PATCH 4/6] net: stmmac: dwmac-sun8i: Limit TX checksum insertion to
+ 2032 bytes
+
+On an Allwinner H616, the EMAC inserts wrong checksums into frames
+longer than 2032 bytes, and sometimes corrupts the frame sent after
+such a frame. In MAC loopback at MTU 4070, with checksum insertion on:
+- UDP frames of 2036 and 2040 bytes: 0 of 40 had valid checksums (the
+  payload was intact);
+- 2044-byte UDP frames checksummed in software, sent right after them:
+  4 of 20 intact;
+- 2054-byte raw frames: 1 of 30 had 2 bytes changed at offset 24.
+2032-byte UDP frames at MTU 2018 were fine. With checksum insertion
+off, all of these frames were intact.
+
+Add tx_coe_max_len to plat_stmmacenet_data, the longest frame (without
+the FCS) the TX checksum engine handles. stmmac_fix_features() turns
+TX checksum offload off for MTUs that allow longer frames, and
+stmmac_features_check() asks for software checksums for longer frames,
+which VLAN tags can still produce below that MTU.
+
+Set it to 2032 bytes for dwmac-sun8i, which keeps checksum offload up to
+MTU 2018.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c | 4 ++++
+ drivers/net/ethernet/stmicro/stmmac/stmmac_main.c | 9 +++++++++
+ include/linux/stmmac.h                            | 2 ++
+ 3 files changed, 15 insertions(+)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
+index 3de46f8..33ec037 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
+@@ -227,6 +227,9 @@ static const struct emac_variant emac_variant_h6 = {
+ /* Used in TX_CTL0 */
+ #define EMAC_TX_TRANSMITTER_EN  BIT(31)
+ 
++/* TX checksum insertion corrupts longer frames, and others sent after them */
++#define EMAC_TX_COE_MAX_LEN	2032
++
+ /* Used in EMAC_TX_FLOW_CTL */
+ #define EMAC_TX_FLOW_CTL_EN             BIT(0)
+ 
+@@ -1261,6 +1264,7 @@ static int sun8i_dwmac_probe(struct platform_device *pdev)
+ 	 */
+ 	plat_dat->rx_coe = STMMAC_RX_COE_TYPE2;
+ 	plat_dat->tx_coe = true;
++	plat_dat->tx_coe_max_len = EMAC_TX_COE_MAX_LEN;
+ 	plat_dat->flags |= STMMAC_FLAG_HAS_SUN8I;
+ 	plat_dat->bsp_priv = gmac;
+ 	plat_dat->init = sun8i_dwmac_init;
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 466c711..101df45 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -5073,6 +5073,11 @@ static netdev_features_t stmmac_features_check(struct sk_buff *skb,
+ 	    !stmmac_has_ip_ethertype(skb))
+ 		features &= ~(NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM);
+ 
++	/* VLAN tags can make a frame longer than the MTU allows for */
++	if (priv->plat->tx_coe_max_len &&
++	    skb->len > priv->plat->tx_coe_max_len)
++		features &= ~NETIF_F_CSUM_MASK;
++
+ 	if (skb_is_gso(skb)) {
+ 		if (!stmmac_tso_channel_permitted(priv, queue) ||
+ 		    !stmmac_tso_valid_packet(skb))
+@@ -6265,6 +6270,10 @@ static netdev_features_t stmmac_fix_features(struct net_device *dev,
+ 	if (priv->plat->bugged_jumbo && (dev->mtu > ETH_DATA_LEN))
+ 		features &= ~NETIF_F_CSUM_MASK;
+ 
++	if (priv->plat->tx_coe_max_len &&
++	    dev->mtu + ETH_HLEN > priv->plat->tx_coe_max_len)
++		features &= ~NETIF_F_CSUM_MASK;
++
+ 	if (priv->plat->core_type == DWMAC_CORE_XGMAC) {
+ 		if (features & NETIF_F_HW_VLAN_CTAG_RX)
+ 			features |= NETIF_F_HW_VLAN_STAG_RX;
+diff --git a/include/linux/stmmac.h b/include/linux/stmmac.h
+index 4430b96..7075395 100644
+--- a/include/linux/stmmac.h
++++ b/include/linux/stmmac.h
+@@ -257,6 +257,8 @@ struct plat_stmmacenet_data {
+ 	bool force_thresh_dma_mode;
+ 	bool riwt_off;
+ 	int rx_coe;
++	/* Longest frame (without FCS) for TX checksum insertion, 0: any */
++	unsigned int tx_coe_max_len;
+ 	int max_speed;
+ 	int maxmtu;
+ 	int multicast_filter_bins;
