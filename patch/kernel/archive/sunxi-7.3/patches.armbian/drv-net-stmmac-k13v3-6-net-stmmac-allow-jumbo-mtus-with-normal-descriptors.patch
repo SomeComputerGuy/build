@@ -27,10 +27,10 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 2 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-index 812426e..9ae1171 100644
+index 6acfb67..a3bd9c3 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-@@ -8115,7 +8115,8 @@ static int __stmmac_dvr_probe(struct device *device,
+@@ -8099,7 +8099,8 @@ static int __stmmac_dvr_probe(struct device *device,
  
  	if (priv->plat->core_type == DWMAC_CORE_XGMAC)
  		ndev->max_mtu = XGMAC_JUMBO_LEN;
