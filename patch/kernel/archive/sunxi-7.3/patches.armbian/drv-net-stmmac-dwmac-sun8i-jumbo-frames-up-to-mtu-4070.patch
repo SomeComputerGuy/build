@@ -15,9 +15,11 @@ Support jumbo frames up to MTU 4070 on this EMAC:
   stmmac_rx() as rx_not_ls, as with enhanced descriptors.
 - TX: in chain mode the linear part of a frame is split over several
   descriptors of 2040 bytes; paged frames longer than that are
-  linearised. The EMAC does not insert checksums correctly into such
-  frames (the receiver drops them), so their checksums are computed in
-  software; shorter frames keep checksum insertion.
+  linearised.
+- TX checksum insertion corrupts the checksums of frames longer than
+  2032 bytes and sometimes the frame after them, so it is turned off
+  for MTUs above 2018 (stmmac_fix_features()); frames that VLAN tags
+  make longer than that are checksummed in software.
 These paths are enabled by a new platform flag, STMMAC_FLAG_NDESC_JUMBO,
 which only dwmac-sun8i sets. RX_CTL0/TX_CTL0 FRM_LEN_CTL are set as well
 (frame length limit 16384 bytes in both directions, H616 user manual
@@ -25,7 +27,7 @@ v1.0, 6.5.5 and 6.5.9).
 
 MTU 4070 is the largest MTU whose frames, with two VLAN tags and the
 FCS (4096 bytes), fit in the 4 KiB TX FIFO. Such frames are sent in
-store-and-forward mode, which TX checksum insertion needs and in which
+store-and-forward mode (kept with checksum insertion off), in which
 the FIFO cannot underflow. The EMAC accepts frames of up to 16 KiB, but
 larger frames would have to be sent in threshold mode, and there the TX
 FIFO underflows now and then while the DMA moves a frame over several
@@ -59,7 +61,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  
 --- a/drivers/net/ethernet/stmicro/stmmac/common.h
 +++ b/drivers/net/ethernet/stmicro/stmmac/common.h
-@@ -522,6 +522,10 @@
+@@ -522,6 +522,14 @@
  #define BUF_SIZE_8KiB 8188
  #define BUF_SIZE_4KiB 4096
  #define BUF_SIZE_2KiB 2048
@@ -67,6 +69,10 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 + * fills completely: a multiple of the bus width.
 + */
 +#define BUF_SIZE_NDESC 2040
++/* Largest frame (without the FCS) into which the EMAC of
++ * STMMAC_FLAG_NDESC_JUMBO inserts checksums correctly
++ */
++#define NDESC_JUMBO_COE_MAX_LEN 2032
  
  /* Power Down and WOL */
  #define PMT_NOT_SUPPORTED 0
@@ -171,7 +177,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	dma_conf->dma_buf_sz = bfsize;
  	/* Chose the tx/rx size from the already defined one in the
  	 * priv struct. (if defined)
-@@ -4840,6 +4853,27 @@
+@@ -4840,6 +4853,28 @@
  		}
  	}
  
@@ -186,12 +192,13 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +		nopaged_len = skb_headlen(skb);
 +	}
 +
-+	/* The sun8i EMAC does not insert checksums correctly into frames
-+	 * longer than one TX buffer, and the receiver drops them: compute
-+	 * their checksums in software.
++	/* The sun8i EMAC corrupts the checksums of larger frames (and
++	 * sometimes the frame after them). stmmac_fix_features() turns
++	 * checksum insertion off for MTUs that allow such frames; VLAN
++	 * tags can still make a frame too long: checksum it in software.
 +	 */
 +	if (unlikely((priv->plat->flags & STMMAC_FLAG_NDESC_JUMBO) &&
-+		     skb->len > BUF_SIZE_NDESC &&
++		     skb->len > NDESC_JUMBO_COE_MAX_LEN &&
 +		     skb->ip_summed == CHECKSUM_PARTIAL &&
 +		     skb_checksum_help(skb)))
 +		goto max_sdu_err;
@@ -199,7 +206,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	if (unlikely(stmmac_tx_avail(priv, queue) < nfrags + 1)) {
  		if (!netif_tx_queue_stopped(netdev_get_tx_queue(dev, queue))) {
  			netif_tx_stop_queue(netdev_get_tx_queue(priv->dev,
-@@ -4870,7 +4904,7 @@
+@@ -4870,7 +4905,7 @@
  
  	enh_desc = priv->plat->enh_desc;
  	/* To program the descriptors according to the size of the frame */
@@ -208,7 +215,19 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  		is_jumbo = stmmac_is_jumbo_frm(priv, skb->len, enh_desc);
  
  	csum_insertion = skb->ip_summed == CHECKSUM_PARTIAL;
-@@ -8064,6 +8098,8 @@
+@@ -6247,6 +6282,11 @@
+ 	if (priv->plat->bugged_jumbo && (dev->mtu > ETH_DATA_LEN))
+ 		features &= ~NETIF_F_CSUM_MASK;
+ 
++	/* No checksum insertion for frames longer than the EMAC handles */
++	if ((priv->plat->flags & STMMAC_FLAG_NDESC_JUMBO) &&
++	    dev->mtu + ETH_HLEN > NDESC_JUMBO_COE_MAX_LEN)
++		features &= ~NETIF_F_CSUM_MASK;
++
+ 	if (priv->plat->core_type == DWMAC_CORE_XGMAC) {
+ 		if (features & NETIF_F_HW_VLAN_CTAG_RX)
+ 			features |= NETIF_F_HW_VLAN_STAG_RX;
+@@ -8064,6 +8104,8 @@
  		ndev->max_mtu = XGMAC_JUMBO_LEN;
  	else if (priv->plat->enh_desc || priv->synopsys_id >= DWMAC_CORE_4_00)
  		ndev->max_mtu = JUMBO_LEN;
@@ -242,10 +261,10 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +/* Frames longer than the 2044 bytes of one RX buffer span several DMA
 + * descriptors (11-bit buffer size, STMMAC_FLAG_NDESC_JUMBO). The limit is
 + * the 4 KiB TX FIFO: a frame that fits in it, with two VLAN tags and the
-+ * FCS, is sent in store-and-forward mode, which TX checksum insertion
-+ * needs. Larger frames would need the TX threshold mode, in which the
-+ * FIFO underflows now and then when the DMA moves a frame over several
-+ * descriptors, and the frame is lost.
++ * FCS, is sent in store-and-forward mode (stmmac selects it because
++ * tx_coe is set). Larger frames would need the TX threshold mode, in
++ * which the FIFO underflows now and then when the DMA moves a frame over
++ * several descriptors, and the frame is lost.
   */
 -#define EMAC_MAX_FRAME_LEN	2044
 -#define EMAC_MAX_MTU		(EMAC_MAX_FRAME_LEN - ETH_HLEN - \
