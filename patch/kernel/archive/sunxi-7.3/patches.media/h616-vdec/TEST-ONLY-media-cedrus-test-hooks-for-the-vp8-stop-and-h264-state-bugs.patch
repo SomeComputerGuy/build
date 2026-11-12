@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 12 Nov 2026 12:40:00 +0000
+Subject: TEST ONLY: media: cedrus: test hooks for the VP8 stop and H.264 state
+ bugs
+
+Two module parameters, off by default, that bring back the mainline
+behaviour fixed by the two patches before this one, so that one test
+kernel can show the bugs and the fixes:
+test_vp8_stop_disable=1 writes VE_MODE_DISABLED in the VP8 stop
+callback, test_h264_keep_state=1 skips clearing the H.264 codec state
+on start. Not for the image.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/staging/media/sunxi/cedrus/cedrus_h264.c | 7 ++++++-
+ drivers/staging/media/sunxi/cedrus/cedrus_vp8.c  | 8 ++++++++
+ 2 files changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+@@ -570,6 +570,10 @@
+ 	return 0;
+ }
+ 
++/* TEST ONLY: 1 = do not clear the codec state on start (the mainline behaviour). */
++static bool test_h264_keep_state;
++module_param(test_h264_keep_state, bool, 0644);
++
+ static int cedrus_h264_start(struct cedrus_ctx *ctx)
+ {
+ 	struct cedrus_dev *dev = ctx->dev;
+@@ -580,7 +584,8 @@
+ 	 * The codec state is a union: clear what another codec, or a wider
+ 	 * stream, left in it.
+ 	 */
+-	memset(&ctx->codec.h264, 0, sizeof(ctx->codec.h264));
++	if (!test_h264_keep_state)
++		memset(&ctx->codec.h264, 0, sizeof(ctx->codec.h264));
+ 
+ 	/*
+ 	 * NOTE: All buffers allocated here are only used by HW, so we
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_vp8.c b/drivers/staging/media/sunxi/cedrus/cedrus_vp8.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_vp8.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_vp8.c
+@@ -17,6 +17,7 @@
+  */
+ 
+ #include <linux/delay.h>
++#include <linux/moduleparam.h>
+ #include <linux/types.h>
+ 
+ #include <media/videobuf2-dma-contig.h>
+@@ -909,10 +910,17 @@
+ 	return -ENOMEM;
+ }
+ 
++/* TEST ONLY: 1 = the old stop callback, which wrote VE_MODE_DISABLED to the shared engine. */
++static bool test_vp8_stop_disable;
++module_param(test_vp8_stop_disable, bool, 0644);
++
+ static void cedrus_vp8_stop(struct cedrus_ctx *ctx)
+ {
+ 	struct cedrus_dev *dev = ctx->dev;
+ 
++	if (test_vp8_stop_disable)
++		cedrus_write(dev, VE_MODE, VE_MODE_DISABLED);
++
+ 	dma_free_coherent(dev->dev, CEDRUS_ENTROPY_PROBS_SIZE,
+ 			  ctx->codec.vp8.entropy_probs_buf,
+ 			  ctx->codec.vp8.entropy_probs_buf_dma);
+-- 
+Armbian
+
