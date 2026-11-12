@@ -1,7 +1,7 @@
-From be4caffb22ddfabca658ff05b2fc32cc5751e319 Mon Sep 17 00:00:00 2001
+From 4d996f29f9bea0dc216930a9d4097b9d612de0f8 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Mon, 2 Nov 2026 02:54:41 +0000
-Subject: [PATCH 1/3] feat(allwinner): offer CPU_SUSPEND natively on the H616
+Subject: [PATCH 1/2] feat(allwinner): offer CPU_SUSPEND natively on the H616
 
 The H616 has no management processor, so its PSCI implementation falls
 back to the native ops, which only implement CPU_ON/CPU_OFF and leave
@@ -35,9 +35,7 @@ lost core's CPUIDLE_PEND bit set for good). Instead, a core's bit is
 set when it comes online (CPU_ON finisher; for the boot CPU when the
 ops are set up) and cleared by CPU_OFF, both of which run under the
 PSCI system level lock, so an offline core is still never woken by a
-stray interrupt. The CPUIDLE block itself is enabled once at setup
-rather than by every core on every power-down, as concurrent cores
-would interleave its two-word unlock sequence.
+stray interrupt.
 
 The GIC CPU interface has to be off while the core is gated, exactly
 as for CPU_OFF, so that nothing but the CPUIDLE block can end the WFI.
@@ -47,11 +45,13 @@ half powered down state (observed within seconds).
 
 The boot CPU needs one more preparation: the BROM starts it in AArch32
 and the SPL switches it to AArch64 through RMR_EL3, which leaves its
-AA64nAA32 configuration bit in CPUCFG clear. CPU_ON sets that bit for
-the secondary cores, but a power-cycled core 0 would otherwise come back
-in AArch32 at the reset vector, i.e. in the BROM (observed: the SPL
-re-running underneath the live kernel). Program AArch64 for every core
-when the PSCI ops are set up.
+AA64nAA32 configuration bit in CPUCFG clear. A power-cycled core 0
+would otherwise come back in AArch32 at the reset vector, i.e. in the
+BROM (observed: the SPL re-running underneath the live kernel). Program
+AArch64 for every core once when the native ops are set up, like crust
+does on the H6, instead of in CPU_ON. Enable the CPUIDLE block at the
+same point instead of on every CPU_OFF (the H6 CPU_OFF path still
+repeats the enable sequence, which is harmless).
 
 Describe the resulting "cpu-sleep" state in the H616 idle state table
 and add it to the DTB whenever the PSCI ops implement CPU_SUSPEND, not
@@ -62,22 +62,28 @@ The latencies are initial estimates for the TF-A round trip, to be
 refined with measurements; the residency is more conservative than the
 3.57 ms the vendor firmware advertises.
 
+Backported to lts-v2.14.11 from the version under review upstream. In
+lts-v2.14.11 the Allwinner platform does not use the generic GIC driver
+(that conversion is still under review upstream), so the platform code
+still disables and re-enables the GIC CPU interface itself.
+
+Link: https://review.trustedfirmware.org/c/TF-A/trusted-firmware-a/+/56325
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  plat/allwinner/common/allwinner-common.mk     |  11 ++
  .../common/include/sunxi_cpucfg_ncat.h        |   3 +
  plat/allwinner/common/include/sunxi_private.h |   3 +
- plat/allwinner/common/sunxi_cpu_ops.c         |  24 ++-
- plat/allwinner/common/sunxi_native_pm.c       | 153 +++++++++++++++++-
- plat/allwinner/common/sunxi_pm.c              |  24 ++-
+ plat/allwinner/common/sunxi_cpu_ops.c         |  42 ++++-
+ plat/allwinner/common/sunxi_native_pm.c       | 156 +++++++++++++++++-
+ plat/allwinner/common/sunxi_pm.c              |  15 +-
  plat/allwinner/common/sunxi_prepare_dtb.c     |   7 +-
  plat/allwinner/sun50i_h616/platform.mk        |   2 +
- .../allwinner/sun50i_h616/sunxi_idle_states.c |  19 +++
- plat/allwinner/sun50i_h616/sunxi_power.c      |  15 +-
- 10 files changed, 250 insertions(+), 11 deletions(-)
+ .../allwinner/sun50i_h616/sunxi_idle_states.c |  20 +++
+ plat/allwinner/sun50i_h616/sunxi_power.c      |   4 -
+ 10 files changed, 249 insertions(+), 14 deletions(-)
 
 diff --git a/plat/allwinner/common/allwinner-common.mk b/plat/allwinner/common/allwinner-common.mk
-index bc91c47..3faa44a 100644
+index bc91c47ee..3faa44af1 100644
 --- a/plat/allwinner/common/allwinner-common.mk
 +++ b/plat/allwinner/common/allwinner-common.mk
 @@ -56,6 +56,17 @@ BL31_SOURCES		+=	${AW_PLAT}/common/sunxi_cpu_ops.c	\
@@ -99,7 +105,7 @@ index bc91c47..3faa44a 100644
  BL31_SOURCES		+=	drivers/allwinner/sunxi_msgbox.c	\
  				drivers/arm/css/scpi/css_scpi.c		\
 diff --git a/plat/allwinner/common/include/sunxi_cpucfg_ncat.h b/plat/allwinner/common/include/sunxi_cpucfg_ncat.h
-index 22828c2..18a7654 100644
+index 22828c271..18a7654d5 100644
 --- a/plat/allwinner/common/include/sunxi_cpucfg_ncat.h
 +++ b/plat/allwinner/common/include/sunxi_cpucfg_ncat.h
 @@ -34,6 +34,9 @@
@@ -113,14 +119,14 @@ index 22828c2..18a7654 100644
  #define SUNXI_CONFIG_DELAY_REG		(SUNXI_R_CPUCFG_BASE + 0x0144)
  
 diff --git a/plat/allwinner/common/include/sunxi_private.h b/plat/allwinner/common/include/sunxi_private.h
-index b9ca3f6..f2d7633 100644
+index b9ca3f600..5a9414013 100644
 --- a/plat/allwinner/common/include/sunxi_private.h
 +++ b/plat/allwinner/common/include/sunxi_private.h
 @@ -16,8 +16,10 @@ extern const struct psci_cpu_idle_state sunxi_idle_states[];
  void sunxi_configure_mmu_el3(int flags);
  
  void sunxi_cpu_on(u_register_t mpidr);
-+void sunxi_cpu_set_aarch64(u_register_t mpidr);
++void sunxi_cpu_set_aarch64_all(void);
  void sunxi_cpu_power_off_others(void);
  void sunxi_cpu_power_off_self(void);
 +void sunxi_cpuidle_enable(void);
@@ -136,56 +142,74 @@ index b9ca3f6..f2d7633 100644
  int sunxi_pmic_setup(uint16_t socid, const void *fdt);
  void sunxi_security_setup(void);
 diff --git a/plat/allwinner/common/sunxi_cpu_ops.c b/plat/allwinner/common/sunxi_cpu_ops.c
-index 30841e2..7184713 100644
+index 30841e2ea..826b504a4 100644
 --- a/plat/allwinner/common/sunxi_cpu_ops.c
 +++ b/plat/allwinner/common/sunxi_cpu_ops.c
-@@ -85,6 +85,25 @@ static void sunxi_cpu_off(u_register_t mpidr)
+@@ -85,6 +85,42 @@ static void sunxi_cpu_off(u_register_t mpidr)
  	}
  }
  
 +/*
-+ * Make the core start in AArch64 mode after its next power-on reset. The boot
-+ * CPU is switched to AArch64 by the SPL through RMR_EL3, which leaves its
-+ * configuration bit clear, so this must be done for it explicitly before it
-+ * is ever powered down (e.g. by the CPUIDLE block): otherwise it would come
-+ * back in AArch32 at the reset vector, i.e. in the BROM.
++ * Make every core start in AArch64 mode after its next power-on reset. This
++ * includes the boot CPU: the SPL switches it to AArch64 through RMR_EL3, which
++ * leaves its configuration bit clear, so if it is ever powered down (e.g. by
++ * the CPUIDLE block) it would otherwise come back in AArch32 at the reset
++ * vector, i.e. in the BROM.
 + */
-+void sunxi_cpu_set_aarch64(u_register_t mpidr)
++void sunxi_cpu_set_aarch64_all(void)
 +{
-+	unsigned int core = MPIDR_AFFLVL0_VAL(mpidr);
++	unsigned int cluster;
++	unsigned int core;
 +
-+	if (sunxi_cpucfg_has_per_cluster_regs()) {
-+		mmio_setbits_32(SUNXI_AA64nAA32_REG(MPIDR_AFFLVL1_VAL(mpidr)),
-+				BIT(SUNXI_AA64nAA32_OFFSET + core));
-+	} else {
-+		mmio_setbits_32(SUNXI_CPU_CTRL_REG(core), BIT(0));
++	for (cluster = 0; cluster < PLATFORM_CLUSTER_COUNT; ++cluster) {
++		for (core = 0; core < PLATFORM_MAX_CPUS_PER_CLUSTER; ++core) {
++			if (sunxi_cpucfg_has_per_cluster_regs()) {
++				mmio_setbits_32(SUNXI_AA64nAA32_REG(cluster),
++						BIT(SUNXI_AA64nAA32_OFFSET + core));
++			} else {
++				mmio_setbits_32(SUNXI_CPU_CTRL_REG(core), BIT(0));
++			}
++		}
 +	}
++}
++
++/*
++ * Enable the CPUIDLE hardware block, where there is one. It powers a core off
++ * once the core executes WFI with its CORE_CLOSE flag set.
++ */
++void sunxi_cpuidle_enable(void)
++{
++#ifdef SUNXI_CPUIDLE_EN_REG
++	mmio_write_32(SUNXI_CPUIDLE_EN_REG, 0x16aa0000);
++	mmio_write_32(SUNXI_CPUIDLE_EN_REG, 0xaa160001);
++#endif
 +}
 +
  void sunxi_cpu_on(u_register_t mpidr)
  {
  	unsigned int cluster = MPIDR_AFFLVL1_VAL(mpidr);
-@@ -98,8 +117,7 @@ void sunxi_cpu_on(u_register_t mpidr)
+@@ -97,9 +133,6 @@ void sunxi_cpu_on(u_register_t mpidr)
+ 		mmio_clrbits_32(SUNXI_CPUCFG_RST_CTRL_REG(cluster), BIT(core));
  		/* Assert CPU power-on reset */
  		mmio_clrbits_32(SUNXI_POWERON_RST_REG(cluster), BIT(core));
- 		/* Set CPU to start in AArch64 mode */
+-		/* Set CPU to start in AArch64 mode */
 -		mmio_setbits_32(SUNXI_AA64nAA32_REG(cluster),
 -				BIT(SUNXI_AA64nAA32_OFFSET + core));
-+		sunxi_cpu_set_aarch64(mpidr);
  		/* Apply power to the CPU */
  		sunxi_cpu_enable_power(cluster, core);
  		/* Release the core output clamps */
-@@ -117,7 +135,7 @@ void sunxi_cpu_on(u_register_t mpidr)
+@@ -116,9 +149,6 @@ void sunxi_cpu_on(u_register_t mpidr)
+ 		/* ??? Assert CPU power-on reset ??? */
  		mmio_clrbits_32(SUNXI_CPU_UNK_REG(core), BIT(0));
  
- 		/* Set CPU to start in AArch64 mode */
+-		/* Set CPU to start in AArch64 mode */
 -		mmio_setbits_32(SUNXI_CPU_CTRL_REG(core), BIT(0));
-+		sunxi_cpu_set_aarch64(mpidr);
- 
+-
  		/* Apply power to the CPU */
  		sunxi_cpu_enable_power(cluster, core);
+ 
 diff --git a/plat/allwinner/common/sunxi_native_pm.c b/plat/allwinner/common/sunxi_native_pm.c
-index 28abd3c..de8d70f 100644
+index 28abd3c67..f1589942c 100644
 --- a/plat/allwinner/common/sunxi_native_pm.c
 +++ b/plat/allwinner/common/sunxi_native_pm.c
 @@ -4,13 +4,17 @@
@@ -333,7 +357,7 @@ index 28abd3c..de8d70f 100644
 +
 +	assert(req_state != NULL);
 +
-+	/* Without a management processor, only the CPU level can be changed. */
++	/* Only the CPU level is implemented. */
 +	if (power_level != CPU_PWR_LVL ||
 +	    (state_id >> PLAT_LOCAL_PSTATE_WIDTH) != 0U) {
 +		return PSCI_E_INVALID_PARAMS;
@@ -374,25 +398,28 @@ index 28abd3c..de8d70f 100644
  	.system_off			= sunxi_system_off,
  	.system_reset			= sunxi_system_reset,
  	.validate_ns_entrypoint		= sunxi_validate_ns_entrypoint,
-@@ -76,5 +214,16 @@ static const plat_psci_ops_t sunxi_native_psci_ops = {
+@@ -76,5 +214,19 @@ static const plat_psci_ops_t sunxi_native_psci_ops = {
  
  void sunxi_set_native_psci_ops(const plat_psci_ops_t **psci_ops)
  {
-+#if SUNXI_NATIVE_CPU_SUSPEND
 +	/*
-+	 * Called on the boot CPU before any other core runs: enable the
-+	 * CPUIDLE block once (cores entering cpu-sleep concurrently would
-+	 * otherwise interleave its two-word unlock sequence) and let it wake
-+	 * the boot CPU; the secondaries are armed by their CPU_ON finisher.
++	 * Called once on the boot CPU before any other core runs. Every core
++	 * must come out of a power-on reset in AArch64, including the boot CPU,
++	 * which the SPL switched to AArch64 through RMR_EL3 only. Enable the
++	 * CPUIDLE block, which powers cores down for CPU_OFF (and CPU_SUSPEND).
 +	 */
++	sunxi_cpu_set_aarch64_all();
 +	sunxi_cpuidle_enable();
++
++#if SUNXI_NATIVE_CPU_SUSPEND
++	/* Secondary cores are armed by their CPU_ON finisher. */
 +	sunxi_cpuidle_wake_enable(true);
 +#endif
 +
  	*psci_ops = &sunxi_native_psci_ops;
  }
 diff --git a/plat/allwinner/common/sunxi_pm.c b/plat/allwinner/common/sunxi_pm.c
-index ebc406b..13bf549 100644
+index ebc406b91..68fd3e123 100644
 --- a/plat/allwinner/common/sunxi_pm.c
 +++ b/plat/allwinner/common/sunxi_pm.c
 @@ -30,6 +30,15 @@ bool sunxi_psci_is_scpi(void)
@@ -411,24 +438,7 @@ index ebc406b..13bf549 100644
  int sunxi_validate_ns_entrypoint(uintptr_t ns_entrypoint)
  {
  	/* The non-secure entry point must be in DRAM */
-@@ -45,8 +54,15 @@ int plat_setup_psci_ops(uintptr_t sec_entrypoint,
- {
- 	assert(psci_ops);
- 
--	/* Program all CPU entry points. */
-+	/* Program all CPU entry points, and have every core reset into AArch64. */
- 	for (unsigned int cpu = 0; cpu < PLATFORM_CORE_COUNT; ++cpu) {
-+		if (SUNXI_PSCI_USE_NATIVE != 0) {
-+			u_register_t mpidr =
-+				((cpu / PLATFORM_MAX_CPUS_PER_CLUSTER) << MPIDR_AFF1_SHIFT) |
-+				((cpu % PLATFORM_MAX_CPUS_PER_CLUSTER) << MPIDR_AFF0_SHIFT);
-+
-+			sunxi_cpu_set_aarch64(mpidr);
-+		}
- 		if (sunxi_cpucfg_has_per_cluster_regs()) {
- 			mmio_write_32(SUNXI_CPUCFG_RVBAR_LO_REG(cpu),
- 				      sec_entrypoint & 0xffffffff);
-@@ -64,7 +80,11 @@ int plat_setup_psci_ops(uintptr_t sec_entrypoint,
+@@ -64,7 +73,11 @@ int plat_setup_psci_ops(uintptr_t sec_entrypoint,
  		INFO("PSCI: Suspend is available via SCPI\n");
  		psci_is_scpi = true;
  	} else {
@@ -442,7 +452,7 @@ index ebc406b..13bf549 100644
  	}
  
 diff --git a/plat/allwinner/common/sunxi_prepare_dtb.c b/plat/allwinner/common/sunxi_prepare_dtb.c
-index 0f68974..7072d51 100644
+index 0f689744a..7072d51d3 100644
 --- a/plat/allwinner/common/sunxi_prepare_dtb.c
 +++ b/plat/allwinner/common/sunxi_prepare_dtb.c
 @@ -36,7 +36,12 @@ void sunxi_prepare_dtb(void *fdt)
@@ -460,7 +470,7 @@ index 0f68974..7072d51 100644
  		if (ret < 0) {
  			WARN("Failed to add idle states to DT: %d\n", ret);
 diff --git a/plat/allwinner/sun50i_h616/platform.mk b/plat/allwinner/sun50i_h616/platform.mk
-index 6f44e8c..5610234 100644
+index 6f44e8c26..5610234cb 100644
 --- a/plat/allwinner/sun50i_h616/platform.mk
 +++ b/plat/allwinner/sun50i_h616/platform.mk
 @@ -9,6 +9,8 @@ SUNXI_BL31_IN_DRAM	:=	1
@@ -473,19 +483,20 @@ index 6f44e8c..5610234 100644
  # The differences between the platforms are covered by the include files.
  include plat/allwinner/common/allwinner-common.mk
 diff --git a/plat/allwinner/sun50i_h616/sunxi_idle_states.c b/plat/allwinner/sun50i_h616/sunxi_idle_states.c
-index 4339bcd..2665a36 100644
+index 4339bcd77..549f3907b 100644
 --- a/plat/allwinner/sun50i_h616/sunxi_idle_states.c
 +++ b/plat/allwinner/sun50i_h616/sunxi_idle_states.c
-@@ -6,6 +6,25 @@
+@@ -6,6 +6,26 @@
  
  #include <sunxi_private.h>
  
 +/*
-+ * The only idle state beyond WFI that the H616 can implement without a
-+ * management processor is powering a single core off: the CPUIDLE hardware
-+ * block gates the core when it enters WFI with its CORE_CLOSE flag set, and
-+ * powers it back up (resetting into BL31) once the GIC has an interrupt
-+ * pending for it. The cluster, its L2 cache and the GIC stay on.
++ * Only a core power-down state is implemented: the CPUIDLE hardware block
++ * gates a core when it enters WFI with its CORE_CLOSE flag set, and powers it
++ * back up (resetting into BL31) once the GIC has an interrupt pending for it.
++ * The block also has a voting mechanism that allows the whole cluster to be
++ * powered off, but no cluster state is implemented here, so the cluster, its
++ * L2 cache and the GIC stay on.
 + *
 + * The latencies are the TF-A round trip (SMC, L1 clean, CPUIDLE power-down
 + * sequence, reset into the warm boot path, context restore). The residency
@@ -503,36 +514,20 @@ index 4339bcd..2665a36 100644
  	{}
  };
 diff --git a/plat/allwinner/sun50i_h616/sunxi_power.c b/plat/allwinner/sun50i_h616/sunxi_power.c
-index 8ae16bb..ef6df3f 100644
+index 8ae16bbce..d13f8562a 100644
 --- a/plat/allwinner/sun50i_h616/sunxi_power.c
 +++ b/plat/allwinner/sun50i_h616/sunxi_power.c
-@@ -269,14 +269,23 @@ void sunxi_power_down(void)
- 	}
- }
- 
-+/* Enable the CPUIDLE hardware (only really needs to be done once). */
-+void sunxi_cpuidle_enable(void)
-+{
-+	if ((mmio_read_32(SUNXI_CPUIDLE_EN_REG) & BIT(0)) != 0U) {
-+		return;
-+	}
-+
-+	mmio_write_32(SUNXI_CPUIDLE_EN_REG, 0x16aa0000);
-+	mmio_write_32(SUNXI_CPUIDLE_EN_REG, 0xaa160001);
-+}
-+
- void sunxi_cpu_power_off_self(void)
- {
+@@ -274,10 +274,6 @@ void sunxi_cpu_power_off_self(void)
  	u_register_t mpidr = read_mpidr();
  	unsigned int core  = MPIDR_AFFLVL0_VAL(mpidr);
  
 -	/* Enable the CPUIDLE hardware (only really needs to be done once). */
 -	mmio_write_32(SUNXI_CPUIDLE_EN_REG, 0x16aa0000);
 -	mmio_write_32(SUNXI_CPUIDLE_EN_REG, 0xaa160001);
-+	sunxi_cpuidle_enable();
- 
+-
  	/* Trigger power off for this core. */
  	mmio_write_32(SUNXI_CORE_CLOSE_REG, BIT_32(core));
+ }
 -- 
 2.55.0
 

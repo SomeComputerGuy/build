@@ -1,7 +1,7 @@
-From 87decaa0ef07d04a518012267eafe2602cc4264d Mon Sep 17 00:00:00 2001
+From ec03c36e9115a8cc66661abc0a505320e0a6f5b4 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
-Date: Mon, 2 Nov 2026 02:57:02 +0000
-Subject: [PATCH 2/3] feat(allwinner): implement SYSTEM_SUSPEND natively on the
+Date: Thu, 12 Nov 2026 09:32:29 +0000
+Subject: [PATCH 2/2] feat(allwinner): implement SYSTEM_SUSPEND natively on the
  H616
 
 The H616 has no management processor, so nothing but the CPUs themselves
@@ -11,50 +11,67 @@ the native PSCI ops by keeping the last CPU alive in SRAM:
  - PSCI's generic power-down preparation has already cleaned the L1 and
    L2 caches and disabled the data cache when the platform pwr_down hook
    runs; the other cores were powered off by the OS via CPU_OFF.
- - The CPU is switched to the 24 MHz oscillator and PLL_CPUX is stopped.
  - A small position independent routine is copied to SRAM A1 (unused
-   after the SPL has run). The CPU turns its MMU and caches off and jumps
-   there, so that no DRAM access happens while the DRAM controller is put
-   into self-refresh: with the MBUS masters disabled (as crust does on
-   the H6), PWRCTL.selfref_sw is set and STAT.operating_mode polled for
+   after the SPL has run), then the CPU is switched to the 24 MHz
+   oscillator and PLL_CPUX is stopped.
+ - The CPU turns its MMU and caches off and jumps to SRAM, so that no
+   DRAM access happens while the DRAM controller is put into
+   self-refresh: with the MBUS masters disabled (as crust does on the
+   H6), PWRCTL.selfref_sw is set and STAT.operating_mode polled for
    self-refresh. selfref_sw is changed inside a SWCTL.sw_done/
    SWSTAT.sw_done_ack handshake, as U-Boot's H616 DRAM init does when it
    leaves self-refresh, and the operating mode is compared on its low
    two bits like U-Boot does. All waits are bounded by the generic
    counter (20 ms each); the routine reports timeouts and the
-   STAT/PWRCTL values seen. The H616 DRAM controller blocks are at
-   0x047fa000 (MC_COM) and 0x047fb000 (controller), not at the A133
-   addresses.
+   STAT/PWRCTL values seen.
  - The routine waits in WFI. The GIC CPU interface stays enabled and IRQs
    are routed to EL3 but masked, so every interrupt the OS left enabled
    in the GIC (RTC alarm, GPIO, ...) is a wakeup source without any
    platform specific wakeup source bookkeeping.
- - On wakeup the routine takes the DRAM out of self-refresh, records the
-   outcome, and branches to bl31_warm_entrypoint, so the CPU resumes
-   through the regular PSCI warm boot path as if it had been powered off.
- - The suspend finisher restarts PLL_CPUX, waits for it to lock, restores
-   the CPU clock selection and reports whether self-refresh was reached.
+ - On wakeup the routine restarts PLL_CPUX, takes the DRAM out of
+   self-refresh, waits for the PLL to lock and switches the CPU back to
+   it. If the PLL does not lock in time, the CPU stays on the 24 MHz
+   oscillator and the report says so. It then records the outcome and
+   branches to bl31_warm_entrypoint.
+ - The suspend finisher reports whether self-refresh was reached and
+   warns if the PLL did not lock.
+
+The CPU stays powered throughout, but SYSTEM_SUSPEND still uses the OFF
+state at every level: the generic PSCI code only accepts a power-down
+state for it (psci_system_suspend() asserts that the system level is
+off), and a pwr_down hook that returns ends in
+psci_pwrdown_cpu_end_wakeup(), which panics on cores without hardware
+assisted coherency such as the Cortex-A53. So the CPU resumes through
+the regular PSCI warm boot path as if it had been powered off, which
+also gives the OS what it asked for (execution continues at the entry
+point passed to SYSTEM_SUSPEND), and it does so at full speed.
 
 The GIC distributor, the cluster and the DRAM supplies remain powered;
 reducing the CPU voltage or stopping the DRAM clocks and PLLs during
 standby are possible follow-ups once this baseline is proven.
 
+Backported to lts-v2.14.11 from the version under review upstream. In
+lts-v2.14.11 the Allwinner platform does not use the generic GIC driver
+(that conversion is still under review upstream), so the platform code
+still disables and re-enables the GIC CPU interface itself.
+
+Link: https://review.trustedfirmware.org/c/TF-A/trusted-firmware-a/+/56326
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  plat/allwinner/common/allwinner-common.mk     |  15 ++
  plat/allwinner/common/include/sunxi_private.h |   5 +
- plat/allwinner/common/sunxi_native_pm.c       |  48 ++++-
- plat/allwinner/common/sunxi_native_suspend.c  | 134 ++++++++++++++
- plat/allwinner/common/sunxi_standby_sram.S    | 172 ++++++++++++++++++
+ plat/allwinner/common/sunxi_native_pm.c       |  55 ++++-
+ plat/allwinner/common/sunxi_native_suspend.c  | 123 ++++++++++
+ plat/allwinner/common/sunxi_standby_sram.S    | 218 ++++++++++++++++++
  .../allwinner/sun50i_h616/include/sunxi_ccu.h |   2 +
  .../sun50i_h616/include/sunxi_mmap.h          |   2 +
  plat/allwinner/sun50i_h616/platform.mk        |   2 +
- 8 files changed, 379 insertions(+), 1 deletion(-)
+ 8 files changed, 421 insertions(+), 1 deletion(-)
  create mode 100644 plat/allwinner/common/sunxi_native_suspend.c
  create mode 100644 plat/allwinner/common/sunxi_standby_sram.S
 
 diff --git a/plat/allwinner/common/allwinner-common.mk b/plat/allwinner/common/allwinner-common.mk
-index 3faa44a..88541a0 100644
+index 3faa44af1..88541a044 100644
 --- a/plat/allwinner/common/allwinner-common.mk
 +++ b/plat/allwinner/common/allwinner-common.mk
 @@ -67,6 +67,21 @@ ifeq (${SUNXI_NATIVE_CPU_SUSPEND}${SUNXI_PSCI_USE_NATIVE},10)
@@ -80,7 +97,7 @@ index 3faa44a..88541a0 100644
  BL31_SOURCES		+=	drivers/allwinner/sunxi_msgbox.c	\
  				drivers/arm/css/scpi/css_scpi.c		\
 diff --git a/plat/allwinner/common/include/sunxi_private.h b/plat/allwinner/common/include/sunxi_private.h
-index f2d7633..2653e61 100644
+index 5a9414013..7fd0a56d0 100644
 --- a/plat/allwinner/common/include/sunxi_private.h
 +++ b/plat/allwinner/common/include/sunxi_private.h
 @@ -45,6 +45,11 @@ static inline int sunxi_set_scpi_psci_ops(const plat_psci_ops_t **psci_ops)
@@ -96,7 +113,7 @@ index f2d7633..2653e61 100644
  void sunxi_security_setup(void);
  
 diff --git a/plat/allwinner/common/sunxi_native_pm.c b/plat/allwinner/common/sunxi_native_pm.c
-index de8d70f..5a6907b 100644
+index f1589942c..64429076c 100644
 --- a/plat/allwinner/common/sunxi_native_pm.c
 +++ b/plat/allwinner/common/sunxi_native_pm.c
 @@ -31,9 +31,12 @@
@@ -127,7 +144,7 @@ index de8d70f..5a6907b 100644
  	gicv2_cpuif_disable();
  
  	sunxi_cpu_power_off_self();
-@@ -130,10 +141,41 @@ static void sunxi_pwr_domain_suspend(const psci_power_state_t *target_state)
+@@ -130,10 +141,48 @@ static void sunxi_pwr_domain_suspend(const psci_power_state_t *target_state)
  
  static void sunxi_pwr_domain_suspend_finish(const psci_power_state_t *target_state)
  {
@@ -161,6 +178,13 @@ index de8d70f..5a6907b 100644
 +
 +	assert(req_state != NULL);
 +
++	/*
++	 * The CPU actually stays powered (it waits in SRAM), but the generic
++	 * PSCI code only accepts a power-down state for SYSTEM_SUSPEND (see
++	 * psci_system_suspend()), and the CPU does lose its context from the
++	 * caller's point of view: it resumes at the entry point given to
++	 * SYSTEM_SUSPEND, through the BL31 warm boot path.
++	 */
 +	for (i = 0; i <= PLAT_MAX_PWR_LVL; ++i) {
 +		req_state->pwr_domain_state[i] = PLAT_MAX_OFF_STATE;
 +	}
@@ -170,7 +194,7 @@ index de8d70f..5a6907b 100644
  static int sunxi_validate_power_state(unsigned int power_state,
  				      psci_power_state_t *req_state)
  {
-@@ -206,6 +248,10 @@ static const plat_psci_ops_t sunxi_native_psci_ops = {
+@@ -206,6 +255,10 @@ static const plat_psci_ops_t sunxi_native_psci_ops = {
  	.pwr_domain_suspend		= sunxi_pwr_domain_suspend,
  	.pwr_domain_suspend_finish	= sunxi_pwr_domain_suspend_finish,
  	.validate_power_state		= sunxi_validate_power_state,
@@ -183,10 +207,10 @@ index de8d70f..5a6907b 100644
  	.system_reset			= sunxi_system_reset,
 diff --git a/plat/allwinner/common/sunxi_native_suspend.c b/plat/allwinner/common/sunxi_native_suspend.c
 new file mode 100644
-index 0000000..32941fb
+index 000000000..e5b8b0612
 --- /dev/null
 +++ b/plat/allwinner/common/sunxi_native_suspend.c
-@@ -0,0 +1,134 @@
+@@ -0,0 +1,123 @@
 +/*
 + * Copyright (c) 2026, Arun Iyengar <aiyengar1990@gmail.com>
 + *
@@ -208,20 +232,19 @@ index 0000000..32941fb
 +
 +/* PLL_CPUX control register */
 +#define PLL_CPUX_ENABLE			BIT(31)
-+#define PLL_CPUX_LOCK_ENABLE		BIT(29)
-+#define PLL_CPUX_LOCK			BIT(28)
 +
 +/* CPUX_AXI configuration register */
 +#define CPUX_CLK_SRC_MASK		GENMASK(26, 24)
 +#define CPUX_CLK_SRC_OSC24M		(0U << 24)
 +
-+/* Time limit of each wait on the DRAM controller in SRAM, in 24 MHz ticks */
++/* Time limit of each wait in SRAM (DRAM controller, PLL lock), in 24 MHz ticks */
 +#define STANDBY_POLL_LIMIT		(20U * 24000U)
 +
 +#define STANDBY_RESULT_SR_ENTRY_TIMEOUT	BIT(0)
 +#define STANDBY_RESULT_SR_EXIT_TIMEOUT	BIT(1)
 +#define STANDBY_RESULT_SW_ENTRY_TIMEOUT	BIT(2)
 +#define STANDBY_RESULT_SW_EXIT_TIMEOUT	BIT(3)
++#define STANDBY_RESULT_PLL_LOCK_TIMEOUT	BIT(4)
 +#define STANDBY_RESULT_VALID		BIT(31)
 +
 +/* Written by the SRAM routine once DRAM is usable again. */
@@ -235,10 +258,9 @@ index 0000000..32941fb
 +extern const uint32_t sunxi_standby_sram_start[], sunxi_standby_sram_end[];
 +void __dead2 sunxi_standby_jump(uintptr_t entry, uintptr_t ctl, uintptr_t com,
 +				uintptr_t resume, uint32_t timeout,
-+				struct sunxi_standby_report *report);
++				struct sunxi_standby_report *report,
++				uint32_t pll_cpux, uint32_t cpux_axi_cfg);
 +
-+static uint32_t saved_cpux_axi_cfg;
-+static uint32_t saved_pll_cpux;
 +static struct sunxi_standby_report standby_report;
 +
 +/*
@@ -247,25 +269,18 @@ index 0000000..32941fb
 + *
 + * Without a management processor the boot CPU itself has to put the DRAM into
 + * self-refresh and take it out again, which it can only do while executing
-+ * from SRAM. So: slow the CPU down to the 24 MHz oscillator and stop its PLL,
-+ * copy the standby routine to SRAM A1 (free once the SPL has run), and jump
-+ * there with MMU and caches off. The routine waits in WFI for an interrupt
-+ * that the OS left enabled in the GIC and finally resets this core into the
-+ * BL31 warm boot entry point, as if it had been powered off and on again.
++ * from SRAM. So: copy the standby routine to SRAM A1 (free once the SPL has
++ * run), slow the CPU down to the 24 MHz oscillator and stop its PLL, and jump
++ * to SRAM with MMU and caches off. The routine waits in WFI for an interrupt
++ * that the OS left enabled in the GIC, brings DRAM and the CPU clock back and
++ * finally enters the BL31 warm boot entry point, as if this core had been
++ * powered off and on again.
 + */
 +void __dead2 sunxi_native_system_suspend_pwr_down(void)
 +{
 +	const uint32_t *src = sunxi_standby_sram_start;
 +	uintptr_t dst = SUNXI_SRAM_A1_BASE;
-+
-+	/* Run the CPU from the 24 MHz oscillator and stop its PLL. */
-+	saved_cpux_axi_cfg = mmio_read_32(SUNXI_CCU_CPUX_AXI_CFG_REG);
-+	mmio_write_32(SUNXI_CCU_CPUX_AXI_CFG_REG,
-+		      (saved_cpux_axi_cfg & ~CPUX_CLK_SRC_MASK) |
-+		      CPUX_CLK_SRC_OSC24M);
-+	udelay(1);
-+	saved_pll_cpux = mmio_read_32(SUNXI_CCU_PLL_CPUX_REG);
-+	mmio_write_32(SUNXI_CCU_PLL_CPUX_REG, saved_pll_cpux & ~PLL_CPUX_ENABLE);
++	uint32_t cpux_axi_cfg, pll_cpux;
 +
 +	/* SRAM is mapped as device memory, so copy it word by word. */
 +	while (src < sunxi_standby_sram_end) {
@@ -274,6 +289,15 @@ index 0000000..32941fb
 +	}
 +	dsbsy();
 +
++	/* Run the CPU from the 24 MHz oscillator and stop its PLL. */
++	cpux_axi_cfg = mmio_read_32(SUNXI_CCU_CPUX_AXI_CFG_REG);
++	mmio_write_32(SUNXI_CCU_CPUX_AXI_CFG_REG,
++		      (cpux_axi_cfg & ~CPUX_CLK_SRC_MASK) |
++		      CPUX_CLK_SRC_OSC24M);
++	udelay(1);
++	pll_cpux = mmio_read_32(SUNXI_CCU_PLL_CPUX_REG);
++	mmio_write_32(SUNXI_CCU_PLL_CPUX_REG, pll_cpux & ~PLL_CPUX_ENABLE);
++
 +	/* A pending Non-secure interrupt must terminate the WFI in SRAM. */
 +	write_scr_el3(read_scr_el3() | SCR_IRQ_BIT);
 +	isb();
@@ -281,29 +305,14 @@ index 0000000..32941fb
 +	standby_report.result = 0;
 +	sunxi_standby_jump(SUNXI_SRAM_A1_BASE, SUNXI_DRAM_CTL_BASE,
 +			   SUNXI_DRAM_COM_BASE, (uintptr_t)bl31_warm_entrypoint,
-+			   STANDBY_POLL_LIMIT, &standby_report);
++			   STANDBY_POLL_LIMIT, &standby_report,
++			   pll_cpux, cpux_axi_cfg);
 +}
 +
 +/* Called from the warm boot path on the CPU that resumes the system. */
 +void sunxi_native_system_suspend_finish(void)
 +{
 +	uint32_t result = standby_report.result;
-+	unsigned int timeout = 1000;
-+
-+	/* Restart the PLL and wait for it to lock before switching back. */
-+	if ((saved_pll_cpux & PLL_CPUX_ENABLE) != 0U) {
-+		mmio_write_32(SUNXI_CCU_PLL_CPUX_REG,
-+			      saved_pll_cpux | PLL_CPUX_LOCK_ENABLE);
-+		while ((mmio_read_32(SUNXI_CCU_PLL_CPUX_REG) & PLL_CPUX_LOCK) == 0U) {
-+			if (--timeout == 0U) {
-+				WARN("PSCI: PLL_CPUX failed to lock\n");
-+				break;
-+			}
-+			udelay(1);
-+		}
-+		mmio_write_32(SUNXI_CCU_PLL_CPUX_REG, saved_pll_cpux);
-+	}
-+	mmio_write_32(SUNXI_CCU_CPUX_AXI_CFG_REG, saved_cpux_axi_cfg);
 +
 +	if ((result & STANDBY_RESULT_VALID) == 0U) {
 +		WARN("PSCI: resumed without passing through the SRAM standby code\n");
@@ -320,13 +329,17 @@ index 0000000..32941fb
 +	} else {
 +		INFO("PSCI: system resumed, DRAM was in self-refresh\n");
 +	}
++
++	if ((result & STANDBY_RESULT_PLL_LOCK_TIMEOUT) != 0U) {
++		WARN("PSCI: PLL_CPUX failed to lock, CPU left at 24 MHz\n");
++	}
 +}
 diff --git a/plat/allwinner/common/sunxi_standby_sram.S b/plat/allwinner/common/sunxi_standby_sram.S
 new file mode 100644
-index 0000000..aa033d6
+index 000000000..76af8b68d
 --- /dev/null
 +++ b/plat/allwinner/common/sunxi_standby_sram.S
-@@ -0,0 +1,172 @@
+@@ -0,0 +1,218 @@
 +/*
 + * Copyright (c) 2026, Arun Iyengar <aiyengar1990@gmail.com>
 + *
@@ -335,6 +348,9 @@ index 0000000..aa033d6
 +
 +#include <arch.h>
 +#include <asm_macros.S>
++
++#include <sunxi_ccu.h>
++#include <sunxi_mmap.h>
 +
 +	.globl	sunxi_standby_jump
 +	.globl	sunxi_standby_sram_start
@@ -355,22 +371,30 @@ index 0000000..aa033d6
 +#define MCTL_COM_MAER1			0x024
 +#define MCTL_COM_MAER2			0x028
 +
++/* PLL_CPUX control register */
++#define PLL_CPUX_ENABLE_BIT		31
++#define PLL_CPUX_LOCK_ENABLE		(1 << 29)
++#define PLL_CPUX_LOCK_BIT		28
++
 +/*
 + * void sunxi_standby_jump(uintptr_t entry, uintptr_t ctl, uintptr_t com,
 + *			   uintptr_t resume, uint32_t timeout,
-+ *			   struct sunxi_standby_report *report);
++ *			   struct sunxi_standby_report *report,
++ *			   uint32_t pll_cpux, uint32_t cpux_axi_cfg);
 + *
 + * Turn the MMU and the caches off (BL31 is identity mapped, so execution
 + * continues seamlessly) and enter the standby routine copied to SRAM with
-+ * its arguments shifted into x0-x4. Never returns.
++ * its arguments shifted into x0-x6. Never returns.
 + */
 +func sunxi_standby_jump
-+	mov	x6, x0
++	mov	x8, x0
 +	mov	x0, x1
 +	mov	x1, x2
 +	mov	x2, x3
 +	mov	w3, w4			/* uint32_t: zero-extend */
 +	mov	x4, x5
++	mov	w5, w6
++	mov	w6, w7
 +	mrs	x7, sctlr_el3
 +	bic	x7, x7, #SCTLR_M_BIT
 +	bic	x7, x7, #SCTLR_C_BIT
@@ -380,7 +404,7 @@ index 0000000..aa033d6
 +	ic	iallu
 +	dsb	sy
 +	isb
-+	br	x6
++	br	x8
 +endfunc sunxi_standby_jump
 +
 +/*
@@ -391,14 +415,18 @@ index 0000000..aa033d6
 + * x1: DRAM controller common (MC_COM) base
 + * x2: resume address (BL31 warm boot entry point)
 + * x3: time limit in counter ticks for each wait on the DRAM controller
-+ *     (0: do not touch the DRAM controller at all)
++ *     and for the PLL lock (0: do not touch the DRAM controller at all)
 + * x4: address of the report (struct sunxi_standby_report, 4 x uint32_t),
 + *     written once DRAM is back: result (bit 31 valid, bit 0/1 entering/
 + *     leaving self-refresh timed out, bit 2/3 the SWCTL handshake timed out
-+ *     on entry/exit, bits 15:8 / 23:16 the low byte of the last STATR value
-+ *     seen by a timed-out poll), STATR when self-refresh was reached (or the
-+ *     entry poll gave up), STATR when it was left (or the exit poll gave
-+ *     up), and PWRCTL as read back after the self-refresh request.
++ *     on entry/exit, bit 4 PLL_CPUX did not lock, bits 15:8 / 23:16 the low
++ *     byte of the last STATR value seen by a timed-out poll), STATR when
++ *     self-refresh was reached (or the entry poll gave up), STATR when it
++ *     was left (or the exit poll gave up), and PWRCTL as read back after the
++ *     self-refresh request.
++ * w5: PLL_CPUX control register value to restore (PLL not restarted if its
++ *     enable bit is clear)
++ * w6: CPUX_AXI_CFG value to restore (CPU clock source and dividers)
 + *
 + * PWRCTL.selfref_sw is changed the way U-Boot's H616 DRAM init changes it
 + * when it leaves self-refresh: with SWCTL.sw_done cleared, then setting
@@ -406,6 +434,11 @@ index 0000000..aa033d6
 + * compared on its low two bits, as U-Boot does. Only the controller (and the
 + * MBUS master enables in MC_COM) are involved: the PHY keeps its clocks, so
 + * nothing there needs restoring on the way out.
++ *
++ * After the wakeup, PLL_CPUX is restarted at once, so that it locks while
++ * the DRAM leaves self-refresh, and the CPU is switched back to it before
++ * entering BL31. If the PLL does not lock in time, the CPU stays on the
++ * 24 MHz oscillator and the report says so.
 + *
 + * Only the IRQ/FIQ signals from the GIC CPU interface can end the WFI,
 + * which is what makes any interrupt the OS left enabled a wakeup source.
@@ -429,6 +462,11 @@ index 0000000..aa033d6
 +.endm
 +
 +sunxi_standby_sram_start:
++	mov	w19, w5
++	mov	w20, w6
++	mov_imm	x21, SUNXI_CCU_PLL_CPUX_REG
++	mov_imm	x22, SUNXI_CCU_CPUX_AXI_CFG_REG
++
 +	/* Quiesce all MBUS masters, keeping their enable masks. */
 +	ldr	w5, [x1, #MCTL_COM_MAER0]
 +	ldr	w6, [x1, #MCTL_COM_MAER1]
@@ -466,7 +504,12 @@ index 0000000..aa033d6
 +2:	dsb	sy
 +	isb
 +	wfi
-+	cbz	x3, 4f
++
++	/* Restart PLL_CPUX now, so that it locks while DRAM wakes up. */
++	tbz	w19, #PLL_CPUX_ENABLE_BIT, 21f
++	orr	w11, w19, #PLL_CPUX_LOCK_ENABLE
++	str	w11, [x21]
++21:	cbz	x3, 4f
 +
 +	/* Leave self-refresh (normal or power-down operation both do). */
 +	mov	w9, w8
@@ -489,8 +532,24 @@ index 0000000..aa033d6
 +	str	w7, [x1, #MCTL_COM_MAER2]
 +	dsb	sy
 +
++	/* Switch the CPU back to PLL_CPUX once it has locked. */
++	tbz	w19, #PLL_CPUX_ENABLE_BIT, 6f
++	mrs	x13, cntpct_el0
++5:	ldr	w11, [x21]
++	tbnz	w11, #PLL_CPUX_LOCK_BIT, 52f
++	mrs	x14, cntpct_el0
++	sub	x14, x14, x13
++	cmp	x14, x3
++	b.lo	5b
++	orr	w10, w10, #0x10			/* PLL_CPUX did not lock */
++	b	7f
++52:	str	w19, [x21]
++6:	str	w20, [x22]
++	dsb	sy
++	isb
++
 +	/* DRAM is usable again: record the outcome and resume BL31. */
-+	orr	w10, w10, #0x80000000
++7:	orr	w10, w10, #0x80000000
 +	str	w15, [x4, #4]
 +	str	w16, [x4, #8]
 +	str	w17, [x4, #12]
@@ -500,7 +559,7 @@ index 0000000..aa033d6
 +	br	x2
 +sunxi_standby_sram_end:
 diff --git a/plat/allwinner/sun50i_h616/include/sunxi_ccu.h b/plat/allwinner/sun50i_h616/include/sunxi_ccu.h
-index 85fbb90..ea4d9b0 100644
+index 85fbb9080..ea4d9b0e5 100644
 --- a/plat/allwinner/sun50i_h616/include/sunxi_ccu.h
 +++ b/plat/allwinner/sun50i_h616/include/sunxi_ccu.h
 @@ -7,6 +7,8 @@
@@ -513,7 +572,7 @@ index 85fbb90..ea4d9b0 100644
  
  #define SUNXI_R_PRCM_SEC_SWITCH_REG	(SUNXI_R_PRCM_BASE + 0x0290)
 diff --git a/plat/allwinner/sun50i_h616/include/sunxi_mmap.h b/plat/allwinner/sun50i_h616/include/sunxi_mmap.h
-index 24a4ba8..763dc49 100644
+index 24a4ba8e6..763dc49ff 100644
 --- a/plat/allwinner/sun50i_h616/include/sunxi_mmap.h
 +++ b/plat/allwinner/sun50i_h616/include/sunxi_mmap.h
 @@ -29,6 +29,8 @@
@@ -526,7 +585,7 @@ index 24a4ba8..763dc49 100644
  #define SUNXI_GICC_BASE			0x03022000
  #define SUNXI_UART0_BASE		0x05000000
 diff --git a/plat/allwinner/sun50i_h616/platform.mk b/plat/allwinner/sun50i_h616/platform.mk
-index 5610234..331b9ec 100644
+index 5610234cb..331b9ec1c 100644
 --- a/plat/allwinner/sun50i_h616/platform.mk
 +++ b/plat/allwinner/sun50i_h616/platform.mk
 @@ -11,6 +11,8 @@ SUNXI_PSCI_USE_SCPI	:=	0
