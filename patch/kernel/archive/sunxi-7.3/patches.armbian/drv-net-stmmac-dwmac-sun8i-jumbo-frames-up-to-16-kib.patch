@@ -3,44 +3,33 @@ From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 10:00:00 +0000
 Subject: [PATCH] net: stmmac: dwmac-sun8i: jumbo frames up to 16 KiB
 
-The EMAC supports frames of up to 16384 bytes (H616 user manual 6.1;
-EMAC_TX_CTL0/EMAC_RX_CTL0 bit 30 FRM_LEN_CTL: 2048 bytes, 10240 with
-JUMBO_FRM_EN, 16384 with FRM_LEN_CTL). Up to MTU 4070 a frame with two
-VLAN tags and the FCS fits in the 4 KiB TX FIFO and is sent in
-store-and-forward mode. Allow MTUs up to 16358 (a 16384-byte frame)
-where the DMA is fast enough:
+The EMAC handles frames up to 16384 bytes (H616 UM 6.1, RX/TX_CTL0
+bit 30 FRM_LEN_CTL), but the MTU stops at 4070, the largest frame that
+fits the 4 KiB TX FIFO for store-and-forward.
 
-- the DMA burst length (EMAC_BASIC_CTL1 BURST_LEN, one 6-bit field in
-  words for RX and TX) comes from the variant (32 on the H616 EMAC0,
-  else 8 as before) or from snps,pbl/txpbl/rxpbl (the largest). With
-  bursts of 8 words the TX DMA is no faster than a 1 Gbit/s link and
-  the TX FIFO runs empty inside frames larger than itself (TX
-  underflow); with 16 or 32 it stays full. MTUs above the TX FIFO are
-  only allowed with a burst length of 16 or more
-  (STMMAC_FLAG_TX_THRESH_JUMBO);
-- with that flag: FRM_LEN_CTL in RX_CTL0 and TX_CTL0; frames larger
-  than the TX FIFO are sent in threshold mode (TX_TH 256) without
-  checksum insertion; stmmac_change_mtu() no longer compares the
-  aligned MTU with the TX FIFO and 16368 (dev->max_mtu bounds it);
-- frames larger than half of the 16 KiB RX FIFO are received in
-  threshold mode (RX_TH 32, as the vendor driver does): in
-  store-and-forward mode the RX DMA waits for the whole frame and the
-  next back-to-back frame overflows the FIFO;
-- fix the TX and RX threshold mappings (the largest thresholds were
-  never selected; a TX mode of 256 selected 64);
-- the TX underflow interrupt resumes the suspended TX DMA instead of
-  resetting the whole TX ring (stmmac_tx_err()).
+Larger frames need TX threshold mode, and then the DMA must outrun the
+line: with bursts of 8 words it does not, and the TX FIFO underflows
+inside the frame. Bursts of 16 or 32 keep it full.
+
+- BASIC_CTL1 BURST_LEN from the variant (32 on H616 EMAC0, else 8) or
+  snps,pbl/txpbl/rxpbl (largest; one field for RX and TX);
+- with a burst length >= 16 (STMMAC_FLAG_TX_THRESH_JUMBO): max MTU
+  16358, FRM_LEN_CTL set, frames above the TX FIFO sent in threshold
+  mode without checksum insertion, and stmmac_change_mtu() skips the
+  aligned-MTU FIFO/16368 checks;
+- fix the TX/RX threshold mappings (TX mode 256 selected 64);
+- a TX underflow resumes the TX DMA instead of resetting the TX ring.
 
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- .../net/ethernet/stmicro/stmmac/dwmac-sun8i.c | 129 +++++++++++++++---
+ .../net/ethernet/stmicro/stmmac/dwmac-sun8i.c | 116 +++++++++++++++---
  drivers/net/ethernet/stmicro/stmmac/stmmac.h  |   3 +
  .../net/ethernet/stmicro/stmmac/stmmac_main.c |  26 +++-
  include/linux/stmmac.h                        |   1 +
- 4 files changed, 138 insertions(+), 21 deletions(-)
+ 4 files changed, 126 insertions(+), 20 deletions(-)
 
 diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
-index 6ad13e1..bd25213 100644
+index 6ad13e1..024449d 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
 @@ -46,6 +46,9 @@ extern int sunxi_get_soc_chipid(unsigned char *chipid);
@@ -95,7 +84,7 @@ index 6ad13e1..bd25213 100644
  
  /* Used in EMAC_RX_FRM_FLT */
  #define EMAC_FRM_FLT_RXALL              BIT(0)
-@@ -222,19 +246,32 @@ static const struct emac_variant emac_variant_h6 = {
+@@ -222,19 +246,26 @@ static const struct emac_variant emac_variant_h6 = {
  
  /* Used in RX_CTL0 */
  #define EMAC_RX_RECEIVER_EN             BIT(31)
@@ -117,10 +106,6 @@ index 6ad13e1..bd25213 100644
 + * in threshold mode (STMMAC_FLAG_TX_THRESH_JUMBO). In threshold mode the
 + * DMA must fill the FIFO faster than a 1 Gbit/s link empties it, which
 + * takes bursts of at least 16 words.
-+ * In RX store-and-forward mode the RX DMA starts only when the whole frame
-+ * is in the 16 KiB RX FIFO; a frame larger than half of it leaves too little
-+ * room for the next frame that arrives back to back, so such MTUs receive
-+ * in threshold mode (as the vendor driver always does, RX_TH 32).
   */
  #define EMAC_TX_FIFO_SIZE	4096
 -#define EMAC_MAX_MTU		(EMAC_TX_FIFO_SIZE - ETH_HLEN - \
@@ -128,12 +113,10 @@ index 6ad13e1..bd25213 100644
 +#define EMAC_MAX_FRAME_LEN	16384
 +#define EMAC_MAX_MTU(len)	((len) - ETH_HLEN - 2 * VLAN_HLEN - ETH_FCS_LEN)
 +#define EMAC_JUMBO_MIN_BURSTLEN	16
-+#define EMAC_RX_FIFO_SIZE	16384
-+#define EMAC_RX_JUMBO_TH	32
  
  /* Used in EMAC_TX_FLOW_CTL */
  #define EMAC_TX_FLOW_CTL_EN             BIT(0)
-@@ -338,7 +375,9 @@ static int sun8i_dwmac_dma_reset(void __iomem *ioaddr)
+@@ -338,7 +369,9 @@ static int sun8i_dwmac_dma_reset(void __iomem *ioaddr)
  static void sun8i_dwmac_dma_init(void __iomem *ioaddr,
  				 struct stmmac_dma_cfg *dma_cfg)
  {
@@ -144,7 +127,7 @@ index 6ad13e1..bd25213 100644
  	writel(0x1FFFFFF, ioaddr + EMAC_INT_STA);
  }
  
-@@ -505,8 +544,17 @@ static int sun8i_dwmac_dma_interrupt(struct stmmac_priv *priv,
+@@ -505,8 +538,17 @@ static int sun8i_dwmac_dma_interrupt(struct stmmac_priv *priv,
  	if (v & EMAC_TX_TIMEOUT_INT)
  		ret |= tx_hard_error;
  
@@ -163,18 +146,7 @@ index 6ad13e1..bd25213 100644
  		x->tx_undeflow_irq++;
  	}
  
-@@ -551,19 +599,25 @@ static void sun8i_dwmac_dma_operation_mode_rx(struct stmmac_priv *priv,
- {
- 	u32 v;
- 
-+	/* frames that take more than half of the RX FIFO: threshold mode */
-+	if (mode == SF_DMA_MODE &&
-+	    priv->dma_conf.max_frame > EMAC_RX_FIFO_SIZE / 2)
-+		mode = EMAC_RX_JUMBO_TH;
-+
- 	v = readl(ioaddr + EMAC_RX_CTL1);
- 	if (mode == SF_DMA_MODE) {
- 		v |= EMAC_RX_MD;
+@@ -557,13 +599,14 @@ static void sun8i_dwmac_dma_operation_mode_rx(struct stmmac_priv *priv,
  	} else {
  		v &= ~EMAC_RX_MD;
  		v &= ~EMAC_RX_TH_MASK;
@@ -193,7 +165,7 @@ index 6ad13e1..bd25213 100644
  			v |= EMAC_RX_TH_128;
  	}
  	writel(v, ioaddr + EMAC_RX_CTL1);
-@@ -587,13 +641,14 @@ static void sun8i_dwmac_dma_operation_mode_tx(struct stmmac_priv *priv,
+@@ -587,13 +630,14 @@ static void sun8i_dwmac_dma_operation_mode_tx(struct stmmac_priv *priv,
  	} else {
  		v &= ~EMAC_TX_MD;
  		v &= ~EMAC_TX_TH_MASK;
@@ -212,7 +184,7 @@ index 6ad13e1..bd25213 100644
  			v |= EMAC_TX_TH_256;
  	}
  	writel(v, ioaddr + EMAC_TX_CTL1);
-@@ -656,21 +711,47 @@ err_disable_regulator_phy_io:
+@@ -656,21 +700,47 @@ err_disable_regulator_phy_io:
  	return ret;
  }
  
@@ -263,13 +235,11 @@ index 6ad13e1..bd25213 100644
  }
  
  static void sun8i_dwmac_set_mac(void __iomem *ioaddr, bool enable)
-@@ -1285,8 +1366,14 @@ static int sun8i_dwmac_probe(struct platform_device *pdev)
- 	plat_dat->exit = sun8i_dwmac_exit;
+@@ -1286,7 +1356,13 @@ static int sun8i_dwmac_probe(struct platform_device *pdev)
  	plat_dat->mac_setup = sun8i_dwmac_setup;
  	plat_dat->tx_fifo_size = EMAC_TX_FIFO_SIZE;
--	plat_dat->rx_fifo_size = 16384;
+ 	plat_dat->rx_fifo_size = 16384;
 -	plat_dat->maxmtu = EMAC_MAX_MTU;
-+	plat_dat->rx_fifo_size = EMAC_RX_FIFO_SIZE;
 +	sun8i_dwmac_set_burst_len(dev, gmac->variant, plat_dat->dma_cfg);
 +	if (plat_dat->dma_cfg->pbl >= EMAC_JUMBO_MIN_BURSTLEN) {
 +		plat_dat->flags |= STMMAC_FLAG_TX_THRESH_JUMBO;
@@ -280,7 +250,7 @@ index 6ad13e1..bd25213 100644
  
  	ret = sun8i_dwmac_set_syscon(&pdev->dev, plat_dat);
  	if (ret)
-@@ -1374,6 +1461,8 @@ static const struct of_device_id sun8i_dwmac_match[] = {
+@@ -1374,6 +1450,8 @@ static const struct of_device_id sun8i_dwmac_match[] = {
  		.data = &emac_variant_a64 },
  	{ .compatible = "allwinner,sun50i-h6-emac",
  		.data = &emac_variant_h6 },
@@ -387,5 +357,6 @@ index 4430b96..d21b50c 100644
  
  struct mac_device_info;
  
+-- 
 -- 
 Armbian
