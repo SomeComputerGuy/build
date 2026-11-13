@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 06:30:00 +0000
+Subject: media: cedrus: AVS2: do not offer the 32x32 tiled capture format
+
+The AVS2 mode of the H.265 engine does not write NV12_32L32. An 8-bit
+832x480 stream decoded into it gave no correct picture (the same stream
+into NV12 matches the reference), and a 416x240 stream never raised the
+interrupt ("frame processing timed out"). The vendor library never asks
+the engine for it: Avs2MallocFbmBuffer() turns every requested output
+format other than NV21 and NV12 into YV12.
+
+GStreamer prefers the tiled format when the driver offers it, so 8-bit
+AVS2 failed there while FFmpeg, which takes the NV12 default, worked.
+Leave NV12_32L32 out of the capture formats of AVS2.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/staging/media/sunxi/cedrus/cedrus_video.c | 19 +++++++++++++++++++
+ 1 file changed, 19 insertions(+)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -186,6 +186,19 @@
+ 
+ #define CEDRUS_FORMATS_COUNT	ARRAY_SIZE(cedrus_formats)
+ 
++/*
++ * The AVS2 mode of the H.265 engine does not write the 32x32 tiled format:
++ * the pictures come out wrong, or the engine never raises its interrupt.
++ * The vendor library does not use it for AVS2 either, it only decodes AVS2
++ * into YV12, NV21 or NV12.
++ */
++static bool cedrus_format_unsupported(struct cedrus_ctx *ctx,
++				      const struct cedrus_format *fmt)
++{
++	return fmt->pixelformat == V4L2_PIX_FMT_NV12_32L32 &&
++	       ctx->src_fmt.pixelformat == V4L2_PIX_FMT_AVS2_FRAME;
++}
++
+ static struct cedrus_format *cedrus_find_format(struct cedrus_ctx *ctx,
+ 						u32 pixelformat, u32 directions)
+ {
+@@ -207,6 +220,9 @@
+ 		    fmt->src_format != ctx->src_fmt.pixelformat)
+ 			continue;
+ 
++		if (cedrus_format_unsupported(ctx, fmt))
++			continue;
++
+ 		if (fmt->pixelformat == pixelformat)
+ 			break;
+ 
+@@ -396,6 +412,9 @@
+ 		    fmt->src_format != ctx->src_fmt.pixelformat)
+ 			continue;
+ 
++		if (cedrus_format_unsupported(ctx, fmt))
++			continue;
++
+ 		if (index == f->index)
+ 			break;
+ 
+-- 
+2.55.0
