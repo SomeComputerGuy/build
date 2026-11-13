@@ -451,7 +451,7 @@ diff --git a/drivers/media/v4l2-core/v4l2-ctrls-core.c b/drivers/media/v4l2-core
 index ae0be373c..916b02e32 100644
 --- a/drivers/media/v4l2-core/v4l2-ctrls-core.c
 +++ b/drivers/media/v4l2-core/v4l2-ctrls-core.c
-@@ -147,6 +147,7 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
+@@ -148,6 +148,7 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
  	struct v4l2_ctrl_h263_slice_params *p_h263_slice;
  	struct v4l2_ctrl_avs2_sequence *p_avs2_sequence;
  	struct v4l2_ctrl_avs2_weight_quant *p_avs2_weight_quant;
@@ -459,7 +459,7 @@ index ae0be373c..916b02e32 100644
  	void *p = ptr.p + idx * ctrl->elem_size;
  
  	if (ctrl->p_def.p_const)
-@@ -272,6 +273,19 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
+@@ -282,6 +283,19 @@ static void std_init_compound(const struct v4l2_ctrl *ctrl, u32 idx,
  		memset(p_avs2_weight_quant->matrix_8x8, 64,
  		       sizeof(p_avs2_weight_quant->matrix_8x8));
  		break;
@@ -479,7 +479,7 @@ index ae0be373c..916b02e32 100644
  	case V4L2_CTRL_TYPE_FWHT_PARAMS:
  		p_fwht_params = p;
  		p_fwht_params->version = V4L2_FWHT_VERSION;
-@@ -597,6 +608,15 @@ void v4l2_ctrl_type_op_log(const struct v4l2_ctrl *ctrl)
+@@ -613,6 +627,15 @@ void v4l2_ctrl_type_op_log(const struct v4l2_ctrl *ctrl)
  	case V4L2_CTRL_TYPE_AVS2_ALF:
  		pr_cont("AVS2_ALF");
  		break;
@@ -495,7 +495,7 @@ index ae0be373c..916b02e32 100644
  	case V4L2_CTRL_TYPE_RECT:
  		pr_cont("(%d,%d)/%ux%u",
  			ptr.p_rect->left, ptr.p_rect->top,
-@@ -1563,6 +1583,116 @@ static int validate_avs2_alf(struct v4l2_ctrl_avs2_alf *alf)
+@@ -1579,6 +1602,116 @@ static int validate_avs2_alf(struct v4l2_ctrl_avs2_alf *alf)
  	return 0;
  }
  
@@ -612,7 +612,7 @@ index ae0be373c..916b02e32 100644
  /*
   * Compound controls validation requires setting unused fields/flags to zero
   * in order to properly detect unchanged controls with v4l2_ctrl_type_op_equal's
-@@ -2038,6 +2168,12 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
+@@ -2055,6 +2188,12 @@ static int std_validate_compound(const struct v4l2_ctrl *ctrl, u32 idx,
  		break;
  	case V4L2_CTRL_TYPE_AVS2_ALF:
  		return validate_avs2_alf(p);
@@ -625,7 +625,7 @@ index ae0be373c..916b02e32 100644
  
  	case V4L2_CTRL_TYPE_AREA:
  		area = p;
-@@ -2807,6 +2943,15 @@ static struct v4l2_ctrl *v4l2_ctrl_new(struct v4l2_ctrl_handler *hdl,
+@@ -2824,6 +2963,15 @@ static struct v4l2_ctrl *v4l2_ctrl_new(struct v4l2_ctrl_handler *hdl,
  	case V4L2_CTRL_TYPE_AVS2_ALF:
  		elem_size = sizeof(struct v4l2_ctrl_avs2_alf);
  		break;
