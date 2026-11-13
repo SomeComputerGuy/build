@@ -1,0 +1,87 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 19:23:13 +0000
+Subject: [PATCH] drm/sun4i: dw-hdmi: Enable HDMI 3D modes on H616
+
+Expose the frame packing, top-and-bottom and side-by-side (half) modes
+of the sink on H616, whose TCON TV and mixer run the doubled frame
+packing timings. Check the clock limits against the frame packing
+clock.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+
+diff --git a/drivers/gpu/drm/sun4i/sun8i_dw_hdmi.c b/drivers/gpu/drm/sun4i/sun8i_dw_hdmi.c
+index a826ade..6568a9c 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_dw_hdmi.c
++++ b/drivers/gpu/drm/sun4i/sun8i_dw_hdmi.c
+@@ -175,12 +175,22 @@ sun8i_dw_hdmi_encoder_helper_funcs = {
+ 	.atomic_mode_set = sun8i_dw_hdmi_encoder_atomic_mode_set,
+ };
+ 
++/* Frame packing sends both views as one frame, at twice the clock. */
++static int sun8i_dw_hdmi_mode_clock(const struct drm_display_mode *mode)
++{
++	if ((mode->flags & DRM_MODE_FLAG_3D_MASK) ==
++	    DRM_MODE_FLAG_3D_FRAME_PACKING)
++		return mode->clock * 2;
++
++	return mode->clock;
++}
++
+ static enum drm_mode_status
+ sun8i_dw_hdmi_mode_valid_a83t(struct dw_hdmi *hdmi, void *data,
+ 			      const struct drm_display_info *info,
+ 			      const struct drm_display_mode *mode)
+ {
+-	if (mode->clock > 297000)
++	if (sun8i_dw_hdmi_mode_clock(mode) > 297000)
+ 		return MODE_CLOCK_HIGH;
+ 
+ 	return MODE_OK;
+@@ -192,7 +202,7 @@ sun8i_dw_hdmi_mode_valid_a80(struct dw_hdmi *hdmi, void *data,
+ 			     const struct drm_display_mode *mode)
+ {
+ 	/* The A80 DE 1.0 backend does not scan out above 1080p60 cleanly */
+-	if (mode->clock > 148500)
++	if (sun8i_dw_hdmi_mode_clock(mode) > 148500)
+ 		return MODE_CLOCK_HIGH;
+ 
+ 	return MODE_OK;
+@@ -207,7 +217,7 @@ sun8i_dw_hdmi_mode_valid_h6(struct dw_hdmi *hdmi, void *data,
+ 	 * Controller support maximum of 594 MHz, which correlates to
+ 	 * 4K@60Hz 4:4:4 or RGB.
+ 	 */
+-	if (mode->clock > 594000)
++	if (sun8i_dw_hdmi_mode_clock(mode) > 594000)
+ 		return MODE_CLOCK_HIGH;
+ 
+ 	return MODE_OK;
+@@ -343,6 +353,7 @@ static int sun8i_dw_hdmi_bind(struct device *dev, struct device *master,
+ 	plat_data->mode_valid = hdmi->quirks->mode_valid;
+ 	plat_data->use_drm_infoframe = hdmi->quirks->use_drm_infoframe;
+ 	plat_data->ycbcr_420_allowed = hdmi->quirks->ycbcr_420_allowed;
++	plat_data->stereo_allowed = hdmi->quirks->stereo_allowed;
+ 	plat_data->deep_color_max_tmds_clock =
+ 		hdmi->quirks->deep_color_max_tmds_clock;
+ 	/*
+@@ -458,6 +469,7 @@ static const struct sun8i_dw_hdmi_quirks sun50i_h616_quirks = {
+ 	.mode_valid = sun8i_dw_hdmi_mode_valid_h6,
+ 	.use_drm_infoframe = true,
+ 	.ycbcr_420_allowed = true,
++	.stereo_allowed = true,
+ 	.deep_color_max_tmds_clock = 594000,
+ };
+ 
+diff --git a/drivers/gpu/drm/sun4i/sun8i_dw_hdmi.h b/drivers/gpu/drm/sun4i/sun8i_dw_hdmi.h
+index f31aa44..a9aa132 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_dw_hdmi.h
++++ b/drivers/gpu/drm/sun4i/sun8i_dw_hdmi.h
+@@ -178,6 +178,7 @@ struct sun8i_dw_hdmi_quirks {
+ 					   const struct drm_display_mode *mode);
+ 	unsigned int use_drm_infoframe : 1;
+ 	unsigned int ycbcr_420_allowed : 1;
++	unsigned int stereo_allowed : 1;
+ 	unsigned int deep_color_max_tmds_clock;
+ };
+ 
