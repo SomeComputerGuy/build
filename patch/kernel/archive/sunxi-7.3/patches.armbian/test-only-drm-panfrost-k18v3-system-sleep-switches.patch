@@ -1,0 +1,113 @@
+From 7254c6211bdb782d4ff4f79b23b5b89d8572edbe Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 03:47:32 +0000
+Subject: [PATCH 3/3] TEST ONLY: drm/panfrost: K18 v3 system sleep switches
+
+Not for upstream and not for the image. Module parameters, off by
+default, for the board test of the v3 system sleep fix of "Power the GPU
+up for a reset queued from the MMU code":
+- test_reset_work_delay_ms: the reset work sleeps with its runtime PM
+  reference held before it resets the GPU, so that a system suspend
+  starts while it runs;
+- test_reset_in_suspend: panfrost_device_suspend() requests a reset
+  after it has disabled the reset work;
+- test_pm (read only): reset.pending and how often the two ran.
+
+Assisted-by: Claude
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/panfrost/panfrost_device.c |  1 +
+ drivers/gpu/drm/panfrost/panfrost_job.c    | 45 ++++++++++++++++++++++
+ drivers/gpu/drm/panfrost/panfrost_job.h    |  1 +
+ 3 files changed, 47 insertions(+)
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_device.c b/drivers/gpu/drm/panfrost/panfrost_device.c
+index 09c5746..480e23b 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_device.c
++++ b/drivers/gpu/drm/panfrost/panfrost_device.c
+@@ -562,6 +562,7 @@ static int panfrost_device_suspend(struct device *dev)
+ 	 * resume, which queues it again if a reset is still pending.
+ 	 */
+ 	disable_work_sync(&pfdev->reset.work);
++	panfrost_test_suspend_hook(pfdev);
+ 
+ 	ret = pm_runtime_force_suspend(dev);
+ 	if (ret) {
+diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
+index 08c1fa4..f5eedcf 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_job.c
++++ b/drivers/gpu/drm/panfrost/panfrost_job.c
+@@ -85,6 +85,46 @@ static const struct kernel_param_ops panfrost_test_cc_ops = {
+ 	.get = panfrost_test_cc_get,
+ };
+ module_param_cb(test_cc, &panfrost_test_cc_ops, NULL, 0444);
++
++/* TEST ONLY (K18 v3, system sleep): test_reset_work_delay_ms makes the reset
++ * work sleep with its runtime PM reference held, before it resets the GPU, so
++ * that a system suspend starts while it runs; test_reset_in_suspend requests a
++ * reset from panfrost_device_suspend() after the work has been disabled;
++ * test_pm reads the counters and reset.pending.
++ */
++static unsigned int panfrost_test_work_delay_ms;
++module_param_named(test_reset_work_delay_ms, panfrost_test_work_delay_ms, uint, 0600);
++static bool panfrost_test_reset_in_suspend;
++module_param_named(test_reset_in_suspend, panfrost_test_reset_in_suspend, bool, 0600);
++static unsigned int panfrost_test_work_delays;
++static unsigned int panfrost_test_suspend_resets;
++
++void panfrost_test_suspend_hook(struct panfrost_device *pfdev)
++{
++	if (!READ_ONCE(panfrost_test_reset_in_suspend))
++		return;
++
++	panfrost_test_suspend_resets++;
++	panfrost_device_schedule_reset(pfdev);
++}
++
++static int panfrost_test_pm_get(char *buf, const struct kernel_param *kp)
++{
++	struct panfrost_device *pfdev = READ_ONCE(panfrost_test_pfdev);
++
++	if (!pfdev)
++		return -ENODEV;
++
++	return sysfs_emit(buf, "pending=%d work_delays=%u suspend_resets=%u\n",
++			  atomic_read(&pfdev->reset.pending),
++			  READ_ONCE(panfrost_test_work_delays),
++			  READ_ONCE(panfrost_test_suspend_resets));
++}
++
++static const struct kernel_param_ops panfrost_test_pm_ops = {
++	.get = panfrost_test_pm_get,
++};
++module_param_cb(test_pm, &panfrost_test_pm_ops, NULL, 0444);
+ #define JOB_TIMEOUT_MS 500
+ 
+ /* How long a soft-stopped slot gets to reach a task boundary before its job is
+@@ -1117,6 +1157,11 @@ static void panfrost_reset_work(struct work_struct *work)
+ 		return;
+ 	}
+ 
++	if (READ_ONCE(panfrost_test_work_delay_ms)) {
++		panfrost_test_work_delays++;
++		msleep(READ_ONCE(panfrost_test_work_delay_ms));
++	}
++
+ 	panfrost_reset(pfdev, NULL, false);
+ 	pm_runtime_put_autosuspend(pfdev->base.dev);
+ }
+diff --git a/drivers/gpu/drm/panfrost/panfrost_job.h b/drivers/gpu/drm/panfrost/panfrost_job.h
+index c30cf01..b7a3ab5 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_job.h
++++ b/drivers/gpu/drm/panfrost/panfrost_job.h
+@@ -74,6 +74,7 @@ void panfrost_jm_reset_interrupts(struct panfrost_device *pfdev);
+ void panfrost_jm_enable_interrupts(struct panfrost_device *pfdev);
+ void panfrost_jm_suspend_irq(struct panfrost_device *pfdev);
+ int panfrost_jm_is_idle(struct panfrost_device *pfdev);
++void panfrost_test_suspend_hook(struct panfrost_device *pfdev); /* TEST ONLY */
+ int panfrost_job_get_slot(struct panfrost_job *job);
+ int panfrost_job_push(struct panfrost_job *job);
+ void panfrost_job_put(struct panfrost_job *job);
+-- 
+2.55.0
+

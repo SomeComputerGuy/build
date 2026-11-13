@@ -1,7 +1,7 @@
-From 16cf7c6a3f5f184ce13538382e483f65305c65ec Mon Sep 17 00:00:00 2001
+From fdb502cf880700c526e5e63771572417c7cc7d5f Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 03:22:48 +0000
-Subject: [PATCH 2/2] TEST ONLY: drm/panfrost: K18 v3 switches and counters
+Subject: [PATCH 2/3] TEST ONLY: drm/panfrost: K18 v3 switches and counters
 
 Not for upstream and not for the image. Module parameters, off by
 default, for the board test of the two v3 fixes:
@@ -20,7 +20,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 52 insertions(+)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index eb200de..5eade79 100644
+index c9cc210..08c1fa4 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -50,6 +50,41 @@ static const struct kernel_param_ops panfrost_test_reset_ops = {

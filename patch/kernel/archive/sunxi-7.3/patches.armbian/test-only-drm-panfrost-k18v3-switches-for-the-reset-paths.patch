@@ -1,7 +1,7 @@
-From 0b65c461424efebc0e6f0c2c0eacfa7b8c768bab Mon Sep 17 00:00:00 2001
+From 612aa1ae0e407860d5d765d038c95d60bdcae9f4 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Thu, 12 Nov 2026 07:03:51 +0000
-Subject: [PATCH 1/2] TEST ONLY: drm/panfrost: switches for the reset paths
+Subject: [PATCH 1/3] TEST ONLY: drm/panfrost: switches for the reset paths
 
 Not for upstream and not for the image. Two module parameters, off by
 default, for the board test of the reset paths that userspace cannot
@@ -18,7 +18,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 33 insertions(+), 1 deletion(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index e26addf..eb200de 100644
+index 6c76873..c9cc210 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -5,6 +5,7 @@
@@ -72,7 +72,7 @@ index e26addf..eb200de 100644
  				job_write(pfdev, JS_COMMAND(i), JS_COMMAND_HARD_STOP);
  		}
  
-@@ -1139,6 +1167,8 @@ int panfrost_jm_init(struct panfrost_device *pfdev)
+@@ -1138,6 +1166,8 @@ int panfrost_jm_init(struct panfrost_device *pfdev)
  	panfrost_jm_reset_interrupts(pfdev);
  	panfrost_jm_enable_interrupts(pfdev);
  
@@ -81,7 +81,7 @@ index e26addf..eb200de 100644
  	return 0;
  
  err_sched:
-@@ -1154,6 +1184,8 @@ void panfrost_jm_fini(struct panfrost_device *pfdev)
+@@ -1153,6 +1183,8 @@ void panfrost_jm_fini(struct panfrost_device *pfdev)
  	struct panfrost_job_slot *js = pfdev->js;
  	int j;
  
