@@ -1,0 +1,245 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 19:22:21 +0000
+Subject: [PATCH] drm/sun4i: Run frame-packed stereo modes as one double frame
+
+HDMI 3D frame packing sends the left view, the active space and the
+right view as one progressive frame of twice the lines at twice the
+clock. The DRM core describes it with CRTC_STEREO_DOUBLE timings and a
+framebuffer of drm_mode_get_hv_timing() size, but nothing here applied
+them: TCON, mixer and writeback were set up for one view only.
+
+Apply CRTC_STEREO_DOUBLE to the adjusted mode of stereo modes, program
+the TCON vertical total from crtc_vtotal, and size the mixer, the
+formatter, the writeback and the VI scaler line budget from
+drm_mode_get_hv_timing(). Reject modes whose frame does not fit the
+12-bit TCON size fields (4K frame packing needs 4410 lines).
+
+Same layout as the vendor driver: TCON TV source and output height
+2 * vdisplay + vblank, vertical total doubled. The vendor fills the
+active space in the TCON (TV_FILL_*); here it comes from the
+framebuffer, as the DRM uAPI defines it.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+
+diff --git a/drivers/gpu/drm/sun4i/sun4i_backend.c b/drivers/gpu/drm/sun4i/sun4i_backend.c
+index 88870e6..d2ff4aa 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_backend.c
++++ b/drivers/gpu/drm/sun4i/sun4i_backend.c
+@@ -646,12 +646,13 @@ static void sun4i_backend_mode_set(struct sunxi_engine *engine,
+ 				   const struct drm_display_mode *mode)
+ {
+ 	bool interlaced = !!(mode->flags & DRM_MODE_FLAG_INTERLACE);
++	int w, h;
+ 
+-	DRM_DEBUG_DRIVER("Updating global size W: %u H: %u\n",
+-			 mode->hdisplay, mode->vdisplay);
++	drm_mode_get_hv_timing(mode, &w, &h);
++	DRM_DEBUG_DRIVER("Updating global size W: %u H: %u\n", w, h);
+ 
+ 	regmap_write(engine->regs, SUN4I_BACKEND_DISSIZE_REG,
+-		     SUN4I_BACKEND_DISSIZE(mode->hdisplay, mode->vdisplay));
++		     SUN4I_BACKEND_DISSIZE(w, h));
+ 
+ 	regmap_update_bits(engine->regs, SUN4I_BACKEND_MODCTL_REG,
+ 			   SUN4I_BACKEND_MODCTL_ITLMOD_EN,
+diff --git a/drivers/gpu/drm/sun4i/sun4i_crtc.c b/drivers/gpu/drm/sun4i/sun4i_crtc.c
+index f191ad1..a28db7f 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_crtc.c
++++ b/drivers/gpu/drm/sun4i/sun4i_crtc.c
+@@ -55,6 +55,11 @@ static int sun4i_crtc_atomic_check(struct drm_crtc *crtc,
+ 	struct sunxi_engine *engine = scrtc->engine;
+ 	int ret = 0;
+ 
++	/* Frame packing: TCON and engine run both views as one frame. */
++	if (drm_mode_is_stereo(&crtc_state->adjusted_mode))
++		drm_mode_set_crtcinfo(&crtc_state->adjusted_mode,
++				      CRTC_INTERLACE_HALVE_V | CRTC_STEREO_DOUBLE);
++
+ 	if (engine && engine->ops && engine->ops->atomic_check)
+ 		ret = engine->ops->atomic_check(engine, crtc_state);
+ 
+@@ -207,7 +212,23 @@ static void sun4i_crtc_mode_set_nofb(struct drm_crtc *crtc)
+ 		sunxi_engine_disable_color_correction(scrtc->engine);
+ }
+ 
++static enum drm_mode_status
++sun4i_crtc_mode_valid(struct drm_crtc *crtc, const struct drm_display_mode *mode)
++{
++	int w, h;
++
++	/* TCON source and output size fields are 12 bits wide */
++	drm_mode_get_hv_timing(mode, &w, &h);
++	if (w > 4096)
++		return MODE_BAD_HVALUE;
++	if (h > 4096)
++		return MODE_BAD_VVALUE;
++
++	return MODE_OK;
++}
++
+ static const struct drm_crtc_helper_funcs sun4i_crtc_helper_funcs = {
++	.mode_valid	= sun4i_crtc_mode_valid,
+ 	.atomic_check	= sun4i_crtc_atomic_check,
+ 	.atomic_begin	= sun4i_crtc_atomic_begin,
+ 	.atomic_flush	= sun4i_crtc_atomic_flush,
+diff --git a/drivers/gpu/drm/sun4i/sun4i_tcon.c b/drivers/gpu/drm/sun4i/sun4i_tcon.c
+index cf0aa41..499ae54 100644
+--- a/drivers/gpu/drm/sun4i/sun4i_tcon.c
++++ b/drivers/gpu/drm/sun4i/sun4i_tcon.c
+@@ -848,10 +848,11 @@ static void sun4i_tcon1_mode_set(struct sun4i_tcon *tcon,
+ 	 *
+ 	 * To work around this, we will always use vtotal, and
+ 	 * multiply by two only if we're not in interlace.
++	 * crtc_vtotal covers both views of a frame-packed mode.
+ 	 */
+ 	vtotal = mode->vtotal;
+ 	if (!(mode->flags & DRM_MODE_FLAG_INTERLACE))
+-		vtotal = vtotal * 2;
++		vtotal = mode->crtc_vtotal * 2;
+ 
+ 	/* Set vertical display timings */
+ 	regmap_write(tcon->regs, SUN4I_TCON1_BASIC4_REG,
+diff --git a/drivers/gpu/drm/sun4i/sun50i_wb.c b/drivers/gpu/drm/sun4i/sun50i_wb.c
+index a7de6eb..c8f37d9 100644
+--- a/drivers/gpu/drm/sun4i/sun50i_wb.c
++++ b/drivers/gpu/drm/sun4i/sun50i_wb.c
+@@ -358,8 +358,8 @@ static int sun50i_wb_encoder_atomic_check(struct drm_encoder *encoder,
+ 	const struct drm_display_mode *mode = &crtc_state->adjusted_mode;
+ 	struct drm_device *drm = encoder->dev;
+ 	struct drm_framebuffer *fb;
++	int ret, w, h;
+ 	u32 hw;
+-	int ret;
+ 
+ 	if (!conn_state->writeback_job || !conn_state->writeback_job->fb)
+ 		return 0;
+@@ -373,23 +373,20 @@ static int sun50i_wb_encoder_atomic_check(struct drm_encoder *encoder,
+ 	if (sun50i_wb_hw_format(fb->format->format, &hw))
+ 		return -EINVAL;
+ 
+-	if (mode->hdisplay < SUN50I_WB_MIN_WIDTH ||
+-	    mode->hdisplay > SUN50I_WB_MAX_WIDTH ||
+-	    mode->vdisplay < SUN50I_WB_MIN_HEIGHT ||
+-	    mode->vdisplay > SUN50I_WB_MAX_HEIGHT) {
+-		drm_dbg_kms(drm, "writeback: mode %ux%u out of range\n",
+-			    mode->hdisplay, mode->vdisplay);
++	drm_mode_get_hv_timing(mode, &w, &h);
++	if (w < SUN50I_WB_MIN_WIDTH || w > SUN50I_WB_MAX_WIDTH ||
++	    h < SUN50I_WB_MIN_HEIGHT || h > SUN50I_WB_MAX_HEIGHT) {
++		drm_dbg_kms(drm, "writeback: mode %ux%u out of range\n", w, h);
+ 		return -EINVAL;
+ 	}
+ 
+ 	/* the unit scales down only, into a 2048 pixel output line buffer */
+ 	if (fb->width < SUN50I_WB_MIN_WIDTH ||
+ 	    fb->height < SUN50I_WB_MIN_HEIGHT ||
+-	    fb->width > mode->hdisplay || fb->height > mode->vdisplay ||
++	    fb->width > w || fb->height > h ||
+ 	    fb->width > SUN50I_WB_MAX_OUT_WIDTH) {
+ 		drm_dbg_kms(drm, "writeback: fb %ux%u not capturable from %ux%u\n",
+-			    fb->width, fb->height, mode->hdisplay,
+-			    mode->vdisplay);
++			    fb->width, fb->height, w, h);
+ 		return -EINVAL;
+ 	}
+ 
+@@ -402,7 +399,7 @@ static int sun50i_wb_encoder_atomic_check(struct drm_encoder *encoder,
+ 
+ 	/* 10-bit output: no scaler and no CSC on that path (vendor) */
+ 	if (fb->format->format == DRM_FORMAT_XRGB2101010 &&
+-	    (fb->width != mode->hdisplay || fb->height != mode->vdisplay))
++	    (fb->width != w || fb->height != h))
+ 		return -EINVAL;
+ 
+ 	return 0;
+@@ -824,7 +821,7 @@ static void sun50i_wb_connector_atomic_commit(struct drm_connector *connector,
+ 	struct sun4i_crtc *scrtc;
+ 	unsigned long flags;
+ 	unsigned int i;
+-	int ret;
++	int ret, w, h;
+ 
+ 	if (!wb_job || !wb_job->fb || !crtc)
+ 		return;
+@@ -841,7 +838,8 @@ static void sun50i_wb_connector_atomic_commit(struct drm_connector *connector,
+ 
+ 	job->mixer = engine_to_sun8i_mixer(scrtc->engine);
+ 	job->crtc = crtc;
+-	job->size = SUN50I_WB_SIZE_REG(mode->hdisplay, mode->vdisplay);
++	drm_mode_get_hv_timing(mode, &w, &h);
++	job->size = SUN50I_WB_SIZE_REG(w, h);
+ 	sun50i_wb_hw_format(fb->format->format, &job->format);
+ 
+ 	for (i = 0; i < fb->format->num_planes; i++) {
+@@ -855,8 +853,7 @@ static void sun50i_wb_connector_atomic_commit(struct drm_connector *connector,
+ 	if (fb->format->num_planes > 1)
+ 		job->pitch[1] = fb->pitches[1];
+ 
+-	sun50i_wb_job_scaler(job, fb->format, mode->hdisplay, mode->vdisplay,
+-			     fb->width, fb->height);
++	sun50i_wb_job_scaler(job, fb->format, w, h, fb->width, fb->height);
+ 	sun50i_wb_job_csc(job, fb->format);
+ 
+ 	/*
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+index 7425281..7055d9d 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -812,6 +812,7 @@ static void sun8i_mixer_mode_set(struct sunxi_engine *engine,
+ 	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
+ 	u32 bld_base, size, val;
+ 	bool interlaced;
++	int w, h;
+ 
+ 	/* v35x DE: top control via MMIO, datapath sizes staged into the RCQ */
+ 	if (mixer->cfg->uses_rcq) {
+@@ -821,10 +822,10 @@ static void sun8i_mixer_mode_set(struct sunxi_engine *engine,
+ 
+ 	bld_base = sun8i_blender_base(mixer);
+ 	interlaced = !!(mode->flags & DRM_MODE_FLAG_INTERLACE);
+-	size = SUN8I_MIXER_SIZE(mode->hdisplay, mode->vdisplay);
++	drm_mode_get_hv_timing(mode, &w, &h);
++	size = SUN8I_MIXER_SIZE(w, h);
+ 
+-	DRM_DEBUG_DRIVER("Updating global size W: %u H: %u\n",
+-			 mode->hdisplay, mode->vdisplay);
++	DRM_DEBUG_DRIVER("Updating global size W: %u H: %u\n", w, h);
+ 
+ 	if (mixer->cfg->de_type == SUN8I_MIXER_DE33)
+ 		regmap_write(mixer->top_regs, SUN50I_MIXER_GLOBAL_SIZE, size);
+@@ -847,8 +848,7 @@ static void sun8i_mixer_mode_set(struct sunxi_engine *engine,
+ 			 interlaced ? "on" : "off");
+ 
+ 	if (mixer->cfg->has_formatter)
+-		sun50i_fmt_setup(mixer, mode->hdisplay, mode->vdisplay,
+-				 engine->format);
++		sun50i_fmt_setup(mixer, w, h, engine->format);
+ }
+ 
+ static bool sun8i_mixer_format_valid(struct sunxi_engine *engine, u32 format)
+diff --git a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+index 547b9d4..c78fc44 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+@@ -143,16 +143,18 @@ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
+ 		unsigned int scanline, required;
+ 		struct drm_display_mode *mode;
+ 		u32 hscale, vscale, fps;
++		int lines, unused;
+ 		u64 ability;
+ 
+ 		DRM_DEBUG_DRIVER("HW scaling is enabled\n");
+ 
+ 		mode = &plane->state->crtc->state->mode;
+ 		fps = (mode->clock * 1000) / (mode->vtotal * mode->htotal);
++		drm_mode_get_hv_timing(mode, &unused, &lines);
+ 		ability = clk_get_rate(mixer->mod_clk);
+ 		/* BSP algorithm assumes 80% efficiency of VI scaler unit */
+ 		ability *= 80;
+-		do_div(ability, mode->vdisplay * fps * max(src_w, dst_w));
++		do_div(ability, lines * fps * max(src_w, dst_w));
+ 
+ 		required = src_h * 100 / dst_h;
+ 
