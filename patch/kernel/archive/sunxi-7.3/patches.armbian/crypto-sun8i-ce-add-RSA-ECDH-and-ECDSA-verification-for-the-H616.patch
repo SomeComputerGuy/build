@@ -1,0 +1,1113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 12:00:00 +0000
+Subject: crypto: sun8i-ce - Add RSA, ECDH and ECDSA verification for the H616
+
+The H616 crypto engine has a public key unit (algorithms RSA 0x20 and
+ECC 0x21) for RSA 512-4096 and ECC up to 521 bits. Register for the
+H616:
+- rsa: modular exponentiation for 512, 1024, 2048, 3072 and 4096-bit
+  moduli, rsa-generic as fallback for other sizes;
+- ecdh-nist-p192/p256/p384: point multiplication;
+- ecdsa-nist-p192/p256/p384/p521: the engine's signature verification.
+
+A task gives the operands in order in the source, each one operand
+width long and little endian (as the vendor U-Boot sunxi_rsa_calc()
+does); the width in words and the operation go in the asymmetric
+control word (user manual 10.1.3.4 and 10.1.3.10). Key checks, key
+generation and the public key check stay in software, as in the generic
+implementations. The tasks run one at a time on channel 3, which the
+TRNG already uses; RSA and ECDH go through that channel's crypto engine,
+ECDSA verification (a synchronous API) runs directly.
+
+All register below the software implementations, like the engine's
+other new modes: the CPU stays the default and the engine is used when
+it is asked for by driver name.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/crypto/allwinner/Kconfig              |  13 +
+ drivers/crypto/allwinner/sun8i-ce/Makefile    |   1 +
+ .../crypto/allwinner/sun8i-ce/sun8i-ce-core.c |  24 +-
+ .../crypto/allwinner/sun8i-ce/sun8i-ce-pkc.c  | 916 ++++++++++++++++++
+ drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h  |  16 +-
+ 5 files changed, 968 insertions(+), 2 deletions(-)
+ create mode 100644 drivers/crypto/allwinner/sun8i-ce/sun8i-ce-pkc.c
+
+diff --git a/drivers/crypto/allwinner/Kconfig b/drivers/crypto/allwinner/Kconfig
+index d86ae00..7f97dff 100644
+--- a/drivers/crypto/allwinner/Kconfig
++++ b/drivers/crypto/allwinner/Kconfig
+@@ -78,6 +78,19 @@ config CRYPTO_DEV_SUN8I_CE_TRNG
+ 	  Select this option if you want to provide kernel-side support for
+ 	  the True Random Number Generator found in the Crypto Engine.
+ 
++config CRYPTO_DEV_SUN8I_CE_PKC
++	bool "Support for Allwinner Crypto Engine RSA and ECC"
++	depends on CRYPTO_DEV_SUN8I_CE
++	select CRYPTO_ENGINE
++	select CRYPTO_RSA
++	select CRYPTO_ECDH
++	select CRYPTO_ECDSA
++	help
++	  Say y to enable RSA (rsa), ECDH (ecdh-nist-p192/p256/p384) and
++	  ECDSA verification (ecdsa-nist-p192/p256/p384/p521) on the H616
++	  Crypto Engine. They register below the software implementations
++	  and are used when asked for by driver name.
++
+ config CRYPTO_DEV_SUN8I_SS
+ 	tristate "Support for Allwinner Security System cryptographic offloader"
+ 	select CRYPTO_SKCIPHER
+diff --git a/drivers/crypto/allwinner/sun8i-ce/Makefile b/drivers/crypto/allwinner/sun8i-ce/Makefile
+index ea708b4..5e9981e 100644
+--- a/drivers/crypto/allwinner/sun8i-ce/Makefile
++++ b/drivers/crypto/allwinner/sun8i-ce/Makefile
+@@ -2,3 +2,4 @@ obj-$(CONFIG_CRYPTO_DEV_SUN8I_CE) += sun8i-ce.o
+ sun8i-ce-y += sun8i-ce-core.o sun8i-ce-cipher.o
+ sun8i-ce-$(CONFIG_CRYPTO_DEV_SUN8I_CE_HASH) += sun8i-ce-hash.o
+ sun8i-ce-$(CONFIG_CRYPTO_DEV_SUN8I_CE_TRNG) += sun8i-ce-trng.o
++sun8i-ce-$(CONFIG_CRYPTO_DEV_SUN8I_CE_PKC) += sun8i-ce-pkc.o
+diff --git a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c
+index 42dd2eb..bf8e06d 100644
+--- a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c
++++ b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-core.c
+@@ -116,6 +116,7 @@ static const struct ce_variant ce_h616_variant = {
+ 		},
+ 	.esr = ESR_H6,
+ 	.trng = CE_ALG_TRNG_V2,
++	.pkc = true,
+ };
+ 
+ static const struct ce_variant ce_a64_variant = {
+@@ -911,6 +912,10 @@ static int sun8i_ce_debugfs_show(struct seq_file *seq, void *v)
+ #endif
+ 		}
+ 	}
++#ifdef CONFIG_CRYPTO_DEV_SUN8I_CE_PKC
++	if (ce->variant->pkc)
++		sun8i_ce_pkc_stats(seq);
++#endif
+ #if defined(CONFIG_CRYPTO_DEV_SUN8I_CE_TRNG) && \
+     defined(CONFIG_CRYPTO_DEV_SUN8I_CE_DEBUG)
+ 	seq_printf(seq, "HWRNG %lu %lu\n",
+@@ -1238,9 +1243,17 @@ static int sun8i_ce_probe(struct platform_device *pdev)
+ 	if (err)
+ 		goto error_alg;
+ 
++#ifdef CONFIG_CRYPTO_DEV_SUN8I_CE_PKC
++	if (ce->variant->pkc) {
++		err = sun8i_ce_pkc_register(ce);
++		if (err)
++			goto error_alg;
++	}
++#endif
++
+ 	err = pm_runtime_resume_and_get(ce->dev);
+ 	if (err < 0)
+-		goto error_alg;
++		goto error_pkc;
+ 
+ #ifdef CONFIG_CRYPTO_DEV_SUN8I_CE_TRNG
+ 	sun8i_ce_hwrng_register(ce);
+@@ -1270,6 +1283,11 @@ static int sun8i_ce_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	return 0;
++error_pkc:
++#ifdef CONFIG_CRYPTO_DEV_SUN8I_CE_PKC
++	if (ce->variant->pkc)
++		sun8i_ce_pkc_unregister(ce);
++#endif
+ error_alg:
+ 	sun8i_ce_unregister_algs(ce);
+ error_pm:
+@@ -1285,6 +1303,10 @@ static void sun8i_ce_remove(struct platform_device *pdev)
+ 	sun8i_ce_hwrng_unregister(ce);
+ #endif
+ 
++#ifdef CONFIG_CRYPTO_DEV_SUN8I_CE_PKC
++	if (ce->variant->pkc)
++		sun8i_ce_pkc_unregister(ce);
++#endif
+ 	sun8i_ce_unregister_algs(ce);
+ 
+ #ifdef CONFIG_CRYPTO_DEV_SUN8I_CE_DEBUG
+diff --git a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-pkc.c b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-pkc.c
+new file mode 100644
+index 0000000..eef3017
+--- /dev/null
++++ b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce-pkc.c
+@@ -0,0 +1,916 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * sun8i-ce-pkc.c - RSA and ECC on the Allwinner H616 Crypto Engine
++ *
++ * The engine runs public key tasks (algorithm RSA or ECC) on its own
++ * asymmetric queue. The operands are given in order in the source SG, each
++ * one operand width long and little endian; the width (in words) and the
++ * operation go in the asymmetric control word of the task.
++ * RSA modular exponentiation: exponent, modulus, base -> result.
++ * ECC point multiplication: p, k, a, Px, Py -> (k*P)x, (k*P)y.
++ * ECDSA verification: n, s, e, r, p, a, Gx, Gy, Qx, Qy, n, r -> 1 or 0.
++ * All tasks run on channel 3 (shared with the TRNG), one at a time.
++ */
++#include <crypto/akcipher.h>
++#include <crypto/ecc_curve.h>
++#include <crypto/ecdh.h>
++#include <crypto/engine.h>
++#include <crypto/internal/akcipher.h>
++#include <crypto/internal/ecc.h>
++#include <crypto/internal/kpp.h>
++#include <crypto/internal/rsa.h>
++#include <crypto/internal/sig.h>
++#include <crypto/scatterwalk.h>
++#include <crypto/sha2.h>
++#include <linux/dma-mapping.h>
++#include <linux/fips.h>
++#include <linux/pm_runtime.h>
++#include <linux/scatterlist.h>
++#include <linux/seq_file.h>
++#include <linux/unaligned.h>
++#include "sun8i-ce.h"
++
++#define CE_PKC_FLOW		3
++#define CE_RSA_MAX_BYTES	(4096 / 8)
++#define CE_ECC_MAX_BYTES	68	/* P-521 rounded up to words */
++#define CE_ECDSA_VERIFY_OPS	12
++
++struct sun8i_ce_pkc_alg {
++	u32 type;
++	unsigned int curve_id;
++	struct sun8i_ce_dev *ce;
++	union {
++		struct akcipher_engine_alg rsa;
++		struct kpp_engine_alg kpp;
++		struct sig_alg sig;
++	} alg;
++	unsigned long stat_req;
++	unsigned long stat_fb;
++};
++
++struct sun8i_ce_rsa_ctx {
++	struct sun8i_ce_dev *ce;
++	struct crypto_akcipher *fallback;
++	u8 *n;		/* big endian, leading zeros stripped */
++	u8 *e;		/* little endian, n_sz bytes */
++	u8 *d;		/* little endian, n_sz bytes, NULL for a public key */
++	unsigned int n_sz;
++	bool hw;
++};
++
++struct sun8i_ce_rsa_reqctx {
++	bool decrypt;
++};
++
++struct sun8i_ce_ecdh_ctx {
++	struct sun8i_ce_dev *ce;
++	const struct ecc_curve *curve;
++	unsigned int curve_id;
++	unsigned int ndigits;
++	u64 priv[ECC_MAX_DIGITS];
++};
++
++struct sun8i_ce_ecdh_reqctx {
++	bool shared;
++};
++
++struct sun8i_ce_ecdsa_ctx {
++	struct sun8i_ce_dev *ce;
++	const struct ecc_curve *curve;
++	unsigned int ndigits;
++	u64 x[ECC_MAX_DIGITS];
++	u64 y[ECC_MAX_DIGITS];
++	bool pub_set;
++};
++
++/* ECC operand width in bytes: the curve size rounded up to words */
++static unsigned int sun8i_ce_ecc_width(const struct ecc_curve *curve)
++{
++	return DIV_ROUND_UP(curve->nbits, 32) * 4;
++}
++
++#define rsa_tmpl(tfm) container_of(crypto_akcipher_alg(tfm),		\
++				 struct sun8i_ce_pkc_alg, alg.rsa.base)
++#define kpp_tmpl(tfm) container_of(crypto_kpp_alg(tfm),			\
++				 struct sun8i_ce_pkc_alg, alg.kpp.base)
++#define sig_tmpl(tfm) container_of(crypto_sig_alg(tfm),			\
++				 struct sun8i_ce_pkc_alg, alg.sig)
++
++/*
++ * Run one public key task: @nops operands of @width bytes each in @src,
++ * @dwidth bytes of result in @dst. Sleeps.
++ */
++static int sun8i_ce_pkc_run(struct sun8i_ce_dev *ce, u32 alg, u32 op,
++			    const u8 *src, unsigned int nops,
++			    unsigned int width, u8 *dst, unsigned int dwidth,
++			    const char *name)
++{
++	struct sun8i_ce_flow *chan = &ce->chanlist[CE_PKC_FLOW];
++	unsigned int slen = nops * width;
++	dma_addr_t dma_src, dma_dst;
++	struct ce_task *cet;
++	int err;
++
++	dma_src = dma_map_single(ce->dev, (void *)src, slen, DMA_TO_DEVICE);
++	if (dma_mapping_error(ce->dev, dma_src))
++		return -EFAULT;
++	dma_dst = dma_map_single(ce->dev, dst, dwidth, DMA_FROM_DEVICE);
++	if (dma_mapping_error(ce->dev, dma_dst)) {
++		err = -EFAULT;
++		goto err_src;
++	}
++
++	err = pm_runtime_resume_and_get(ce->dev);
++	if (err < 0)
++		goto err_dst;
++
++	mutex_lock(&ce->rnglock);
++	cet = chan->tl;
++	memset(cet, 0, sizeof(*cet));
++	cet->t_id = cpu_to_le32(CE_PKC_FLOW);
++	cet->t_common_ctl = cpu_to_le32(alg | CE_COMM_INT);
++	cet->t_asym_ctl = cpu_to_le32(CE_ASYM_OP(op) | width / 4);
++	cet->t_dlen = cpu_to_le32(slen);
++	cet->t_src[0].addr = desc_addr_val_le32(ce, dma_src);
++	cet->t_src[0].len = cpu_to_le32(slen / 4);
++	cet->t_dst[0].addr = desc_addr_val_le32(ce, dma_dst);
++	cet->t_dst[0].len = cpu_to_le32(dwidth / 4);
++	err = sun8i_ce_run_task(ce, CE_PKC_FLOW, name);
++	mutex_unlock(&ce->rnglock);
++
++	pm_runtime_put(ce->dev);
++err_dst:
++	dma_unmap_single(ce->dev, dma_dst, dwidth, DMA_FROM_DEVICE);
++err_src:
++	dma_unmap_single(ce->dev, dma_src, slen, DMA_TO_DEVICE);
++	return err;
++}
++
++static void sun8i_ce_reverse(u8 *dst, const u8 *src, unsigned int len)
++{
++	unsigned int i;
++
++	for (i = 0; i < len; i++)
++		dst[i] = src[len - 1 - i];
++}
++
++/* big endian @src of @len bytes -> little endian @dst of @width bytes */
++static void sun8i_ce_be_to_le(u8 *dst, unsigned int width, const u8 *src,
++			      unsigned int len)
++{
++	memset(dst, 0, width);
++	sun8i_ce_reverse(dst, src, len);
++}
++
++static void sun8i_ce_digits_to_le(u8 *dst, unsigned int width, const u64 *v,
++				  unsigned int ndigits)
++{
++	unsigned int i;
++
++	for (i = 0; i < width; i++)
++		dst[i] = i / 8 < ndigits ? v[i / 8] >> (8 * (i % 8)) : 0;
++}
++
++static void sun8i_ce_le_to_digits(u64 *v, unsigned int ndigits, const u8 *src,
++				  unsigned int width)
++{
++	unsigned int i;
++
++	memset(v, 0, ndigits * sizeof(u64));
++	for (i = 0; i < width && i / 8 < ndigits; i++)
++		v[i / 8] |= (u64)src[i] << (8 * (i % 8));
++}
++
++/* RSA */
++
++static bool sun8i_ce_rsa_hw_size(unsigned int bits)
++{
++	switch (bits) {
++	case 512:
++	case 1024:
++	case 2048:
++	case 3072:
++	case 4096:
++		return true;
++	}
++	return false;
++}
++
++static void sun8i_ce_rsa_free_key(struct sun8i_ce_rsa_ctx *ctx)
++{
++	kfree(ctx->n);
++	kfree_sensitive(ctx->e);
++	kfree_sensitive(ctx->d);
++	ctx->n = NULL;
++	ctx->e = NULL;
++	ctx->d = NULL;
++	ctx->n_sz = 0;
++	ctx->hw = false;
++}
++
++static const u8 *sun8i_ce_strip(const u8 *p, size_t *len)
++{
++	while (*len && !*p) {
++		p++;
++		(*len)--;
++	}
++	return p;
++}
++
++static u8 *sun8i_ce_rsa_le(const u8 *p, size_t len, unsigned int width)
++{
++	u8 *v;
++
++	p = sun8i_ce_strip(p, &len);
++	if (len > width)
++		return ERR_PTR(-EINVAL);
++	v = kmalloc(width, GFP_KERNEL);
++	if (!v)
++		return ERR_PTR(-ENOMEM);
++	sun8i_ce_be_to_le(v, width, p, len);
++	return v;
++}
++
++static int sun8i_ce_rsa_setkey(struct crypto_akcipher *tfm, const void *key,
++			       unsigned int keylen, bool priv)
++{
++	struct sun8i_ce_rsa_ctx *ctx = akcipher_tfm_ctx(tfm);
++	struct rsa_key raw = {};
++	const u8 *n;
++	size_t n_sz;
++	int err;
++
++	sun8i_ce_rsa_free_key(ctx);
++
++	/* the fallback checks the key the same way as for software RSA */
++	if (priv)
++		err = crypto_akcipher_set_priv_key(ctx->fallback, key, keylen);
++	else
++		err = crypto_akcipher_set_pub_key(ctx->fallback, key, keylen);
++	if (err)
++		return err;
++
++	if (priv)
++		err = rsa_parse_priv_key(&raw, key, keylen);
++	else
++		err = rsa_parse_pub_key(&raw, key, keylen);
++	if (err)
++		return err;
++
++	n_sz = raw.n_sz;
++	n = sun8i_ce_strip(raw.n, &n_sz);
++	if (!sun8i_ce_rsa_hw_size(n_sz * 8))
++		return 0;
++
++	ctx->n = kmemdup(n, n_sz, GFP_KERNEL);
++	if (!ctx->n)
++		return -ENOMEM;
++	ctx->n_sz = n_sz;
++	ctx->e = sun8i_ce_rsa_le(raw.e, raw.e_sz, n_sz);
++	if (IS_ERR(ctx->e)) {
++		err = PTR_ERR(ctx->e);
++		ctx->e = NULL;
++		goto err_free;
++	}
++	if (priv) {
++		ctx->d = sun8i_ce_rsa_le(raw.d, raw.d_sz, n_sz);
++		if (IS_ERR(ctx->d)) {
++			err = PTR_ERR(ctx->d);
++			ctx->d = NULL;
++			goto err_free;
++		}
++	}
++	ctx->hw = true;
++	return 0;
++
++err_free:
++	sun8i_ce_rsa_free_key(ctx);
++	return err;
++}
++
++static int sun8i_ce_rsa_set_pub_key(struct crypto_akcipher *tfm,
++				    const void *key, unsigned int keylen)
++{
++	return sun8i_ce_rsa_setkey(tfm, key, keylen, false);
++}
++
++static int sun8i_ce_rsa_set_priv_key(struct crypto_akcipher *tfm,
++				     const void *key, unsigned int keylen)
++{
++	return sun8i_ce_rsa_setkey(tfm, key, keylen, true);
++}
++
++static unsigned int sun8i_ce_rsa_max_size(struct crypto_akcipher *tfm)
++{
++	struct sun8i_ce_rsa_ctx *ctx = akcipher_tfm_ctx(tfm);
++
++	return crypto_akcipher_maxsize(ctx->fallback);
++}
++
++static int sun8i_ce_rsa_fallback(struct akcipher_request *req, bool decrypt)
++{
++	struct crypto_akcipher *tfm = crypto_akcipher_reqtfm(req);
++	struct sun8i_ce_rsa_ctx *ctx = akcipher_tfm_ctx(tfm);
++	struct sun8i_ce_pkc_alg *a = rsa_tmpl(tfm);
++	int err;
++
++	a->stat_fb++;
++	akcipher_request_set_tfm(req, ctx->fallback);
++	err = decrypt ? crypto_akcipher_decrypt(req) :
++			crypto_akcipher_encrypt(req);
++	akcipher_request_set_tfm(req, tfm);
++	return err;
++}
++
++static int sun8i_ce_rsa_queue(struct akcipher_request *req, bool decrypt)
++{
++	struct crypto_akcipher *tfm = crypto_akcipher_reqtfm(req);
++	struct sun8i_ce_rsa_ctx *ctx = akcipher_tfm_ctx(tfm);
++	struct sun8i_ce_rsa_reqctx *rctx = akcipher_request_ctx(req);
++
++	if (!ctx->hw || (decrypt && !ctx->d) || req->src_len > ctx->n_sz)
++		return sun8i_ce_rsa_fallback(req, decrypt);
++
++	rctx->decrypt = decrypt;
++	return crypto_transfer_akcipher_request_to_engine(ctx->ce->chanlist[CE_PKC_FLOW].engine,
++							  req);
++}
++
++static int sun8i_ce_rsa_encrypt(struct akcipher_request *req)
++{
++	return sun8i_ce_rsa_queue(req, false);
++}
++
++static int sun8i_ce_rsa_decrypt(struct akcipher_request *req)
++{
++	return sun8i_ce_rsa_queue(req, true);
++}
++
++/* 1 < x < n - 1, both big endian n_sz bytes (SP 800-56Br2 7.1.1, as rsa-generic) */
++static bool sun8i_ce_rsa_payload_ok(const u8 *x, const u8 *n, unsigned int len)
++{
++	unsigned int i;
++	int borrow = 1;
++	u8 n1[CE_RSA_MAX_BYTES];
++
++	for (i = 0; i < len - 1 && !x[i]; i++)
++		;
++	if (i == len - 1 && x[i] <= 1)
++		return false;
++
++	for (i = len; i-- > 0;) {
++		int v = n[i] - borrow;
++
++		borrow = v < 0;
++		n1[i] = v;
++	}
++	return memcmp(x, n1, len) < 0;
++}
++
++static int sun8i_ce_rsa_do(struct akcipher_request *req, bool decrypt)
++{
++	struct crypto_akcipher *tfm = crypto_akcipher_reqtfm(req);
++	struct sun8i_ce_rsa_ctx *ctx = akcipher_tfm_ctx(tfm);
++	struct sun8i_ce_pkc_alg *a = rsa_tmpl(tfm);
++	unsigned int w = ctx->n_sz, used, pad;
++	int nents, err;
++	u8 *src, *dst;
++
++	src = kzalloc(3 * w, GFP_KERNEL);
++	dst = kzalloc(w, GFP_KERNEL);
++	if (!src || !dst) {
++		err = -ENOMEM;
++		goto out;
++	}
++
++	/* base, big endian right aligned in dst for the check */
++	nents = sg_nents_for_len(req->src, req->src_len);
++	if (nents < 0) {
++		err = nents;
++		goto out;
++	}
++	sg_copy_to_buffer(req->src, nents, dst + w - req->src_len,
++			  req->src_len);
++	if (!sun8i_ce_rsa_payload_ok(dst, ctx->n, w)) {
++		err = -EINVAL;
++		goto out;
++	}
++	memcpy(src, decrypt ? ctx->d : ctx->e, w);
++	sun8i_ce_be_to_le(src + w, w, ctx->n, w);
++	sun8i_ce_be_to_le(src + 2 * w, w, dst, w);
++
++	a->stat_req++;
++	err = sun8i_ce_pkc_run(ctx->ce, CE_ALG_RSA, CE_PKC_MOD_EXP, src, 3, w,
++			       dst, w, "RSA");
++	if (err)
++		goto out;
++
++	/* result: as rsa-generic, big endian, zero padded to dst_len */
++	sun8i_ce_reverse(src, dst, w);
++	for (used = w; used && !src[w - used]; used--)
++		;
++	if (req->dst_len < used) {
++		err = -EOVERFLOW;
++		goto out;
++	}
++	nents = sg_nents_for_len(req->dst, req->dst_len);
++	if (nents < 0) {
++		err = nents;
++		goto out;
++	}
++	pad = req->dst_len > w ? req->dst_len - w : 0;
++	used = min(req->dst_len, w);
++	sg_zero_buffer(req->dst, nents, pad, 0);
++	sg_pcopy_from_buffer(req->dst, nents, src + w - used, used, pad);
++out:
++	kfree_sensitive(src);
++	kfree_sensitive(dst);
++	return err;
++}
++
++static int sun8i_ce_rsa_run(struct crypto_engine *engine, void *areq)
++{
++	struct akcipher_request *req = container_of(areq, struct akcipher_request,
++						    base);
++	struct sun8i_ce_rsa_reqctx *rctx = akcipher_request_ctx(req);
++	int err = sun8i_ce_rsa_do(req, rctx->decrypt);
++
++	local_bh_disable();
++	crypto_finalize_akcipher_request(engine, req, err);
++	local_bh_enable();
++	return 0;
++}
++
++static int sun8i_ce_rsa_init(struct crypto_akcipher *tfm)
++{
++	struct sun8i_ce_rsa_ctx *ctx = akcipher_tfm_ctx(tfm);
++	struct sun8i_ce_pkc_alg *a = rsa_tmpl(tfm);
++
++	memset(ctx, 0, sizeof(*ctx));
++	ctx->ce = a->ce;
++	ctx->fallback = crypto_alloc_akcipher("rsa", 0, CRYPTO_ALG_ASYNC |
++					      CRYPTO_ALG_NEED_FALLBACK);
++	if (IS_ERR(ctx->fallback))
++		return PTR_ERR(ctx->fallback);
++	akcipher_set_reqsize(tfm, max(sizeof(struct sun8i_ce_rsa_reqctx),
++				      crypto_akcipher_reqsize(ctx->fallback)));
++	return 0;
++}
++
++static void sun8i_ce_rsa_exit(struct crypto_akcipher *tfm)
++{
++	struct sun8i_ce_rsa_ctx *ctx = akcipher_tfm_ctx(tfm);
++
++	sun8i_ce_rsa_free_key(ctx);
++	crypto_free_akcipher(ctx->fallback);
++}
++
++/* ECDH */
++
++static int sun8i_ce_ecdh_set_secret(struct crypto_kpp *tfm, const void *buf,
++				    unsigned int len)
++{
++	struct sun8i_ce_ecdh_ctx *ctx = kpp_tfm_ctx(tfm);
++	struct ecdh params;
++
++	if (crypto_ecdh_decode_key(buf, len, &params) < 0 ||
++	    params.key_size > sizeof(u64) * ctx->ndigits)
++		return -EINVAL;
++
++	memset(ctx->priv, 0, sizeof(ctx->priv));
++
++	if (!params.key || !params.key_size)
++		return ecc_gen_privkey(ctx->curve_id, ctx->ndigits, ctx->priv);
++
++	ecc_digits_from_bytes(params.key, params.key_size, ctx->priv,
++			      ctx->ndigits);
++	if (ecc_is_key_valid(ctx->curve_id, ctx->ndigits, ctx->priv,
++			     params.key_size) < 0) {
++		memzero_explicit(ctx->priv, sizeof(ctx->priv));
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static int sun8i_ce_ecdh_queue(struct kpp_request *req, bool shared)
++{
++	struct sun8i_ce_ecdh_ctx *ctx = kpp_tfm_ctx(crypto_kpp_reqtfm(req));
++	struct sun8i_ce_ecdh_reqctx *rctx = kpp_request_ctx(req);
++
++	rctx->shared = shared;
++	return crypto_transfer_kpp_request_to_engine(ctx->ce->chanlist[CE_PKC_FLOW].engine,
++						     req);
++}
++
++static int sun8i_ce_ecdh_generate_public_key(struct kpp_request *req)
++{
++	return sun8i_ce_ecdh_queue(req, false);
++}
++
++static int sun8i_ce_ecdh_compute_shared_secret(struct kpp_request *req)
++{
++	return sun8i_ce_ecdh_queue(req, true);
++}
++
++static int sun8i_ce_ecdh_do(struct kpp_request *req, bool shared)
++{
++	struct crypto_kpp *tfm = crypto_kpp_reqtfm(req);
++	struct sun8i_ce_ecdh_ctx *ctx = kpp_tfm_ctx(tfm);
++	struct sun8i_ce_pkc_alg *a = kpp_tmpl(tfm);
++	const struct ecc_curve *curve = ctx->curve;
++	unsigned int nd = ctx->ndigits, nbytes = nd * sizeof(u64);
++	unsigned int w = sun8i_ce_ecc_width(curve), outlen;
++	u64 x[ECC_MAX_DIGITS], y[ECC_MAX_DIGITS];
++	struct ecc_point pk = ECC_POINT_INIT(x, y, nd);
++	u8 *src, *dst, *out;
++	int nents, err;
++
++	src = kzalloc(5 * w, GFP_KERNEL);
++	dst = kzalloc(2 * w, GFP_KERNEL);
++	out = kzalloc(2 * nbytes, GFP_KERNEL);
++	if (!src || !dst || !out) {
++		err = -ENOMEM;
++		goto out;
++	}
++
++	if (shared) {
++		if (req->src_len != 2 * nbytes) {
++			err = -EINVAL;
++			goto out;
++		}
++		nents = sg_nents_for_len(req->src, 2 * nbytes);
++		if (nents < 0 ||
++		    sg_copy_to_buffer(req->src, nents, out, 2 * nbytes) !=
++		    2 * nbytes) {
++			err = -EINVAL;
++			goto out;
++		}
++		ecc_digits_from_bytes(out, nbytes, x, nd);
++		ecc_digits_from_bytes(out + nbytes, nbytes, y, nd);
++		err = ecc_is_pubkey_valid_partial(curve, &pk);
++		if (err)
++			goto out;
++	} else {
++		memcpy(x, curve->g.x, nbytes);
++		memcpy(y, curve->g.y, nbytes);
++	}
++
++	sun8i_ce_digits_to_le(src, w, curve->p, nd);
++	sun8i_ce_digits_to_le(src + w, w, ctx->priv, nd);
++	sun8i_ce_digits_to_le(src + 2 * w, w, curve->a, nd);
++	sun8i_ce_digits_to_le(src + 3 * w, w, x, nd);
++	sun8i_ce_digits_to_le(src + 4 * w, w, y, nd);
++
++	a->stat_req++;
++	err = sun8i_ce_pkc_run(ctx->ce, CE_ALG_ECC, CE_ECC_POINT_MUL, src, 5,
++			       w, dst, 2 * w, "ECDH");
++	if (err)
++		goto out;
++
++	sun8i_ce_le_to_digits(x, nd, dst, w);
++	sun8i_ce_le_to_digits(y, nd, dst + w, w);
++	if (ecc_point_is_zero(&pk)) {
++		err = -EFAULT;
++		goto out;
++	}
++	ecc_swap_digits(x, (u64 *)out, nd);
++	ecc_swap_digits(y, (u64 *)(out + nbytes), nd);
++
++	/* the shared secret is x only; might want less than we've got */
++	outlen = min(shared ? nbytes : 2 * nbytes, req->dst_len);
++	nents = sg_nents_for_len(req->dst, outlen);
++	if (nents < 0 ||
++	    sg_copy_from_buffer(req->dst, nents, out, outlen) != outlen)
++		err = -EINVAL;
++out:
++	kfree_sensitive(src);
++	kfree_sensitive(dst);
++	kfree_sensitive(out);
++	return err;
++}
++
++static int sun8i_ce_ecdh_run(struct crypto_engine *engine, void *areq)
++{
++	struct kpp_request *req = container_of(areq, struct kpp_request, base);
++	struct sun8i_ce_ecdh_reqctx *rctx = kpp_request_ctx(req);
++	int err = sun8i_ce_ecdh_do(req, rctx->shared);
++
++	local_bh_disable();
++	crypto_finalize_kpp_request(engine, req, err);
++	local_bh_enable();
++	return 0;
++}
++
++static unsigned int sun8i_ce_ecdh_max_size(struct crypto_kpp *tfm)
++{
++	struct sun8i_ce_ecdh_ctx *ctx = kpp_tfm_ctx(tfm);
++
++	return 2 * ctx->ndigits * sizeof(u64);
++}
++
++static int sun8i_ce_ecdh_init(struct crypto_kpp *tfm)
++{
++	struct sun8i_ce_ecdh_ctx *ctx = kpp_tfm_ctx(tfm);
++	struct sun8i_ce_pkc_alg *a = kpp_tmpl(tfm);
++
++	memset(ctx, 0, sizeof(*ctx));
++	ctx->ce = a->ce;
++	ctx->curve_id = a->curve_id;
++	ctx->curve = ecc_get_curve(a->curve_id);
++	if (!ctx->curve)
++		return -EINVAL;
++	ctx->ndigits = ctx->curve->g.ndigits;
++	kpp_set_reqsize(tfm, sizeof(struct sun8i_ce_ecdh_reqctx));
++	return 0;
++}
++
++static void sun8i_ce_ecdh_exit(struct crypto_kpp *tfm)
++{
++	struct sun8i_ce_ecdh_ctx *ctx = kpp_tfm_ctx(tfm);
++
++	memzero_explicit(ctx->priv, sizeof(ctx->priv));
++}
++
++/* ECDSA verification */
++
++static int sun8i_ce_ecdsa_set_pub_key(struct crypto_sig *tfm, const void *key,
++				      unsigned int keylen)
++{
++	struct sun8i_ce_ecdsa_ctx *ctx = crypto_sig_ctx(tfm);
++	struct ecc_point pk = ECC_POINT_INIT(ctx->x, ctx->y, ctx->ndigits);
++	const u8 *d = key;
++	unsigned int digitlen;
++	int err;
++
++	ctx->pub_set = false;
++
++	/* uncompressed point only, as ecdsa-generic */
++	if (keylen < 1 || ((keylen - 1) & 1) || d[0] != 4)
++		return -EINVAL;
++	digitlen = (keylen - 1) / 2;
++	if (DIV_ROUND_UP(digitlen, sizeof(u64)) != ctx->ndigits)
++		return -EINVAL;
++
++	ecc_digits_from_bytes(d + 1, digitlen, ctx->x, ctx->ndigits);
++	ecc_digits_from_bytes(d + 1 + digitlen, digitlen, ctx->y, ctx->ndigits);
++	err = ecc_is_pubkey_valid_full(ctx->curve, &pk);
++	ctx->pub_set = !err;
++	return err;
++}
++
++static int sun8i_ce_ecdsa_verify(struct crypto_sig *tfm, const void *src,
++				 unsigned int slen, const void *digest,
++				 unsigned int dlen)
++{
++	struct sun8i_ce_ecdsa_ctx *ctx = crypto_sig_ctx(tfm);
++	struct sun8i_ce_pkc_alg *a = sig_tmpl(tfm);
++	const struct ecc_curve *curve = ctx->curve;
++	const struct ecdsa_raw_sig *sig = src;
++	unsigned int nd = ctx->ndigits, w = sun8i_ce_ecc_width(curve);
++	const u64 *ops[CE_ECDSA_VERIFY_OPS];
++	u64 e[ECC_MAX_DIGITS];
++	u8 *buf, *res;
++	unsigned int i;
++	int err;
++
++	if (!ctx->pub_set || slen != sizeof(*sig))
++		return -EINVAL;
++
++	if (vli_is_zero(sig->r, nd) || vli_cmp(sig->r, curve->n, nd) >= 0 ||
++	    vli_is_zero(sig->s, nd) || vli_cmp(sig->s, curve->n, nd) >= 0)
++		return -EBADMSG;
++
++	/* the leftmost bytes of the digest, as ecdsa-generic, reduced mod n */
++	ecc_digits_from_bytes(digest, min(nd * (unsigned int)sizeof(u64), dlen),
++			      e, nd);
++	if (vli_cmp(e, curve->n, nd) >= 0)
++		vli_sub(e, e, curve->n, nd);
++
++	ops[0] = curve->n;
++	ops[1] = sig->s;
++	ops[2] = e;
++	ops[3] = sig->r;
++	ops[4] = curve->p;
++	ops[5] = curve->a;
++	ops[6] = curve->g.x;
++	ops[7] = curve->g.y;
++	ops[8] = ctx->x;
++	ops[9] = ctx->y;
++	ops[10] = curve->n;
++	ops[11] = sig->r;
++
++	buf = kmalloc(CE_ECDSA_VERIFY_OPS * w, GFP_KERNEL);
++	res = kzalloc(w, GFP_KERNEL);
++	if (!buf || !res) {
++		err = -ENOMEM;
++		goto out;
++	}
++	for (i = 0; i < CE_ECDSA_VERIFY_OPS; i++)
++		sun8i_ce_digits_to_le(buf + i * w, w, ops[i], nd);
++
++	a->stat_req++;
++	err = sun8i_ce_pkc_run(ctx->ce, CE_ALG_ECC, CE_ECC_SIGN_VERIFY, buf,
++			       CE_ECDSA_VERIFY_OPS, w, res, w, "ECDSA");
++	if (!err && get_unaligned_le32(res) != 1)
++		err = -EKEYREJECTED;
++out:
++	kfree(buf);
++	kfree(res);
++	return err;
++}
++
++static unsigned int sun8i_ce_ecdsa_key_size(struct crypto_sig *tfm)
++{
++	struct sun8i_ce_ecdsa_ctx *ctx = crypto_sig_ctx(tfm);
++
++	return ctx->curve->nbits;
++}
++
++static unsigned int sun8i_ce_ecdsa_digest_size(struct crypto_sig *tfm)
++{
++	return SHA512_DIGEST_SIZE;
++}
++
++static int sun8i_ce_ecdsa_init(struct crypto_sig *tfm)
++{
++	struct sun8i_ce_ecdsa_ctx *ctx = crypto_sig_ctx(tfm);
++	struct sun8i_ce_pkc_alg *a = sig_tmpl(tfm);
++
++	memset(ctx, 0, sizeof(*ctx));
++	ctx->ce = a->ce;
++	ctx->curve = ecc_get_curve(a->curve_id);
++	if (!ctx->curve)
++		return -EINVAL;
++	ctx->ndigits = ctx->curve->g.ndigits;
++	return 0;
++}
++
++#define CE_PKC_BASE(_name, _drv, _ctx, _flags) {			\
++	.cra_name = _name,						\
++	.cra_driver_name = _drv,					\
++	.cra_priority = CE_PRIO_BELOW_CPU,				\
++	.cra_flags = _flags,						\
++	.cra_module = THIS_MODULE,					\
++	.cra_ctxsize = sizeof(_ctx),					\
++}
++
++#define CE_ECDH(_name, _drv, _id) {					\
++	.type = CRYPTO_ALG_TYPE_KPP,					\
++	.curve_id = _id,						\
++	.alg.kpp = {							\
++		.base = {						\
++			.set_secret = sun8i_ce_ecdh_set_secret,		\
++			.generate_public_key = sun8i_ce_ecdh_generate_public_key, \
++			.compute_shared_secret = sun8i_ce_ecdh_compute_shared_secret, \
++			.max_size = sun8i_ce_ecdh_max_size,		\
++			.init = sun8i_ce_ecdh_init,			\
++			.exit = sun8i_ce_ecdh_exit,			\
++			.base = CE_PKC_BASE(_name, _drv,		\
++					    struct sun8i_ce_ecdh_ctx,	\
++					    CRYPTO_ALG_ASYNC),		\
++		},							\
++		.op.do_one_request = sun8i_ce_ecdh_run,			\
++	},								\
++}
++
++#define CE_ECDSA(_name, _drv, _id) {					\
++	.type = CRYPTO_ALG_TYPE_SIG,					\
++	.curve_id = _id,						\
++	.alg.sig = {							\
++		.verify = sun8i_ce_ecdsa_verify,			\
++		.set_pub_key = sun8i_ce_ecdsa_set_pub_key,		\
++		.key_size = sun8i_ce_ecdsa_key_size,			\
++		.digest_size = sun8i_ce_ecdsa_digest_size,		\
++		.init = sun8i_ce_ecdsa_init,				\
++		.base = CE_PKC_BASE(_name, _drv,			\
++				    struct sun8i_ce_ecdsa_ctx, 0),	\
++	},								\
++}
++
++static struct sun8i_ce_pkc_alg ce_pkc_algs[] = {
++{
++	.type = CRYPTO_ALG_TYPE_AKCIPHER,
++	.alg.rsa = {
++		.base = {
++			.encrypt = sun8i_ce_rsa_encrypt,
++			.decrypt = sun8i_ce_rsa_decrypt,
++			.set_pub_key = sun8i_ce_rsa_set_pub_key,
++			.set_priv_key = sun8i_ce_rsa_set_priv_key,
++			.max_size = sun8i_ce_rsa_max_size,
++			.init = sun8i_ce_rsa_init,
++			.exit = sun8i_ce_rsa_exit,
++			.base = {
++				.cra_name = "rsa",
++				.cra_driver_name = "rsa-sun8i-ce",
++				.cra_priority = CE_PRIO_BELOW_CPU,
++				.cra_flags = CRYPTO_ALG_ASYNC |
++					     CRYPTO_ALG_NEED_FALLBACK,
++				.cra_module = THIS_MODULE,
++				.cra_ctxsize = sizeof(struct sun8i_ce_rsa_ctx),
++			},
++		},
++		.op.do_one_request = sun8i_ce_rsa_run,
++	},
++},
++CE_ECDH("ecdh-nist-p192", "ecdh-nist-p192-sun8i-ce",
++	ECC_CURVE_NIST_P192),
++CE_ECDH("ecdh-nist-p256", "ecdh-nist-p256-sun8i-ce",
++	ECC_CURVE_NIST_P256),
++CE_ECDH("ecdh-nist-p384", "ecdh-nist-p384-sun8i-ce",
++	ECC_CURVE_NIST_P384),
++CE_ECDSA("ecdsa-nist-p192", "ecdsa-nist-p192-sun8i-ce",
++	 ECC_CURVE_NIST_P192),
++CE_ECDSA("ecdsa-nist-p256", "ecdsa-nist-p256-sun8i-ce",
++	 ECC_CURVE_NIST_P256),
++CE_ECDSA("ecdsa-nist-p384", "ecdsa-nist-p384-sun8i-ce",
++	 ECC_CURVE_NIST_P384),
++CE_ECDSA("ecdsa-nist-p521", "ecdsa-nist-p521-sun8i-ce",
++	 ECC_CURVE_NIST_P521),
++};
++
++static const char *sun8i_ce_pkc_name(struct sun8i_ce_pkc_alg *a)
++{
++	switch (a->type) {
++	case CRYPTO_ALG_TYPE_AKCIPHER:
++		return a->alg.rsa.base.base.cra_driver_name;
++	case CRYPTO_ALG_TYPE_KPP:
++		return a->alg.kpp.base.base.cra_driver_name;
++	default:
++		return a->alg.sig.base.cra_driver_name;
++	}
++}
++
++static int sun8i_ce_pkc_register_one(struct sun8i_ce_pkc_alg *a)
++{
++	switch (a->type) {
++	case CRYPTO_ALG_TYPE_AKCIPHER:
++		return crypto_engine_register_akcipher(&a->alg.rsa);
++	case CRYPTO_ALG_TYPE_KPP:
++		return crypto_engine_register_kpp(&a->alg.kpp);
++	default:
++		return crypto_register_sig(&a->alg.sig);
++	}
++}
++
++static void sun8i_ce_pkc_unregister_one(struct sun8i_ce_pkc_alg *a)
++{
++	switch (a->type) {
++	case CRYPTO_ALG_TYPE_AKCIPHER:
++		crypto_engine_unregister_akcipher(&a->alg.rsa);
++		break;
++	case CRYPTO_ALG_TYPE_KPP:
++		crypto_engine_unregister_kpp(&a->alg.kpp);
++		break;
++	default:
++		crypto_unregister_sig(&a->alg.sig);
++	}
++}
++
++int sun8i_ce_pkc_register(struct sun8i_ce_dev *ce)
++{
++	unsigned int i;
++	int err;
++
++	for (i = 0; i < ARRAY_SIZE(ce_pkc_algs); i++) {
++		struct sun8i_ce_pkc_alg *a = &ce_pkc_algs[i];
++
++		/* no P-192 in FIPS mode, as the software implementations */
++		if (fips_enabled && a->curve_id == ECC_CURVE_NIST_P192)
++			continue;
++		a->ce = ce;
++		dev_info(ce->dev, "Register %s\n", sun8i_ce_pkc_name(a));
++		err = sun8i_ce_pkc_register_one(a);
++		if (err) {
++			dev_err(ce->dev, "ERROR: Fail to register %s\n",
++				sun8i_ce_pkc_name(a));
++			a->ce = NULL;
++			sun8i_ce_pkc_unregister(ce);
++			return err;
++		}
++	}
++	return 0;
++}
++
++void sun8i_ce_pkc_unregister(struct sun8i_ce_dev *ce)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(ce_pkc_algs); i++) {
++		if (!ce_pkc_algs[i].ce)
++			continue;
++		sun8i_ce_pkc_unregister_one(&ce_pkc_algs[i]);
++		ce_pkc_algs[i].ce = NULL;
++	}
++}
++
++void sun8i_ce_pkc_stats(struct seq_file *seq)
++{
++	unsigned int i;
++
++	for (i = 0; i < ARRAY_SIZE(ce_pkc_algs); i++)
++		if (ce_pkc_algs[i].ce)
++			seq_printf(seq, "%s reqs=%lu fallback=%lu\n",
++				   sun8i_ce_pkc_name(&ce_pkc_algs[i]),
++				   ce_pkc_algs[i].stat_req,
++				   ce_pkc_algs[i].stat_fb);
++}
+diff --git a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h
+index c991340..449bf59 100644
+--- a/drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h
++++ b/drivers/crypto/allwinner/sun8i-ce/sun8i-ce.h
+@@ -73,8 +73,16 @@
+ #define CE_ALG_HMAC_SHA256	0x17
+ #define CE_ALG_TRNG		48
+ #define CE_ALG_TRNG_V2		0x1c
++#define CE_ALG_RSA		0x20
++#define CE_ALG_ECC		0x21
+ #define CE_ALG_RAES		0x30
+ 
++/* ce_task asymmetric: operation in bits 20:16, operand width in words */
++#define CE_ASYM_OP(op)		((op) << 16)
++#define CE_PKC_MOD_EXP		0
++#define CE_ECC_POINT_MUL	2
++#define CE_ECC_SIGN_VERIFY	7
++
+ /* Used in ce_variant */
+ #define CE_ID_NOTSUPP		0xFF
+ 
+@@ -166,6 +174,7 @@ struct ce_clock {
+  * @ce_clks:	list of clocks needed by this variant
+  * @esr:	The type of error register
+  * @trng:	The CE_ALG_XXX value for the TRNG
++ * @pkc:	The RSA/ECC unit is supported
+  */
+ struct ce_variant {
+ 	char alg_cipher[CE_ID_CIPHER_MAX];
+@@ -178,6 +187,7 @@ struct ce_variant {
+ 	struct ce_clock ce_clks[CE_MAX_CLOCKS];
+ 	int esr;
+ 	unsigned char trng;
++	bool pkc;
+ };
+ 
+ struct sginfo {
+@@ -234,7 +244,7 @@ struct sun8i_ce_flow {
+  * @reset:	pointer to reset controller
+  * @dev:	the platform device
+  * @mlock:	Control access to device registers
+- * @rnglock:	Control access to the RNG (dedicated channel 3)
++ * @rnglock:	Control access to the dedicated channel 3 (RNG, RSA and ECC)
+  * @chanlist:	array of all flow
+  * @flow:	flow to use in next request
+  * @variant:	pointer to variant specific data
+@@ -427,5 +437,9 @@ int sun8i_ce_hmac_setkey(struct crypto_ahash *tfm, const u8 *key,
+ int sun8i_ce_hmac_digest(struct ahash_request *areq);
+ int sun8i_ce_hmac_run(struct crypto_engine *engine, void *breq);
+ 
++int sun8i_ce_pkc_register(struct sun8i_ce_dev *ce);
++void sun8i_ce_pkc_unregister(struct sun8i_ce_dev *ce);
++void sun8i_ce_pkc_stats(struct seq_file *seq);
++
+ int sun8i_ce_hwrng_register(struct sun8i_ce_dev *ce);
+ void sun8i_ce_hwrng_unregister(struct sun8i_ce_dev *ce);
