@@ -1,4 +1,4 @@
-From d3d005172cb23cfef788972e17fd7a9626510ad0 Mon Sep 17 00:00:00 2001
+From 2f2693f8f5113dd1d52b112da206e6bfff5f8959 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 03:17:23 +0000
 Subject: [PATCH 09/13] drm/panfrost: Drop the cycle counter only for a job
@@ -12,9 +12,10 @@ use_count goes below zero. The same happens for a job that was stopped
 (its reference dropped at dequeue) and resubmitted while a reset was
 pending: is_profiled is still set from its first run.
 
-The GPU reset that follows hides this, panfrost_gpu_soft_reset() WARNs
-and sets use_count back to 0. Without a reset (next patches) the counter
-stays wrong, and panfrost_cycle_counter_get() no longer starts it.
+Today a GPU reset follows, and panfrost_gpu_soft_reset() WARNs and sets
+use_count back to 0. Without a reset (patch "Soft-stop and resume a job
+that outlives the timeout") the count stays wrong, and
+panfrost_cycle_counter_get() no longer starts the counter.
 
 Record in the job whether it holds a reference, and drop it only then.
 

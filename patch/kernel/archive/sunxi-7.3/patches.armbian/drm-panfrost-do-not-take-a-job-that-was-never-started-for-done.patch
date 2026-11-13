@@ -1,4 +1,4 @@
-From 2a4ca90c0c0fa6c138c51af1d5b591abb9906ae6 Mon Sep 17 00:00:00 2001
+From 17bfb4dc105b5f00a093ac216fd5a086a8c61d10 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 03:17:39 +0000
 Subject: [PATCH 10/13] drm/panfrost: Don't take a job that was never started

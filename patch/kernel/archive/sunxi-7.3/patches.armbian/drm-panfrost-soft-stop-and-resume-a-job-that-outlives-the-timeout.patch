@@ -1,4 +1,4 @@
-From 8a0d66763e8720644e7b82794836219c707f73e1 Mon Sep 17 00:00:00 2001
+From e298fd5a2489441765366a8c5c478072e6536f0a Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 05:00:27 +0000
 Subject: [PATCH 12/13] drm/panfrost: Soft-stop and resume a job that outlives

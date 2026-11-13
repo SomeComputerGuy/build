@@ -1,4 +1,4 @@
-From 30116efeefddb9308228d9737d4858fbce231639 Mon Sep 17 00:00:00 2001
+From 06d2ee8ed91b3402c196fe812bfe25aa5941fca1 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 05:00:19 +0000
 Subject: [PATCH 11/13] drm/panfrost: Wait for the soft-stopped slots with the
