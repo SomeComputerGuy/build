@@ -1,7 +1,7 @@
-From 0eba1a34f5923aa6b25ebf6efa27c243e09903b6 Mon Sep 17 00:00:00 2001
+From 8065aae8084f60eeb2bcc3f1ac391cafcc82b744 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 08:39:25 +0000
-Subject: [PATCH 07/11] drm/panfrost: Don't signal a job cancelled from _NEXT
+Subject: [PATCH 08/14] drm/panfrost: Don't signal a job cancelled from _NEXT
  at a reset as done
 
 panfrost_reset() cancels the job waiting in each slot's _NEXT registers
@@ -31,14 +31,13 @@ Fixes: 030761e097b4 ("drm/panfrost: Queue jobs on the hardware")
 Cc: stable@vger.kernel.org
 Reported-by: Sashiko <sashiko-bot@kernel.org>
 Closes: https://lore.kernel.org/all/sashiko-outbox-206581@kernel.org/
-Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/panfrost/panfrost_job.c | 24 ++++++++++++++++++++++++
  1 file changed, 24 insertions(+)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index b21f465..567da26 100644
+index 995e8de..c07ec42 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -657,6 +657,7 @@ static void

@@ -1,0 +1,56 @@
+From adbdee1ea7850ca9d8e92a49ade01b532ffcdc40 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 03:40:07 +0000
+Subject: [PATCH 07/14] drm/panfrost: Don't WARN for a heap folio a
+ neighbouring chunk filled
+
+panfrost_mmu_map_fault_addr() fills the page array of a heap BO a whole
+folio at a time, aligned down to the start of the folio, and warns when
+it finds a page of the folio already filled in. With 16K or 64K pages,
+the THP mount panfrost uses for its BOs can return folios larger than
+the 2 MB fault chunk (up to 32 MB and 128 MB). The first fault in such
+a folio fills the entries of the neighbouring chunks too, so every later
+fault in one of those chunks finds the folio's pages already owned and
+WARNs, although all it has to do is drop the extra folio reference it
+took, as it does.
+
+Warn only for a folio that fits in the chunk: its pages can only have
+been filled by an earlier fault in the same chunk, which is a bug.
+
+Not reproduced: with 4K pages, as here, a folio is at most 2 MB and
+never crosses a chunk.
+
+Fixes: b49c35ba0ce1 ("drm/panfrost: Fix a page leak in panfrost_mmu_map_fault_addr() when THP is on")
+Cc: stable@vger.kernel.org
+Reported-by: Sashiko <sashiko-bot@kernel.org>
+Closes: https://lore.kernel.org/all/sashiko-outbox-210837@kernel.org/
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/panfrost/panfrost_mmu.c | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_mmu.c b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+index c9ade97..9b7591b 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_mmu.c
++++ b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+@@ -715,11 +715,13 @@ static int panfrost_mmu_map_fault_addr(struct panfrost_device *pfdev, int as,
+ 			pages[pg++] = folio_page(folio, i);
+ 		}
+ 
+-		/* We always fill the page array at a folio granularity so
+-		 * there's no valid reason for a folio range to be partially
+-		 * populated.
++		/* We always fill the page array at a folio granularity, so a
++		 * folio is already owned only if it is larger than the chunk
++		 * and the fault of a neighbouring chunk filled it.
+ 		 */
+-		if (drm_WARN_ON(&pfdev->base, already_owned)) {
++		if (already_owned) {
++			drm_WARN_ON(&pfdev->base,
++				    folio_nr_pages(folio) <= NUM_FAULT_PAGES);
+ 			folio_put(folio);
+ 		} else {
+ 			got_start = min(got_start, first);
+-- 
+2.55.0
+

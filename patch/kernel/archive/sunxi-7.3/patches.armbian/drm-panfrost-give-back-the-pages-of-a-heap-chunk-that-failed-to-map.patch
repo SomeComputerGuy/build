@@ -1,7 +1,7 @@
-From 9aa43e995032070ad61171635ce9a6518bc314f4 Mon Sep 17 00:00:00 2001
+From ffb1fdd7e4d72c3cc32f7f3a4ef338b81da4c08c Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
-Date: Tue, 10 Nov 2026 04:59:56 +0000
-Subject: [PATCH 06/11] drm/panfrost: Give back the pages of a heap chunk that
+Date: Fri, 13 Nov 2026 03:43:56 +0000
+Subject: [PATCH 06/14] drm/panfrost: Give back the pages of a heap chunk that
  failed to map
 
 panfrost_mmu_map_fault_addr() grows a heap BO by one 2 MB chunk per
@@ -23,7 +23,7 @@ On those error paths, put the folios read for the chunk and clear their
 entries, so that a later fault in it starts from an empty range. The
 range to clear is the one the fill loop wrote, which is not always the
 chunk: the loop aligns down to the start of each folio and fills the
-whole folio, so a folio larger than 2 MB (PMD-sized folios with 16K or
+whole folio, so a folio larger than 2 MB (possible with 16K or
 64K pages) also fills entries of the neighbouring chunks, and a folio
 whose pages the loop found already owned (by such a neighbour) is not
 ours to put.
@@ -33,7 +33,6 @@ a chunk; the larger-folio case is from reading the code.
 
 Fixes: b49c35ba0ce1 ("drm/panfrost: Fix a page leak in panfrost_mmu_map_fault_addr() when THP is on")
 Cc: stable@vger.kernel.org
-Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/panfrost/panfrost_mmu.c | 51 +++++++++++++++++++++++--

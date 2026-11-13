@@ -1,7 +1,7 @@
-From 7ef95013ab224043ad9296b0aa809d8c9da036ac Mon Sep 17 00:00:00 2001
+From 715c24c6ef21e82db927a1d0eb91c3714f2d8056 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 05:00:19 +0000
-Subject: [PATCH 09/11] drm/panfrost: Wait for the soft-stopped slots with the
+Subject: [PATCH 12/14] drm/panfrost: Wait for the soft-stopped slots with the
  live slot status
 
 panfrost_reset() soft-stops the slots and waits for them to go idle by
@@ -33,17 +33,16 @@ every caller copes with a NULL, so a stray event is a warning rather
 than an Oops.
 
 Fixes: 030761e097b4 ("drm/panfrost: Queue jobs on the hardware")
-Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/panfrost/panfrost_job.c | 48 +++++++++++++------------
  1 file changed, 26 insertions(+), 22 deletions(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index b813493..d7f7ff6 100644
+index 3b0b690..26d39d7 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
-@@ -163,7 +163,11 @@ panfrost_dequeue_job(struct panfrost_device *pfdev, int slot)
+@@ -171,7 +171,11 @@ panfrost_dequeue_job(struct panfrost_device *pfdev, int slot)
  {
  	struct panfrost_job *job = pfdev->jobs[slot][0];
  
@@ -56,7 +55,7 @@ index b813493..d7f7ff6 100644
  
  	if (job->is_profiled && job->engine_usage) {
  		job->engine_usage->elapsed_ns[slot] +=
-@@ -635,25 +639,23 @@ static void panfrost_jm_handle_irqs(struct panfrost_device *pfdev)
+@@ -648,25 +652,23 @@ static void panfrost_jm_handle_irqs(struct panfrost_device *pfdev)
  	}
  }
  
@@ -95,7 +94,7 @@ index b813493..d7f7ff6 100644
  }
  
  static void
-@@ -661,9 +663,8 @@ panfrost_reset(struct panfrost_device *pfdev,
+@@ -674,9 +676,8 @@ panfrost_reset(struct panfrost_device *pfdev,
  	       struct drm_sched_job *bad)
  {
  	struct panfrost_job *evicted[NUM_JOB_SLOTS] = {};
@@ -106,7 +105,7 @@ index b813493..d7f7ff6 100644
  	int ret;
  
  	if (!atomic_read(&pfdev->reset.pending))
-@@ -719,10 +720,13 @@ panfrost_reset(struct panfrost_device *pfdev,
+@@ -732,10 +733,13 @@ panfrost_reset(struct panfrost_device *pfdev,
  	}
  	spin_unlock(&pfdev->js->job_lock);
  
