@@ -1,0 +1,122 @@
+From fdb502cf880700c526e5e63771572417c7cc7d5f Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 03:22:48 +0000
+Subject: [PATCH 2/3] TEST ONLY: drm/panfrost: K18 v3 switches and counters
+
+Not for upstream and not for the image. Module parameters, off by
+default, for the board test of the two v3 fixes:
+- test_stop_delay_ms: sleep between a timeout marking reset.pending and
+  panfrost_reset(), so that jobs of the other slot are queued without
+  being started and the interrupt handler sees them;
+- test_force_cc: every job asks for the cycle counter;
+- test_cc (read only): cycle counter use count, and how often an
+  unstarted job was queued, kept on an idle slot, or drained without a
+  cycle counter reference, and how many delays ran.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/panfrost/panfrost_job.c | 52 +++++++++++++++++++++++++
+ 1 file changed, 52 insertions(+)
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
+index c9cc210..08c1fa4 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_job.c
++++ b/drivers/gpu/drm/panfrost/panfrost_job.c
+@@ -50,6 +50,41 @@ static const struct kernel_param_ops panfrost_test_reset_ops = {
+ 	.set = panfrost_test_reset_set,
+ };
+ module_param_cb(test_reset, &panfrost_test_reset_ops, NULL, 0200);
++
++/* TEST ONLY (K18 v3): test_stop_delay_ms widens the window between a timeout
++ * marking reset.pending and panfrost_reset() masking the job interrupt, so
++ * that jobs of the other slot are queued without being started;
++ * test_force_cc makes every job ask for the cycle counter; test_cc reads the
++ * cycle counter use count and how often the v3 fixes' cases were hit.
++ */
++static unsigned int panfrost_test_stop_delay_ms;
++module_param_named(test_stop_delay_ms, panfrost_test_stop_delay_ms, uint, 0600);
++static bool panfrost_test_force_cc;
++module_param_named(test_force_cc, panfrost_test_force_cc, bool, 0600);
++static unsigned int panfrost_test_unstarted_queued;
++static unsigned int panfrost_test_unstarted_kept;
++static unsigned int panfrost_test_noref_drained;
++static unsigned int panfrost_test_delays;
++
++static int panfrost_test_cc_get(char *buf, const struct kernel_param *kp)
++{
++	struct panfrost_device *pfdev = READ_ONCE(panfrost_test_pfdev);
++
++	if (!pfdev)
++		return -ENODEV;
++
++	return sysfs_emit(buf, "use_count=%d unstarted_queued=%u unstarted_kept=%u noref_drained=%u delays=%u\n",
++			  atomic_read(&pfdev->cycle_counter.use_count),
++			  READ_ONCE(panfrost_test_unstarted_queued),
++			  READ_ONCE(panfrost_test_unstarted_kept),
++			  READ_ONCE(panfrost_test_noref_drained),
++			  READ_ONCE(panfrost_test_delays));
++}
++
++static const struct kernel_param_ops panfrost_test_cc_ops = {
++	.get = panfrost_test_cc_get,
++};
++module_param_cb(test_cc, &panfrost_test_cc_ops, NULL, 0444);
+ #define JOB_TIMEOUT_MS 500
+ 
+ /* How long a soft-stopped slot gets to reach a task boundary before its job is
+@@ -266,6 +301,9 @@ static int panfrost_job_hw_submit(struct panfrost_job *job, int js)
+ 	u64 jc_head = job->jc;
+ 	int ret;
+ 
++	if (READ_ONCE(panfrost_test_force_cc))
++		job->requirements |= PANFROST_JD_REQ_CYCLE_COUNT;
++
+ 	ret = pm_runtime_get_sync(pfdev->base.dev);
+ 	if (ret < 0)
+ 		goto err_hwsubmit;
+@@ -331,6 +369,8 @@ static int panfrost_job_hw_submit(struct panfrost_job *job, int js)
+ 		dev_dbg(pfdev->base.dev,
+ 			"JS: Submitting atom %p to js[%d][%d] with head=0x%llx AS %d",
+ 			job, js, subslot, jc_head, cfg & 0xf);
++	} else {
++		panfrost_test_unstarted_queued++;
+ 	}
+ 	spin_unlock(&pfdev->js->job_lock);
+ 
+@@ -638,6 +678,10 @@ static void panfrost_jm_handle_irq(struct panfrost_device *pfdev, u32 status)
+ 		if (!(js_events & MK_JS_MASK(j)))
+ 			continue;
+ 
++		if (!failed[j] && pfdev->jobs[j][0] &&
++		    !pfdev->jobs[j][0]->started && !(js_state & MK_JS_MASK(j)))
++			panfrost_test_unstarted_kept++;
++
+ 		if (failed[j]) {
+ 			panfrost_job_handle_err(pfdev, failed[j], j);
+ 		} else if (pfdev->jobs[j][0] && pfdev->jobs[j][0]->started &&
+@@ -899,6 +943,10 @@ panfrost_reset(struct panfrost_device *pfdev,
+ 		for (j = 0; j < ARRAY_SIZE(pfdev->jobs[0]) && pfdev->jobs[i][j]; j++) {
+ 			struct panfrost_job *job = pfdev->jobs[i][j];
+ 
++			if (!job->cycle_counter_ref &&
++			    (job->requirements & PANFROST_JD_REQ_CYCLE_COUNT ||
++			     job->is_profiled))
++				panfrost_test_noref_drained++;
+ 			panfrost_job_put_cycle_counter(job);
+ 			pm_runtime_put_noidle(pfdev->base.dev);
+ 			panfrost_devfreq_record_idle(&pfdev->pfdevfreq);
+@@ -1043,6 +1091,10 @@ static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
+ 			       PANFROST_RESET_STOP_ONLY);
+ 	else
+ 		atomic_set(&pfdev->reset.pending, 1);
++	if (job_active && READ_ONCE(panfrost_test_stop_delay_ms)) {
++		panfrost_test_delays++;
++		msleep(READ_ONCE(panfrost_test_stop_delay_ms));
++	}
+ 	panfrost_reset(pfdev, sched_job, job_active);
+ 
+ 	return DRM_GPU_SCHED_STAT_RESET;
+-- 
+2.55.0
+
