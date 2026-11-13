@@ -1,0 +1,56 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 22:00:00 +0000
+Subject: [PATCH] sunxi: support the environment on ext4
+
+env_get_location() never returns ENVL_EXT4, so a board with only
+CONFIG_ENV_IS_IN_EXT4 gets ENVL_UNKNOWN, which hangs board_f (see the
+comment there). Return it wherever ENVL_FAT is returned.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ board/sunxi/board.c | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/board/sunxi/board.c b/board/sunxi/board.c
+index 3d1afec7c66..aa66fef45f7 100644
+--- a/board/sunxi/board.c
++++ b/board/sunxi/board.c
+@@ -150,6 +150,8 @@ enum env_location env_get_location(enum env_operation op, int prio)
+ 	case BOOT_DEVICE_MMC2:
+ 		if (prio == 0 && IS_ENABLED(CONFIG_ENV_IS_IN_FAT))
+ 			return ENVL_FAT;
++		if (prio == 0 && IS_ENABLED(CONFIG_ENV_IS_IN_EXT4))
++			return ENVL_EXT4;
+ 		if (IS_ENABLED(CONFIG_ENV_IS_IN_MMC))
+ 			return ENVL_MMC;
+ 		break;
+@@ -164,6 +166,8 @@ enum env_location env_get_location(enum env_operation op, int prio)
+ 			return ENVL_SPI_FLASH;
+ 		if (IS_ENABLED(CONFIG_ENV_IS_IN_FAT))
+ 			return ENVL_FAT;
++		if (IS_ENABLED(CONFIG_ENV_IS_IN_EXT4))
++			return ENVL_EXT4;
+ 		break;
+ 	case BOOT_DEVICE_BOARD:
+ 		break;
+@@ -176,12 +180,14 @@ enum env_location env_get_location(enum env_operation op, int prio)
+ 	 * environment location other than ENVL_UNKNOWN, or the setup sequence
+ 	 * in board_f() will silently hang. This is arguably a bug in
+ 	 * env_init(), but for now pick one environment for which we know for
+-	 * sure to have a driver for. For all defconfigs this is either FAT
+-	 * or UBI, or NOWHERE, which is already handled above.
++	 * sure to have a driver for. For all defconfigs this is either FAT,
++	 * EXT4 or UBI, or NOWHERE, which is already handled above.
+ 	 */
+ 	if (prio == 0) {
+ 		if (IS_ENABLED(CONFIG_ENV_IS_IN_FAT))
+ 			return ENVL_FAT;
++		if (IS_ENABLED(CONFIG_ENV_IS_IN_EXT4))
++			return ENVL_EXT4;
+ 		if (IS_ENABLED(CONFIG_ENV_IS_IN_UBI))
+ 			return ENVL_UBI;
+ 	}
+-- 
+Armbian
+

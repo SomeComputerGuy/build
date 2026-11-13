@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 22:00:00 +0000
+Subject: [PATCH] configs: orangepi_zero2: keep the environment in
+ /boot/uboot.env
+
+Armbian images have a single ext4 partition, so the default FAT
+environment cannot be used. Keep it in /boot/uboot.env on mmc 0:1.
+U-Boot cannot write ext4 with metadata_csum (the mke2fs default), so
+saveenv fails there.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ configs/orangepi_zero2_defconfig | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/configs/orangepi_zero2_defconfig b/configs/orangepi_zero2_defconfig
+index a45402e5ba8..658d2510bb0 100644
+--- a/configs/orangepi_zero2_defconfig
++++ b/configs/orangepi_zero2_defconfig
+@@ -14,6 +14,11 @@ CONFIG_SPL_SUNXI_LED_STATUS=y
+ CONFIG_SPL_SUNXI_LED_STATUS_GPIO=76
+ # CONFIG_SYS_MALLOC_CLEAR_ON_INIT is not set
+ CONFIG_SPL_I2C=y
++# CONFIG_ENV_IS_IN_FAT is not set
++CONFIG_ENV_IS_IN_EXT4=y
++CONFIG_ENV_EXT4_INTERFACE="mmc"
++CONFIG_ENV_EXT4_DEVICE_AND_PART="0:1"
++CONFIG_ENV_EXT4_FILE="/boot/uboot.env"
+ CONFIG_SYS_I2C_SUN8I_RSB=y
+ CONFIG_MTD=y
+ CONFIG_SPI_FLASH_MACRONIX=y
+-- 
+Armbian
+
