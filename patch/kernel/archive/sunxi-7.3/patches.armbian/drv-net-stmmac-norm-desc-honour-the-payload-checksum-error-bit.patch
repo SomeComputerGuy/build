@@ -1,0 +1,31 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 10:00:00 +0000
+Subject: [PATCH] net: stmmac: norm_desc: honour the payload checksum error bit
+
+ndesc_get_rx_status() ignores RDES0 bit 0 (H616 UM 6.3.6.1
+RX_PAYLOAD_ERR: payload checksum or length wrong), so such a frame can
+go up as CHECKSUM_UNNECESSARY. Return csum_none and let the stack check
+it.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/net/ethernet/stmicro/stmmac/norm_desc.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c b/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
+index de30dfd..562177f 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
++++ b/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
+@@ -104,6 +104,9 @@ static int ndesc_get_rx_status(struct stmmac_extra_stats *x,
+ 	if (rdes0 & RDES0_VLAN_TAG)
+ 		x->vlan_tag++;
+ #endif
++	/* Payload checksum (or length) error: let the stack verify it */
++	if (ret == good_frame && (rdes0 & RDES0_PAYLOAD_CSUM_ERR))
++		ret = csum_none;
+ 	return ret;
+ }
+ 
+-- 
+Armbian
