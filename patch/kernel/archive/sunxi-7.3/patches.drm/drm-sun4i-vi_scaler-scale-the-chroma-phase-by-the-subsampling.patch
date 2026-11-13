@@ -1,0 +1,35 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 19:00:00 +0000
+Subject: [PATCH] drm/sun4i: vi_scaler: Scale the chroma phase by the subsampling
+
+The chroma phase registers count chroma samples: YUV 4:2:0 already
+programs half the luma phase (and the -0.25 vertical siting). YUV 4:2:2
+and 4:1:1 got the luma phase unchanged, which shifts chroma by hsub - 1
+luma pixels for each pixel the crop starts off the chroma grid. Divide
+by the subsampling factors for every format.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/gpu/drm/sun4i/sun8i_vi_scaler.c
++++ b/drivers/gpu/drm/sun4i/sun8i_vi_scaler.c
+@@ -972,13 +972,12 @@
+ 		vphase = 0;
+ 		chphase = 0xfffe0000;
+ 		cvphase = 0xfffe0000;
+-	} else if (format->hsub == 2 && format->vsub == 2) {
+-		chphase = hphase >> 1;
+-		cvphase = (vphase >> 1) -
+-			(1UL << (SUN8I_VI_SCALER_SCALE_FRAC - 2));
+ 	} else {
+-		chphase = hphase;
+-		cvphase = vphase;
++		/* chroma phases count chroma samples */
++		chphase = hphase / format->hsub;
++		cvphase = vphase / format->vsub;
++		if (format->vsub == 2)
++			cvphase -= 1UL << (SUN8I_VI_SCALER_SCALE_FRAC - 2);
+ 	}
+ 
+ 	if (layer->cfg->de_type >= SUN8I_MIXER_DE3) {
