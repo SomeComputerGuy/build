@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 19:23:03 +0000
+Subject: [PATCH] drm/bridge: dw-hdmi: Support HDMI 3D frame packing
+
+Frame packing sends the left view, the active space and the right view
+as one progressive frame: vertical active lines 2 * vdisplay + vblank,
+the vertical blanking of one view, twice the pixel clock. The frame
+composer was set up for one view and the PHY for half the clock.
+
+Program the frame composer and the pixel and TMDS clocks from the frame
+(same layout as the vendor driver: FC VActive 2 * vactive + vblank,
+pixel clock doubled), check deep colour against that clock and reject
+interlaced frame packing, which CRTC_STEREO_DOUBLE does not describe.
+
+The HDMI vendor infoframe already carries the 3D structure from the
+mode flags. Let platforms opt in to stereo modes with
+plat_data->stereo_allowed, as they need a CRTC that runs the doubled
+timings.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+index 4e679b7..55d5ae7 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+@@ -2087,6 +2087,18 @@ static void hdmi_config_drm_infoframe(struct dw_hdmi *hdmi,
+ 		  HDMI_FC_PACKET_TX_EN_DRM_MASK, HDMI_FC_PACKET_TX_EN);
+ }
+ 
++/* Frame packing sends both views and the active space as one frame. */
++static bool dw_hdmi_is_frame_packing(const struct drm_display_mode *mode)
++{
++	return (mode->flags & DRM_MODE_FLAG_3D_MASK) ==
++	       DRM_MODE_FLAG_3D_FRAME_PACKING;
++}
++
++static int dw_hdmi_mode_clock(const struct drm_display_mode *mode)
++{
++	return dw_hdmi_is_frame_packing(mode) ? mode->clock * 2 : mode->clock;
++}
++
+ static void hdmi_av_composer(struct dw_hdmi *hdmi,
+ 			     const struct drm_display_info *display,
+ 			     const struct drm_display_mode *mode)
+@@ -2097,7 +2109,7 @@ static void hdmi_av_composer(struct dw_hdmi *hdmi,
+ 	int hblank, vblank, h_de_hs, v_de_vs, hsync_len, vsync_len;
+ 	unsigned int vdisplay, hdisplay;
+ 
+-	vmode->mpixelclock = mode->clock * 1000;
++	vmode->mpixelclock = dw_hdmi_mode_clock(mode) * 1000;
+ 
+ 	dev_dbg(hdmi->dev, "final pixclk = %d\n", vmode->mpixelclock);
+ 
+@@ -2177,6 +2189,8 @@ static void hdmi_av_composer(struct dw_hdmi *hdmi,
+ 	}
+ 
+ 	vdisplay = mode->vdisplay;
++	if (dw_hdmi_is_frame_packing(mode))
++		vdisplay += mode->vtotal;
+ 	vblank = mode->vtotal - mode->vdisplay;
+ 	v_de_vs = mode->vsync_start - mode->vdisplay;
+ 	vsync_len = mode->vsync_end - mode->vsync_start;
+@@ -2716,6 +2730,7 @@ static int dw_hdmi_connector_create(struct dw_hdmi *hdmi)
+ 		connector->ycbcr_420_allowed = false;
+ 
+ 	connector->interlace_allowed = 1;
++	connector->stereo_allowed = hdmi->plat_data->stereo_allowed;
+ 	connector->polled = DRM_CONNECTOR_POLL_HPD;
+ 
+ 	drm_connector_helper_add(connector, &dw_hdmi_connector_helper_funcs);
+@@ -2790,7 +2805,7 @@ static bool dw_hdmi_deep_color_fits(struct dw_hdmi *hdmi,
+ 				    unsigned int bpc)
+ {
+ 	unsigned int max = hdmi->plat_data->deep_color_max_tmds_clock;
+-	unsigned long tmds = (unsigned long)mode->clock * bpc / 8;
++	unsigned long tmds = (unsigned long)dw_hdmi_mode_clock(mode) * bpc / 8;
+ 
+ 	if (info->max_tmds_clock)
+ 		max = min(max, (unsigned int)info->max_tmds_clock);
+@@ -3151,6 +3166,11 @@ dw_hdmi_bridge_mode_valid(struct drm_bridge *bridge,
+ 	if (mode->flags & DRM_MODE_FLAG_DBLCLK)
+ 		return MODE_BAD;
+ 
++	/* CRTC_STEREO_DOUBLE has no interlaced frame packing layout */
++	if (dw_hdmi_is_frame_packing(mode) &&
++	    mode->flags & DRM_MODE_FLAG_INTERLACE)
++		return MODE_NO_STEREO;
++
+ 	if (pdata->mode_valid)
+ 		mode_status = pdata->mode_valid(hdmi, pdata->priv_data, info,
+ 						mode);
+diff --git a/include/drm/bridge/dw_hdmi.h b/include/drm/bridge/dw_hdmi.h
+index aca0616..4b108c0 100644
+--- a/include/drm/bridge/dw_hdmi.h
++++ b/include/drm/bridge/dw_hdmi.h
+@@ -166,6 +166,12 @@ struct dw_hdmi_plat_data {
+ 	 */
+ 	unsigned int deep_color_max_tmds_clock;
+ 
++	/*
++	 * Expose stereo 3D modes. Frame packing needs a CRTC that runs
++	 * the CRTC_STEREO_DOUBLE timings of the mode.
++	 */
++	bool stereo_allowed;
++
+ 	/*
+ 	 * Private data passed to all the .mode_valid() and .configure_phy()
+ 	 * callback functions.
