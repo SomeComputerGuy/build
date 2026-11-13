@@ -1,0 +1,810 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 20:52:24 +0000
+Subject: [PATCH] drm/sun4i: Program a channel's overlay window from all its
+ layers
+
+A channel blends up to four layers in its overlay window before its
+scaler; layer 3 is on top. Give the visible layers of a channel the
+slots in zpos order, place each in the window by its source-pixel
+offset, set the window, scaler and CSC from the union of the layers,
+and blend them pre-multiplied, as the BSP does for mixed channels.
+
+Reject what one window cannot show: layers of a channel not adjacent in
+z, different scale factors, fractional sources, offsets between source
+pixels, different YUV formats or encodings, YUV off the chroma grid,
+AFBC and an active colour pipeline. Planes of a CRTC all join a commit,
+as one layer moves the slots of the others.
+
+No channel has more than one plane yet.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/sun4i/sun50i_cdc.c     |  12 ++
+ drivers/gpu/drm/sun4i/sun50i_cdc.h     |   5 +
+ drivers/gpu/drm/sun4i/sun8i_mixer.c    | 277 ++++++++++++++++++++++++-
+ drivers/gpu/drm/sun4i/sun8i_mixer.h    |  38 ++++
+ drivers/gpu/drm/sun4i/sun8i_ui_layer.c |  67 ++++--
+ drivers/gpu/drm/sun4i/sun8i_vi_layer.c |  71 +++++--
+ 6 files changed, 424 insertions(+), 46 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun50i_cdc.c b/drivers/gpu/drm/sun4i/sun50i_cdc.c
+index b52499173..e72c2891b 100644
+--- a/drivers/gpu/drm/sun4i/sun50i_cdc.c
++++ b/drivers/gpu/drm/sun4i/sun50i_cdc.c
+@@ -298,6 +298,18 @@ int sun50i_cdc_atomic_check(struct sun8i_layer *layer,
+ 	return ret ? -EINVAL : 0;
+ }
+ 
++/* the colour pipeline of @plane_state does more than bypass */
++bool sun50i_cdc_active(struct sun8i_layer *layer,
++		       struct drm_atomic_commit *state,
++		       struct drm_plane_state *plane_state)
++{
++	struct sun50i_cdc_cfg cfg;
++
++	return layer->cdc &&
++	       !sun50i_cdc_get_cfg(layer, state, plane_state, &cfg) &&
++	       cfg.enable;
++}
++
+ static void sun50i_cdc_write(struct sun8i_layer *layer, u32 reg, u32 val)
+ {
+ 	struct sun50i_cdc *cdc = layer->cdc;
+diff --git a/drivers/gpu/drm/sun4i/sun50i_cdc.h b/drivers/gpu/drm/sun4i/sun50i_cdc.h
+index c856c9a55..e30193e46 100644
+--- a/drivers/gpu/drm/sun4i/sun50i_cdc.h
++++ b/drivers/gpu/drm/sun4i/sun50i_cdc.h
+@@ -3,6 +3,8 @@
+ #ifndef _SUN50I_CDC_H_
+ #define _SUN50I_CDC_H_
+ 
++#include <linux/types.h>
++
+ struct drm_atomic_commit;
+ struct drm_plane_state;
+ struct sun8i_layer;
+@@ -15,5 +17,8 @@ void sun50i_cdc_atomic_update(struct sun8i_layer *layer,
+ 			      struct drm_atomic_commit *state,
+ 			      struct drm_plane_state *plane_state);
+ void sun50i_cdc_disable(struct sun8i_layer *layer);
++bool sun50i_cdc_active(struct sun8i_layer *layer,
++		       struct drm_atomic_commit *state,
++		       struct drm_plane_state *plane_state);
+ 
+ #endif /* _SUN50I_CDC_H_ */
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+index 5ad4a9773..72a8b8b54 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -23,13 +23,16 @@
+ #include <drm/drm_atomic_helper.h>
+ #include <drm/drm_blend.h>
+ #include <drm/drm_crtc.h>
++#include <drm/drm_fourcc.h>
+ #include <drm/drm_framebuffer.h>
+ #include <drm/drm_gem_dma_helper.h>
++#include <drm/drm_gem_framebuffer_helper.h>
+ #include <drm/drm_print.h>
+ #include <drm/drm_probe_helper.h>
+ #include <drm/drm_vblank.h>
+ 
+ #include "sun4i_drv.h"
++#include "sun50i_cdc.h"
+ #include "sun50i_fmt.h"
+ #include "sun50i_planes.h"
+ #include "sun50i_shadow.h"
+@@ -617,8 +620,203 @@ static void sun50i_mixer_vblank_quirk(struct sunxi_engine *engine,
+ 		sun50i_wb_vblank(wb, mixer, cur_line);
+ }
+ 
++/*
++ * The visible layers of @layer's channel on @crtc, in the new state of
++ * @state where it has one. They take the overlay slots bottom up in zpos
++ * order (slot 3 is on top). Returns the slot of @layer, -1 when it is not
++ * visible.
++ */
++int sun8i_layer_get_ovl(struct sun8i_layer *layer,
++			struct drm_atomic_commit *state,
++			struct drm_crtc *crtc, struct sun8i_ovl *ovl)
++{
++	struct sun8i_layer **layers = layer->chan_layers ?: &layer;
++	unsigned int n = layer->chan_layers ? SUN8I_LAYER_OVERLAYS : 1;
++	struct drm_plane_state *first;
++	int i, j, slot = -1;
++
++	memset(ovl, 0, sizeof(*ovl));
++	if (!crtc)
++		return -1;
++
++	for (i = 0; i < n; i++) {
++		struct drm_plane *plane = &layers[i]->plane;
++		struct drm_plane_state *st;
++
++		st = drm_atomic_get_new_plane_state(state, plane) ?: plane->state;
++		if (st->crtc != crtc || !st->visible)
++			continue;
++
++		for (j = ovl->num; j > 0 &&
++		     ovl->state[j - 1]->normalized_zpos > st->normalized_zpos; j--)
++			ovl->state[j] = ovl->state[j - 1];
++		ovl->state[j] = st;
++		ovl->num++;
++	}
++
++	for (i = 0; i < ovl->num; i++) {
++		struct drm_plane_state *st = ovl->state[i];
++
++		if (st->plane == &layer->plane)
++			slot = i;
++		if (!i) {
++			ovl->dst = st->dst;
++			continue;
++		}
++		ovl->dst.x1 = min(ovl->dst.x1, st->dst.x1);
++		ovl->dst.y1 = min(ovl->dst.y1, st->dst.y1);
++		ovl->dst.x2 = max(ovl->dst.x2, st->dst.x2);
++		ovl->dst.y2 = max(ovl->dst.y2, st->dst.y2);
++	}
++
++	if (ovl->num) {
++		/* the layers share one scale factor (sun8i_ovl_check()) */
++		first = ovl->state[0];
++		ovl->w = div_u64((u64)drm_rect_width(&ovl->dst) *
++				 (drm_rect_width(&first->src) >> 16),
++				 drm_rect_width(&first->dst));
++		ovl->h = div_u64((u64)drm_rect_height(&ovl->dst) *
++				 (drm_rect_height(&first->src) >> 16),
++				 drm_rect_height(&first->dst));
++	}
++
++	return slot;
++}
++
++/* position of a layer in the overlay window, in source pixels */
++u32 sun8i_ovl_coord(const struct sun8i_ovl *ovl,
++		    const struct drm_plane_state *state)
++{
++	u32 x, y;
++
++	x = div_u64((u64)(state->dst.x1 - ovl->dst.x1) *
++		    (drm_rect_width(&state->src) >> 16),
++		    drm_rect_width(&state->dst));
++	y = div_u64((u64)(state->dst.y1 - ovl->dst.y1) *
++		    (drm_rect_height(&state->src) >> 16),
++		    drm_rect_height(&state->dst));
++
++	return SUN8I_MIXER_COORD(x, y);
++}
++
++/*
++ * Layer pre-multiply control. A single layer passes its data as is and the
++ * blender pipe is told the blend mode. Several layers are blended inside
++ * the overlay: each is brought to pre-multiplied form and so is the pipe.
++ */
++u32 sun8i_ovl_premul_ctl(const struct sun8i_ovl *ovl,
++			 const struct drm_plane_state *state)
++{
++	if (ovl->num < 2)
++		return SUN8I_MIXER_LAYER_PREMUL_NONE;
++
++	return state->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI ?
++	       SUN8I_MIXER_LAYER_PREMUL_INPUT :
++	       SUN8I_MIXER_LAYER_PREMUL_CONVERT;
++}
++
++/*
++ * The layers of a channel share its overlay window, scaler, CSC, colour
++ * pipeline and decompressor: reject what they cannot show together.
++ */
++int sun8i_ovl_check(struct sun8i_layer *layer, struct drm_atomic_commit *state,
++		    struct drm_crtc *crtc)
++{
++	const struct drm_format_info *f0;
++	struct drm_plane_state *first;
++	struct sun8i_ovl ovl;
++	u32 sw0, sh0, dw0, dh0;
++	const char *why;
++	int i;
++
++	sun8i_layer_get_ovl(layer, state, crtc, &ovl);
++	if (ovl.num < 2)
++		return 0;
++
++	first = ovl.state[0];
++	f0 = first->fb->format;
++	sw0 = drm_rect_width(&first->src) >> 16;
++	sh0 = drm_rect_height(&first->src) >> 16;
++	dw0 = drm_rect_width(&first->dst);
++	dh0 = drm_rect_height(&first->dst);
++
++	for (i = 0; i < ovl.num; i++) {
++		struct drm_plane_state *st = ovl.state[i];
++		struct sun8i_layer *l = plane_to_sun8i_layer(st->plane);
++		const struct drm_format_info *f = st->fb->format;
++		u32 sw, sh, dw, dh, dx, dy, ox, oy;
++
++		why = "AFBC";
++		if (drm_is_afbc(st->fb->modifier))
++			goto reject;
++
++		why = "colour pipeline";
++		if (sun50i_cdc_active(l, state, st))
++			goto reject;
++
++		why = "fractional source";
++		if ((st->src.x1 | st->src.y1 | st->src.x2 | st->src.y2) & 0xffff)
++			goto reject;
++
++		sw = drm_rect_width(&st->src) >> 16;
++		sh = drm_rect_height(&st->src) >> 16;
++		dw = drm_rect_width(&st->dst);
++		dh = drm_rect_height(&st->dst);
++		why = "scale factor";
++		if ((u64)sw * dw0 != (u64)sw0 * dw ||
++		    (u64)sh * dh0 != (u64)sh0 * dh)
++			goto reject;
++
++		dx = st->dst.x1 - ovl.dst.x1;
++		dy = st->dst.y1 - ovl.dst.y1;
++		why = "position between source pixels";
++		if ((u64)dx * sw % dw || (u64)dy * sh % dh)
++			goto reject;
++
++		if (!f->is_yuv && !f0->is_yuv)
++			continue;
++
++		/* the VI overlay has one video format and one CSC */
++		why = "YUV format or colour encoding";
++		if (f->format != f0->format ||
++		    st->color_encoding != first->color_encoding ||
++		    st->color_range != first->color_range)
++			goto reject;
++
++		ox = (u64)dx * sw / dw;
++		oy = (u64)dy * sh / dh;
++		why = "off the chroma grid";
++		if ((st->src.x1 >> 16) % f->hsub || sw % f->hsub ||
++		    ox % f->hsub || (st->src.y1 >> 16) % f->vsub ||
++		    sh % f->vsub || oy % f->vsub)
++			goto reject;
++	}
++
++	return 0;
++
++reject:
++	drm_dbg_atomic(crtc->dev, "[CRTC:%d] channel %d: %u layers, %s\n",
++		       crtc->base.id, layer->channel, ovl.num, why);
++	return -EINVAL;
++}
++
++/* switch off the overlay slots no visible layer uses */
++static void sun8i_layer_clear_slots(struct sun8i_layer *layer,
++				    unsigned int used)
++{
++	u32 ch_base = sun8i_channel_base(layer);
++	unsigned int slot;
++
++	for (slot = used; slot < SUN8I_LAYER_OVERLAYS; slot++)
++		regmap_write(layer->regs,
++			     layer->type == SUN8I_LAYER_TYPE_VI ?
++			     SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, slot) :
++			     SUN8I_MIXER_CHAN_UI_LAYER_ATTR(ch_base, slot), 0);
++}
++
+ /* the planes of one channel on the CRTC being committed */
+ struct sun8i_mixer_chan {
++	struct sun8i_layer *layer;	/* any plane of the channel */
+ 	struct drm_rect dst;		/* union of the visible planes */
+ 	unsigned int visible;		/* visible planes */
+ 	bool attached;			/* any plane on the CRTC */
+@@ -696,17 +894,20 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+ 		bool enable;
+ 		int zpos;
+ 
+-		if (!(plane->possible_crtcs & drm_crtc_mask(crtc)))
++		if (!(plane->possible_crtcs & drm_crtc_mask(crtc)) ||
++		    WARN_ON(layer->index >= MAX_CHANNELS))
+ 			continue;
+ 
++		ch = &chans[layer->index];
++		ch->layer = layer;
++
+ 		plane_state = drm_atomic_get_new_plane_state(state, plane);
+ 		if (!plane_state)
+ 			plane_state = plane->state;
+ 
+-		if (plane_state->crtc != crtc || WARN_ON(layer->index >= MAX_CHANNELS))
++		if (plane_state->crtc != crtc)
+ 			continue;
+ 
+-		ch = &chans[layer->index];
+ 		enable = plane_state->visible;
+ 		zpos = plane_state->normalized_zpos;
+ 
+@@ -738,10 +939,12 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+ 		 * multiplies colour with (pixel and/or plane) alpha itself.
+ 		 * Planes without a blend mode property (DE2 VI layers, no pixel
+ 		 * alpha) keep the non-pre-multiplied path, which their global
+-		 * alpha relies on.
++		 * alpha relies on. Several layers of one channel leave it
++		 * pre-multiplied (sun8i_ovl_premul_ctl()).
+ 		 */
+-		ch->premul = plane->blend_mode_property &&
+-			     plane_state->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI;
++		ch->premul = ch->visible > 1 ||
++			     (plane->blend_mode_property &&
++			      plane_state->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI);
+ 	}
+ 
+ 	/*
+@@ -753,6 +956,9 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+ 		struct sun8i_mixer_chan *ch = &chans[i];
+ 		int key, pipe = 0, x, y, w, h;
+ 
++		if (ch->layer && ch->layer->chan_layers)
++			sun8i_layer_clear_slots(ch->layer, ch->visible);
++
+ 		if (!ch->attached)
+ 			continue;
+ 
+@@ -1003,7 +1209,66 @@ static void sun50i_mixer_disable_color_correction(struct sunxi_engine *engine)
+ 	sun50i_mixer_set_output_yuv(engine, false);
+ }
+ 
++/*
++ * A channel is one blender pipe: its visible planes must be adjacent in
++ * z. Every plane of the CRTC joins the commit, as a change of one layer
++ * moves the slots and window coordinates of the others.
++ */
++static int sun50i_mixer_atomic_check(struct sunxi_engine *engine,
++				     struct drm_crtc_state *crtc_state)
++{
++	struct drm_atomic_commit *state = crtc_state->state;
++	struct drm_plane_state *vis[MAX_CHANNELS * SUN8I_LAYER_OVERLAYS];
++	struct drm_crtc *crtc = crtc_state->crtc;
++	unsigned int n = 0, seen = 0;
++	struct drm_plane *plane;
++	int i, j, last = -1, ret;
++
++	ret = drm_atomic_add_affected_planes(state, crtc);
++	if (ret)
++		return ret;
++
++	drm_for_each_plane_mask(plane, crtc->dev, crtc_state->plane_mask) {
++		struct drm_plane_state *st;
++
++		st = drm_atomic_get_new_plane_state(state, plane);
++		if (!st || !st->visible)
++			continue;
++		if (WARN_ON(n == ARRAY_SIZE(vis)))
++			return -EINVAL;
++
++		for (j = n; j > 0 &&
++		     vis[j - 1]->normalized_zpos > st->normalized_zpos; j--)
++			vis[j] = vis[j - 1];
++		vis[j] = st;
++		n++;
++	}
++
++	for (i = 0; i < n; i++) {
++		struct sun8i_layer *layer = plane_to_sun8i_layer(vis[i]->plane);
++
++		if (layer->index == last)
++			continue;
++
++		if (seen & BIT(layer->index)) {
++			drm_dbg_atomic(crtc->dev,
++				       "[CRTC:%d] channel %d planes not adjacent in z\n",
++				       crtc->base.id, layer->channel);
++			return -EINVAL;
++		}
++		seen |= BIT(layer->index);
++		last = layer->index;
++
++		ret = sun8i_ovl_check(layer, state, crtc);
++		if (ret)
++			return ret;
++	}
++
++	return 0;
++}
++
+ static const struct sunxi_engine_ops sun50i_engine_ops = {
++	.atomic_check		= sun50i_mixer_atomic_check,
+ 	.commit			= sun8i_mixer_commit,
+ 	.layers_init		= sun50i_layers_init,
+ 	.mode_set		= sun8i_mixer_mode_set,
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.h b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+index 15873e198..b379d45ba 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+@@ -16,6 +16,8 @@
+ #include "sunxi_engine.h"
+ #include "sun55i_de.h"
+ 
++struct drm_atomic_commit;
++struct drm_crtc;
+ struct sun50i_cdc;
+ struct sun50i_shadow;
+ struct sun50i_wb;
+@@ -118,6 +120,12 @@ struct sun50i_wb;
+ #define SUN50I_MIXER_BLEND_CSC_CTL_EN(ch)	BIT(ch)
+ #define SUN50I_MIXER_BLEND_CSC_CONST_VAL(d, c)	(((d) << 16) | ((c) & 0xffff))
+ 
++/* layer attribute bits 17:16, the same on VI and UI channels */
++#define SUN8I_MIXER_LAYER_ATTR_PREMUL(x)	((x) << 16)
++#define SUN8I_MIXER_LAYER_PREMUL_NONE		0
++#define SUN8I_MIXER_LAYER_PREMUL_CONVERT	1	/* to pre-multiplied */
++#define SUN8I_MIXER_LAYER_PREMUL_INPUT		2	/* is pre-multiplied */
++
+ #define SUN8I_MIXER_FBFMT_ARGB8888	0
+ #define SUN8I_MIXER_FBFMT_ABGR8888	1
+ #define SUN8I_MIXER_FBFMT_RGBA8888	2
+@@ -327,12 +335,17 @@ enum {
+ 	SUN8I_LAYER_TYPE_VI,
+ };
+ 
++/* overlay layers of a channel; layer 3 is on top */
++#define SUN8I_LAYER_OVERLAYS		4
++
+ struct sun8i_layer {
+ 	struct drm_plane		plane;
+ 	int				type;
+ 	int				index;
+ 	int				channel;
+ 	int				overlay;
++	/* all layers of the channel, NULL when only overlay 0 is a plane */
++	struct sun8i_layer		**chan_layers;
+ 	struct regmap			*regs;
+ 	u32				afbc_base;
+ 	struct sun50i_cdc		*cdc;
+@@ -345,6 +358,31 @@ plane_to_sun8i_layer(struct drm_plane *plane)
+ 	return container_of(plane, struct sun8i_layer, plane);
+ }
+ 
++/**
++ * struct sun8i_ovl - visible layers of a channel
++ * @state: their plane states, bottom (overlay slot 0) first
++ * @num: number of visible layers
++ * @dst: union of their CRTC rectangles, the channel's blender input
++ * @w: overlay window width in source pixels
++ * @h: overlay window height in source pixels
++ */
++struct sun8i_ovl {
++	struct drm_plane_state	*state[SUN8I_LAYER_OVERLAYS];
++	unsigned int		num;
++	struct drm_rect		dst;
++	u32			w, h;
++};
++
++int sun8i_layer_get_ovl(struct sun8i_layer *layer,
++			struct drm_atomic_commit *state,
++			struct drm_crtc *crtc, struct sun8i_ovl *ovl);
++u32 sun8i_ovl_coord(const struct sun8i_ovl *ovl,
++		    const struct drm_plane_state *state);
++u32 sun8i_ovl_premul_ctl(const struct sun8i_ovl *ovl,
++			 const struct drm_plane_state *state);
++int sun8i_ovl_check(struct sun8i_layer *layer, struct drm_atomic_commit *state,
++		    struct drm_crtc *crtc);
++
+ /* Blend modes offered by planes that support per-pixel alpha. */
+ #define SUN8I_LAYER_BLEND_MODES		(BIT(DRM_MODE_BLEND_PREMULTI) | \
+ 					 BIT(DRM_MODE_BLEND_COVERAGE) | \
+diff --git a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
+index 1bc7fba54..e135c1614 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
+@@ -31,12 +31,18 @@ static void sun8i_ui_layer_disable(struct sun8i_layer *layer)
+ {
+ 	u32 ch_base = sun8i_channel_base(layer);
+ 
++	/* with several layers per channel the mixer switches off free slots */
++	if (layer->chan_layers)
++		return;
++
+ 	regmap_write(layer->regs,
+ 		     SUN8I_MIXER_CHAN_UI_LAYER_ATTR(ch_base, layer->overlay), 0);
+ }
+ 
+ static void sun8i_ui_layer_update_attributes(struct sun8i_layer *layer,
+-					     struct drm_plane *plane)
++					     struct drm_plane *plane,
++					     const struct sun8i_ovl *ovl,
++					     int slot)
+ {
+ 	struct drm_plane_state *state = plane->state;
+ 	const struct drm_format_info *fmt;
+@@ -54,23 +60,26 @@ static void sun8i_ui_layer_update_attributes(struct sun8i_layer *layer,
+ 	else
+ 		val |= SUN8I_MIXER_CHAN_UI_LAYER_ATTR_ALPHA_MODE_COMBINED;
+ 	val |= hw_fmt << SUN8I_MIXER_CHAN_UI_LAYER_ATTR_FBFMT_OFFSET;
++	val |= SUN8I_MIXER_LAYER_ATTR_PREMUL(sun8i_ovl_premul_ctl(ovl, state));
+ 	val |= SUN8I_MIXER_CHAN_UI_LAYER_ATTR_EN;
+ 
+ 	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_UI_LAYER_ATTR(ch_base, layer->overlay), val);
++		     SUN8I_MIXER_CHAN_UI_LAYER_ATTR(ch_base, slot), val);
+ }
+ 
+ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
+-					struct drm_plane *plane)
++					struct drm_plane *plane,
++					const struct sun8i_ovl *ovl, int slot)
+ {
+ 	struct drm_plane_state *state = plane->state;
+ 	u32 src_w, src_h, dst_w, dst_h;
++	u32 hscale, vscale;
+ 	u32 outsize, insize;
+ 	u32 hphase, vphase;
+ 	u32 ch_base;
+ 
+-	DRM_DEBUG_DRIVER("Updating UI channel %d overlay %d\n",
+-			 layer->channel, layer->overlay);
++	DRM_DEBUG_DRIVER("Updating UI channel %d overlay %d slot %d of %u\n",
++			 layer->channel, layer->overlay, slot, ovl->num);
+ 
+ 	ch_base = sun8i_channel_base(layer);
+ 
+@@ -81,6 +90,8 @@ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
+ 
+ 	hphase = state->src.x1 & 0xffff;
+ 	vphase = state->src.y1 & 0xffff;
++	hscale = state->src_w / state->crtc_w;
++	vscale = state->src_h / state->crtc_h;
+ 
+ 	insize = SUN8I_MIXER_SIZE(src_w, src_h);
+ 	outsize = SUN8I_MIXER_SIZE(dst_w, dst_h);
+@@ -90,20 +101,35 @@ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
+ 			 state->src.x1 >> 16, state->src.y1 >> 16);
+ 	DRM_DEBUG_DRIVER("Layer source size W: %d H: %d\n", src_w, src_h);
+ 	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_UI_LAYER_SIZE(ch_base, layer->overlay),
++		     SUN8I_MIXER_CHAN_UI_LAYER_SIZE(ch_base, slot),
+ 		     insize);
++	if (layer->chan_layers)
++		regmap_write(layer->regs,
++			     SUN8I_MIXER_CHAN_UI_LAYER_COORD(ch_base, slot),
++			     sun8i_ovl_coord(ovl, state));
++
++	/* the channel registers follow the bottom layer */
++	if (slot)
++		return;
++
++	if (ovl->num > 1) {
++		src_w = ovl->w;
++		src_h = ovl->h;
++		dst_w = drm_rect_width(&ovl->dst);
++		dst_h = drm_rect_height(&ovl->dst);
++		hscale = (src_w << 16) / dst_w;
++		vscale = (src_h << 16) / dst_h;
++		insize = SUN8I_MIXER_SIZE(src_w, src_h);
++		outsize = SUN8I_MIXER_SIZE(dst_w, dst_h);
++	}
++
+ 	regmap_write(layer->regs,
+ 		     SUN8I_MIXER_CHAN_UI_OVL_SIZE(ch_base),
+ 		     insize);
+ 
+ 	if (insize != outsize || hphase || vphase) {
+-		u32 hscale, vscale;
+-
+ 		DRM_DEBUG_DRIVER("HW scaling is enabled\n");
+ 
+-		hscale = state->src_w / state->crtc_w;
+-		vscale = state->src_h / state->crtc_h;
+-
+ 		if (layer->cfg->de_type == SUN8I_MIXER_DE33) {
+ 			sun8i_vi_scaler_setup(layer, src_w, src_h, dst_w, dst_h,
+ 					      hscale, vscale, hphase, vphase,
+@@ -124,7 +150,7 @@ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
+ }
+ 
+ static void sun8i_ui_layer_update_buffer(struct sun8i_layer *layer,
+-					 struct drm_plane *plane)
++					 struct drm_plane *plane, int slot)
+ {
+ 	struct drm_plane_state *state = plane->state;
+ 	struct drm_framebuffer *fb = state->fb;
+@@ -139,13 +165,13 @@ static void sun8i_ui_layer_update_buffer(struct sun8i_layer *layer,
+ 	/* Set the line width */
+ 	DRM_DEBUG_DRIVER("Layer line width: %d bytes\n", fb->pitches[0]);
+ 	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_UI_LAYER_PITCH(ch_base, layer->overlay),
++		     SUN8I_MIXER_CHAN_UI_LAYER_PITCH(ch_base, slot),
+ 		     fb->pitches[0]);
+ 
+ 	DRM_DEBUG_DRIVER("Setting buffer address to %pad\n", &dma_addr);
+ 
+ 	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_UI_LAYER_TOP_LADDR(ch_base, layer->overlay),
++		     SUN8I_MIXER_CHAN_UI_LAYER_TOP_LADDR(ch_base, slot),
+ 		     lower_32_bits(dma_addr));
+ }
+ 
+@@ -196,18 +222,21 @@ static void sun8i_ui_layer_atomic_update(struct drm_plane *plane,
+ 	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state,
+ 									   plane);
+ 	struct sun8i_layer *layer = plane_to_sun8i_layer(plane);
++	struct sun8i_ovl ovl;
++	int slot;
+ 
+-	if (!new_state->crtc || !new_state->visible) {
++	slot = sun8i_layer_get_ovl(layer, state, new_state->crtc, &ovl);
++	if (slot < 0) {
+ 		sun8i_ui_layer_disable(layer);
+ 		return;
+ 	}
+ 
+-	sun8i_ui_layer_update_attributes(layer, plane);
+-	sun8i_ui_layer_update_coord(layer, plane);
++	sun8i_ui_layer_update_attributes(layer, plane, &ovl, slot);
++	sun8i_ui_layer_update_coord(layer, plane, &ovl, slot);
+ 	/* DE33 UI channels have a CSC too, needed for YUV output */
+-	if (layer->cfg->de_type == SUN8I_MIXER_DE33)
++	if (layer->cfg->de_type == SUN8I_MIXER_DE33 && !slot)
+ 		sun8i_csc_config(layer, new_state);
+-	sun8i_ui_layer_update_buffer(layer, plane);
++	sun8i_ui_layer_update_buffer(layer, plane, slot);
+ }
+ 
+ static const struct drm_plane_helper_funcs sun8i_ui_layer_helper_funcs = {
+diff --git a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+index c78fc44c1..b36ba5a2e 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+@@ -27,14 +27,19 @@ static void sun8i_vi_layer_disable(struct sun8i_layer *layer)
+ {
+ 	u32 ch_base = sun8i_channel_base(layer);
+ 
+-	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, layer->overlay), 0);
++	/* with several layers per channel the mixer switches off free slots */
++	if (!layer->chan_layers)
++		regmap_write(layer->regs,
++			     SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, layer->overlay),
++			     0);
+ 	sun50i_afbc_disable(layer);
+ 	sun50i_cdc_disable(layer);
+ }
+ 
+ static void sun8i_vi_layer_update_attributes(struct sun8i_layer *layer,
+-					     struct drm_plane *plane)
++					     struct drm_plane *plane,
++					     const struct sun8i_ovl *ovl,
++					     int slot)
+ {
+ 	struct drm_plane_state *state = plane->state;
+ 	const struct drm_format_info *fmt;
+@@ -56,10 +61,11 @@ static void sun8i_vi_layer_update_attributes(struct sun8i_layer *layer,
+ 			val |= SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_PIXEL;
+ 		else
+ 			val |= SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_COMBINED;
++		val |= SUN8I_MIXER_LAYER_ATTR_PREMUL(sun8i_ovl_premul_ctl(ovl, state));
+ 	}
+ 
+ 	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, layer->overlay), val);
++		     SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, slot), val);
+ 
+ 	if (layer->cfg->de2_fcc_alpha) {
+ 		regmap_write(layer->regs,
+@@ -69,7 +75,8 @@ static void sun8i_vi_layer_update_attributes(struct sun8i_layer *layer,
+ }
+ 
+ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
+-					struct drm_plane *plane, bool afbc)
++					struct drm_plane *plane, bool afbc,
++					const struct sun8i_ovl *ovl, int slot)
+ {
+ 	struct drm_plane_state *state = plane->state;
+ 	struct sun4i_crtc *scrtc = drm_crtc_to_sun4i_crtc(state->crtc);
+@@ -84,8 +91,8 @@ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
+ 	bool subsampled;
+ 	u32 ch_base;
+ 
+-	DRM_DEBUG_DRIVER("Updating VI channel %d overlay %d\n",
+-			 layer->channel, layer->overlay);
++	DRM_DEBUG_DRIVER("Updating VI channel %d overlay %d slot %d of %u\n",
++			 layer->channel, layer->overlay, slot, ovl->num);
+ 
+ 	ch_base = sun8i_channel_base(layer);
+ 
+@@ -127,8 +134,29 @@ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
+ 			 (state->src.y1 >> 16) & ~(format->vsub - 1));
+ 	DRM_DEBUG_DRIVER("Layer source size W: %d H: %d\n", src_w, src_h);
+ 	regmap_write(layer->regs,
+-		     SUN8I_MIXER_CHAN_VI_LAYER_SIZE(ch_base, layer->overlay),
++		     SUN8I_MIXER_CHAN_VI_LAYER_SIZE(ch_base, slot),
+ 		     insize);
++	if (layer->chan_layers)
++		regmap_write(layer->regs,
++			     SUN8I_MIXER_CHAN_VI_LAYER_COORD(ch_base, slot),
++			     sun8i_ovl_coord(ovl, state));
++
++	/* the channel registers follow the bottom layer */
++	if (slot)
++		return;
++
++	/* layers of a window are on the chroma grid (sun8i_ovl_check()) */
++	if (ovl->num > 1) {
++		src_w = ovl->w;
++		src_h = ovl->h;
++		crop_w = src_w << 16;
++		crop_h = src_h << 16;
++		dst_w = drm_rect_width(&ovl->dst);
++		dst_h = drm_rect_height(&ovl->dst);
++		insize = SUN8I_MIXER_SIZE(src_w, src_h);
++		outsize = SUN8I_MIXER_SIZE(dst_w, dst_h);
++	}
++
+ 	regmap_write(layer->regs,
+ 		     SUN8I_MIXER_CHAN_VI_OVL_SIZE(ch_base),
+ 		     insize);
+@@ -214,7 +242,7 @@ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
+ }
+ 
+ static void sun8i_vi_layer_update_buffer(struct sun8i_layer *layer,
+-					 struct drm_plane *plane)
++					 struct drm_plane *plane, int slot)
+ {
+ 	struct drm_plane_state *state = plane->state;
+ 	struct drm_framebuffer *fb = state->fb;
+@@ -249,16 +277,14 @@ static void sun8i_vi_layer_update_buffer(struct sun8i_layer *layer,
+ 		DRM_DEBUG_DRIVER("Layer %d. line width: %d bytes\n",
+ 				 i + 1, fb->pitches[i]);
+ 		regmap_write(layer->regs,
+-			     SUN8I_MIXER_CHAN_VI_LAYER_PITCH(ch_base,
+-							     layer->overlay, i),
++			     SUN8I_MIXER_CHAN_VI_LAYER_PITCH(ch_base, slot, i),
+ 			     fb->pitches[i]);
+ 
+ 		DRM_DEBUG_DRIVER("Setting %d. buffer address to %pad\n",
+ 				 i + 1, &dma_addr);
+ 
+ 		regmap_write(layer->regs,
+-			     SUN8I_MIXER_CHAN_VI_LAYER_TOP_LADDR(ch_base,
+-								 layer->overlay, i),
++			     SUN8I_MIXER_CHAN_VI_LAYER_TOP_LADDR(ch_base, slot, i),
+ 			     lower_32_bits(dma_addr));
+ 	}
+ }
+@@ -324,8 +350,11 @@ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
+ 									   plane);
+ 	struct sun8i_layer *layer = plane_to_sun8i_layer(plane);
+ 	u32 ch_base = sun8i_channel_base(layer);
++	struct sun8i_ovl ovl;
++	int slot;
+ 
+-	if (!new_state->crtc || !new_state->visible) {
++	slot = sun8i_layer_get_ovl(layer, state, new_state->crtc, &ovl);
++	if (slot < 0) {
+ 		sun8i_vi_layer_disable(layer);
+ 		return;
+ 	}
+@@ -333,17 +362,17 @@ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
+ 	if (drm_is_afbc(new_state->fb->modifier)) {
+ 		/* The decompressor replaces the linear fetch unit. */
+ 		regmap_write(layer->regs,
+-			     SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, layer->overlay),
+-			     0);
++			     SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, slot), 0);
+ 		sun50i_afbc_atomic_update(layer, plane);
+-		sun8i_vi_layer_update_coord(layer, plane, true);
++		sun8i_vi_layer_update_coord(layer, plane, true, &ovl, slot);
+ 		sun8i_csc_config(layer, new_state);
+ 	} else {
+ 		sun50i_afbc_disable(layer);
+-		sun8i_vi_layer_update_attributes(layer, plane);
+-		sun8i_vi_layer_update_coord(layer, plane, false);
+-		sun8i_csc_config(layer, new_state);
+-		sun8i_vi_layer_update_buffer(layer, plane);
++		sun8i_vi_layer_update_attributes(layer, plane, &ovl, slot);
++		sun8i_vi_layer_update_coord(layer, plane, false, &ovl, slot);
++		if (!slot)
++			sun8i_csc_config(layer, new_state);
++		sun8i_vi_layer_update_buffer(layer, plane, slot);
+ 	}
+ 	sun50i_cdc_atomic_update(layer, state, new_state);
+ }
