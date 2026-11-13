@@ -17,17 +17,24 @@ dwmac_sun8i: test_uf_irq_log + counter test_uf_irq (TX DMA state,
 current descriptor and buffer at the underflow interrupt),
 test_coe_jumbo (keep TX checksum insertion above MTU 1500, read at
 open).
+RX checksum offload proof (job 185): counters test_rx_frames,
+test_rx_pl_err (RDES0 bit 0 RX_PAYLOAD_ERR), test_rx_crc_err (bit 1),
+test_rx_hdr_err (bit 7 RX_HEADER_ERR), test_rx_es (bit 15),
+test_rx_discard, test_rx_unnec (frames passed up as
+CHECKSUM_UNNECESSARY), test_rx_unnec_err (... with bit 0 or 7 set),
+test_rx_err_d0 (RDES0 of the last such frame); knob
+test_rx_err_csum_none (bit 0 -> CHECKSUM_NONE, off by default).
 
 Assisted-by: Claude
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- .../net/ethernet/stmicro/stmmac/chain_mode.c  |   7 +-
- drivers/net/ethernet/stmicro/stmmac/common.h  |   1 +
- .../net/ethernet/stmicro/stmmac/dwmac-sun8i.c |  33 +++++
- .../net/ethernet/stmicro/stmmac/norm_desc.c   |   3 +-
- drivers/net/ethernet/stmicro/stmmac/stmmac.h  |   5 +
- .../net/ethernet/stmicro/stmmac/stmmac_main.c | 125 +++++++++++++++++-
- 6 files changed, 169 insertions(+), 5 deletions(-)
+ drivers/net/ethernet/stmicro/stmmac/chain_mode.c  |   7 +-
+ drivers/net/ethernet/stmicro/stmmac/common.h      |   1 +
+ drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c |  33 ++++
+ drivers/net/ethernet/stmicro/stmmac/norm_desc.c   |   3 +-
+ drivers/net/ethernet/stmicro/stmmac/stmmac.h      |   5 +
+ drivers/net/ethernet/stmicro/stmmac/stmmac_main.c | 187 +++++++++++++++++++-
+ 6 files changed, 229 insertions(+), 7 deletions(-)
 
 diff --git a/drivers/net/ethernet/stmicro/stmmac/chain_mode.c b/drivers/net/ethernet/stmicro/stmmac/chain_mode.c
 index 42bf7a5..33cc03d 100644
@@ -176,10 +183,10 @@ index ac1d9d8..089b319 100644
  	unsigned int dma_buf_sz;
  	/* largest frame of the MTU: with two VLAN tags and the FCS */
 diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-index e54e81c..4b3f0f0 100644
+index e54e81c..b3f5897 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-@@ -106,6 +106,84 @@ MODULE_PARM_DESC(pause, "Flow Control Pause Time (units of 512 bit times)");
+@@ -106,6 +106,135 @@ MODULE_PARM_DESC(pause, "Flow Control Pause Time (units of 512 bit times)");
  #define TC_DEFAULT 64
  static int tc = TC_DEFAULT;
  module_param(tc, int, 0644);
@@ -205,6 +212,57 @@ index e54e81c..4b3f0f0 100644
 +module_param(test_tx_len_err, ulong, 0444);
 +static unsigned long test_tx_frames;	/* frames completed (last segment) */
 +module_param(test_tx_frames, ulong, 0444);
++
++/* TEST ONLY (item 37, RX checksum offload proof): RDES0 bits of every
++ * received frame (last descriptor) and what the driver made of it.
++ * RX_PAYLOAD_ERR (bit 0) and RX_HEADER_ERR (bit 7) per H616 UM 6.3.6.1;
++ * bit 15 is the Synopsys error summary (reserved in the H616 UM).
++ * test_rx_err_csum_none = 1: a frame with RX_PAYLOAD_ERR goes up as
++ * CHECKSUM_NONE instead of CHECKSUM_UNNECESSARY (the stack checks it).
++ */
++static unsigned long test_rx_frames;
++module_param(test_rx_frames, ulong, 0444);
++static unsigned long test_rx_pl_err;		/* bit 0 RX_PAYLOAD_ERR */
++module_param(test_rx_pl_err, ulong, 0444);
++static unsigned long test_rx_crc_err;		/* bit 1 RX_CRC_ERR */
++module_param(test_rx_crc_err, ulong, 0444);
++static unsigned long test_rx_hdr_err;		/* bit 7 RX_HEADER_ERR */
++module_param(test_rx_hdr_err, ulong, 0444);
++static unsigned long test_rx_es;		/* bit 15 error summary */
++module_param(test_rx_es, ulong, 0444);
++static unsigned long test_rx_discard;		/* discarded by the driver */
++module_param(test_rx_discard, ulong, 0444);
++static unsigned long test_rx_unnec;		/* up as CHECKSUM_UNNECESSARY */
++module_param(test_rx_unnec, ulong, 0444);
++static unsigned long test_rx_unnec_err;		/* ... with bit 0 or 7 set */
++module_param(test_rx_unnec_err, ulong, 0444);
++static u32 test_rx_err_d0;			/* RDES0 of the last bit 0/7 frame */
++module_param(test_rx_err_d0, uint, 0444);
++static bool test_rx_err_csum_none;
++module_param(test_rx_err_csum_none, bool, 0644);
++
++/* last descriptor of a frame: count its RDES0 bits, returns RDES0 */
++static u32 stmmac_test_rx_desc(struct dma_desc *p, int *status)
++{
++	u32 d0 = le32_to_cpu(p->des0);
++
++	test_rx_frames++;
++	if (d0 & BIT(0))
++		test_rx_pl_err++;
++	if (d0 & BIT(1))
++		test_rx_crc_err++;
++	if (d0 & BIT(7))
++		test_rx_hdr_err++;
++	if (d0 & BIT(15))
++		test_rx_es++;
++	if (d0 & (BIT(0) | BIT(7)))
++		test_rx_err_d0 = d0;
++	if (*status == discard_frame)
++		test_rx_discard++;
++	else if (test_rx_err_csum_none && (d0 & BIT(0)))
++		*status |= csum_none;
++	return d0;
++}
 +
 +#define TEST_SEGS	12
 +static struct {
@@ -264,7 +322,7 @@ index e54e81c..4b3f0f0 100644
  MODULE_PARM_DESC(tc, "DMA threshold control value");
  
  /* This is unused */
-@@ -2822,6 +2900,29 @@ static void stmmac_bump_dma_threshold(struct stmmac_priv *priv, u32 chan)
+@@ -2822,6 +2951,29 @@ static void stmmac_bump_dma_threshold(struct stmmac_priv *priv, u32 chan)
  	}
  }
  
@@ -294,7 +352,7 @@ index e54e81c..4b3f0f0 100644
  /**
   * stmmac_tx_clean - to manage the transmission completion
   * @priv: driver private structure
-@@ -2840,10 +2941,13 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
+@@ -2840,10 +2992,13 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
  	unsigned int bytes_compl = 0, pkts_compl = 0;
  	unsigned int entry, xmits = 0, count = 0;
  	u32 tx_packets = 0, tx_errors = 0;
@@ -308,7 +366,7 @@ index e54e81c..4b3f0f0 100644
  
  	entry = tx_q->dirty_tx;
  
-@@ -2879,6 +2983,8 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
+@@ -2879,6 +3034,8 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
  		 */
  		dma_rmb();
  
@@ -317,7 +375,7 @@ index e54e81c..4b3f0f0 100644
  		/* Just consider the last segment and ...*/
  		if (likely(!(status & tx_not_ls))) {
  			/* ... verify the status error condition */
-@@ -2948,7 +3054,16 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
+@@ -2948,7 +3105,16 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
  			if (likely(skb)) {
  				pkts_compl++;
  				bytes_compl += skb->len;
@@ -335,7 +393,7 @@ index e54e81c..4b3f0f0 100644
  				tx_q->tx_skbuff[entry] = NULL;
  			}
  		}
-@@ -3010,6 +3125,9 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
+@@ -3010,6 +3176,9 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
  
  	__netif_tx_unlock_bh(netdev_get_tx_queue(priv->dev, queue));
  
@@ -345,7 +403,7 @@ index e54e81c..4b3f0f0 100644
  	/* Combine decisions from TX clean and XSK TX */
  	return max(count, xmits);
  }
-@@ -4175,6 +4293,9 @@ static int __stmmac_open(struct net_device *dev,
+@@ -4175,6 +4344,9 @@ static int __stmmac_open(struct net_device *dev,
  			dma_conf->tx_queue[i].tbs = priv->dma_conf.tx_queue[i].tbs;
  	memcpy(&priv->dma_conf, dma_conf, sizeof(*dma_conf));
  
@@ -355,7 +413,7 @@ index e54e81c..4b3f0f0 100644
  	/* The PHY is suspended when the interface is reopened without
  	 * disconnecting the PHY, e.g. on MTU change. IEEE 802.3 allows PHYs
  	 * to stop their receive clock while powered down, but the DMA
-@@ -4867,7 +4988,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
+@@ -4867,7 +5039,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
  	 */
  	if (priv->descriptor_mode == STMMAC_CHAIN_MODE &&
  	    priv->hw->desc == &ndesc_ops && nfrags &&
@@ -364,5 +422,39 @@ index e54e81c..4b3f0f0 100644
  		if (skb_linearize(skb))
  			goto max_sdu_err;
  		nfrags = 0;
+@@ -5803,6 +5975,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+ 	bool fcs_stripped = false;
+ 	int xdp_status = 0;
+ 	int bufsz;
++	u32 test_d0 = 0;
+ 
+ 	dma_dir = page_pool_get_dma_dir(rx_q->page_pool);
+ 	bufsz = DIV_ROUND_UP(priv->dma_conf.dma_buf_sz, PAGE_SIZE) * PAGE_SIZE;
+@@ -5851,6 +6024,8 @@ read_again:
+ 		/* check if managed by the DMA otherwise go ahead */
+ 		if (unlikely(status & dma_own))
+ 			break;
++		if (!(status & rx_not_ls))
++			test_d0 = stmmac_test_rx_desc(p, &status);
+ 
+ 		next_entry = STMMAC_NEXT_ENTRY(rx_q->cur_rx,
+ 					       priv->dma_conf.dma_rx_size);
+@@ -6053,10 +6228,14 @@ drain_data:
+ 		skb->protocol = eth_type_trans(skb, priv->dev);
+ 
+ 		if (unlikely(!coe) || !stmmac_has_ip_ethertype(skb) ||
+-		    (status & csum_none))
++		    (status & csum_none)) {
+ 			skb_checksum_none_assert(skb);
+-		else
++		} else {
+ 			skb->ip_summed = CHECKSUM_UNNECESSARY;
++			test_rx_unnec++;
++			if (test_d0 & (BIT(0) | BIT(7)))
++				test_rx_unnec_err++;
++		}
+ 
+ 		if (!stmmac_get_rx_hash(priv, p, &hash, &hash_type))
+ 			skb_set_hash(skb, hash, hash_type);
 -- 
 Armbian
