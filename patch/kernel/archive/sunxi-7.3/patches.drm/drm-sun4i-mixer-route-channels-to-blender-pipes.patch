@@ -1,0 +1,159 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 20:48:43 +0000
+Subject: [PATCH] drm/sun4i: mixer: Route channels to blender pipes
+
+The blender takes one pipe per channel, and a channel's pipe input is
+its overlay window. Gather the planes of each channel, give the channel
+the pipe of its rank in z and the union of its planes' rectangles. With
+one plane per channel this is what the plane loop programmed so far.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/sun4i/sun8i_mixer.c | 88 +++++++++++++++++++++++------
+ 1 file changed, 72 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+index 7055d9db4..5ad4a9773 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -617,15 +617,26 @@ static void sun50i_mixer_vblank_quirk(struct sunxi_engine *engine,
+ 		sun50i_wb_vblank(wb, mixer, cur_line);
+ }
+ 
++/* the planes of one channel on the CRTC being committed */
++struct sun8i_mixer_chan {
++	struct drm_rect dst;		/* union of the visible planes */
++	unsigned int visible;		/* visible planes */
++	bool attached;			/* any plane on the CRTC */
++	bool premul;
++	int zpos, zpos_attached;	/* lowest normalized zpos */
++};
++
+ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+ 			       struct drm_crtc *crtc,
+ 			       struct drm_atomic_commit *state)
+ {
+ 	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(engine);
+ 	u32 bld_base = sun8i_blender_base(mixer);
++	struct sun8i_mixer_chan chans[MAX_CHANNELS];
+ 	struct drm_plane_state *plane_state;
+ 	struct drm_plane *plane;
+ 	u32 route = 0, pipe_en = 0, premul = 0;
++	int i, j;
+ 
+ 	if (mixer->hw_preconfigured && engine->id == 0) {
+ 		struct sun4i_tcon* tcon;
+@@ -678,10 +689,12 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+ 		return;
+ 	}
+ 
++	memset(chans, 0, sizeof(chans));
+ 	drm_for_each_plane(plane, state->dev) {
+ 		struct sun8i_layer *layer = plane_to_sun8i_layer(plane);
+-		int w, h, x, y, zpos;
++		struct sun8i_mixer_chan *ch;
+ 		bool enable;
++		int zpos;
+ 
+ 		if (!(plane->possible_crtcs & drm_crtc_mask(crtc)))
+ 			continue;
+@@ -690,23 +703,34 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+ 		if (!plane_state)
+ 			plane_state = plane->state;
+ 
+-		enable = plane_state->crtc && plane_state->visible;
++		if (plane_state->crtc != crtc || WARN_ON(layer->index >= MAX_CHANNELS))
++			continue;
++
++		ch = &chans[layer->index];
++		enable = plane_state->visible;
+ 		zpos = plane_state->normalized_zpos;
+-		x = plane_state->dst.x1;
+-		y = plane_state->dst.y1;
+-		w = drm_rect_width(&plane_state->dst);
+-		h = drm_rect_height(&plane_state->dst);
+ 
+-		DRM_DEBUG_DRIVER("  plane %d: chan=%d ovl=%d en=%d zpos=%d x=%d y=%d w=%d h=%d\n",
++		DRM_DEBUG_DRIVER("  plane %d: chan=%d ovl=%d en=%d zpos=%d " DRM_RECT_FMT "\n",
+ 				 plane->base.id, layer->index, layer->overlay,
+-				 enable, zpos, x, y, w, h);
++				 enable, zpos, DRM_RECT_ARG(&plane_state->dst));
+ 
++		if (!ch->attached || zpos < ch->zpos_attached)
++			ch->zpos_attached = zpos;
++		ch->attached = true;
+ 		if (!enable)
+ 			continue;
+ 
+-		/* Route layer to pipe based on zpos */
+-		route |= layer->index << SUN8I_MIXER_BLEND_ROUTE_PIPE_SHIFT(zpos);
+-		pipe_en |= SUN8I_MIXER_BLEND_PIPE_CTL_EN(zpos);
++		if (!ch->visible || zpos < ch->zpos)
++			ch->zpos = zpos;
++		if (ch->visible) {
++			ch->dst.x1 = min(ch->dst.x1, plane_state->dst.x1);
++			ch->dst.y1 = min(ch->dst.y1, plane_state->dst.y1);
++			ch->dst.x2 = max(ch->dst.x2, plane_state->dst.x2);
++			ch->dst.y2 = max(ch->dst.y2, plane_state->dst.y2);
++		} else {
++			ch->dst = plane_state->dst;
++		}
++		ch->visible++;
+ 
+ 		/*
+ 		 * Tell the blender whether the pipe already carries
+@@ -716,15 +740,47 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+ 		 * alpha) keep the non-pre-multiplied path, which their global
+ 		 * alpha relies on.
+ 		 */
+-		if (plane->blend_mode_property &&
+-		    plane_state->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI)
+-			premul |= SUN8I_MIXER_BLEND_PREMULTIPLY_EN(zpos);
++		ch->premul = plane->blend_mode_property &&
++			     plane_state->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI;
++	}
++
++	/*
++	 * A channel takes the pipe of its rank in z: the lowest zpos of its
++	 * visible planes, or of its planes on this CRTC when none is visible.
++	 * With one plane per channel this is the plane's normalized zpos.
++	 */
++	for (i = 0; i < MAX_CHANNELS; i++) {
++		struct sun8i_mixer_chan *ch = &chans[i];
++		int key, pipe = 0, x, y, w, h;
++
++		if (!ch->attached)
++			continue;
++
++		key = ch->visible ? ch->zpos : ch->zpos_attached;
++		for (j = 0; j < MAX_CHANNELS; j++)
++			if (chans[j].attached &&
++			    (chans[j].visible ? chans[j].zpos :
++						chans[j].zpos_attached) < key)
++				pipe++;
++
++		if (!ch->visible)
++			continue;
++
++		x = ch->dst.x1;
++		y = ch->dst.y1;
++		w = drm_rect_width(&ch->dst);
++		h = drm_rect_height(&ch->dst);
++
++		route |= i << SUN8I_MIXER_BLEND_ROUTE_PIPE_SHIFT(pipe);
++		pipe_en |= SUN8I_MIXER_BLEND_PIPE_CTL_EN(pipe);
++		if (ch->premul)
++			premul |= SUN8I_MIXER_BLEND_PREMULTIPLY_EN(pipe);
+ 
+ 		regmap_write(engine->regs,
+-			     SUN8I_MIXER_BLEND_ATTR_COORD(bld_base, zpos),
++			     SUN8I_MIXER_BLEND_ATTR_COORD(bld_base, pipe),
+ 			     SUN8I_MIXER_COORD(x, y));
+ 		regmap_write(engine->regs,
+-			     SUN8I_MIXER_BLEND_ATTR_INSIZE(bld_base, zpos),
++			     SUN8I_MIXER_BLEND_ATTR_INSIZE(bld_base, pipe),
+ 			     SUN8I_MIXER_SIZE(w, h));
+ 	}
+ 
