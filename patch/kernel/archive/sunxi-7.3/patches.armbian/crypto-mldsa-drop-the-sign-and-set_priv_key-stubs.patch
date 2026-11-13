@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 21:00:00 +0000
+Subject: crypto: mldsa - Drop the sign and set_priv_key stubs
+
+The sig API returns -ENOSYS for missing sign and set_priv_key.  The stubs
+make ML-DSA look like it can sign, which the next patch reports to users.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ crypto/mldsa.c | 19 -------------------
+ 1 file changed, 19 deletions(-)
+
+diff --git a/crypto/mldsa.c b/crypto/mldsa.c
+index d8de082..b64a8eb 100644
+--- a/crypto/mldsa.c
++++ b/crypto/mldsa.c
+@@ -16,13 +16,6 @@ struct crypto_mldsa_ctx {
+ 	bool key_set;
+ };
+ 
+-static int crypto_mldsa_sign(struct crypto_sig *tfm,
+-			     const void *msg, unsigned int msg_len,
+-			     void *sig, unsigned int sig_len)
+-{
+-	return -EOPNOTSUPP;
+-}
+-
+ static int crypto_mldsa_verify(struct crypto_sig *tfm,
+ 			       const void *sig, unsigned int sig_len,
+ 			       const void *msg, unsigned int msg_len)
+@@ -68,12 +61,6 @@ static int crypto_mldsa_set_pub_key(struct crypto_sig *tfm,
+ 	return 0;
+ }
+ 
+-static int crypto_mldsa_set_priv_key(struct crypto_sig *tfm,
+-				     const void *key, unsigned int keylen)
+-{
+-	return -EOPNOTSUPP;
+-}
+-
+ static unsigned int crypto_mldsa_max_size(struct crypto_sig *tfm)
+ {
+ 	struct crypto_mldsa_ctx *ctx = crypto_sig_ctx(tfm);
+@@ -124,10 +111,8 @@ static void crypto_mldsa_alg_exit(struct crypto_sig *tfm)
+ 
+ static struct sig_alg crypto_mldsa_algs[] = {
+ 	{
+-		.sign			= crypto_mldsa_sign,
+ 		.verify			= crypto_mldsa_verify,
+ 		.set_pub_key		= crypto_mldsa_set_pub_key,
+-		.set_priv_key		= crypto_mldsa_set_priv_key,
+ 		.key_size		= crypto_mldsa_key_size,
+ 		.max_size		= crypto_mldsa_max_size,
+ 		.init			= crypto_mldsa44_alg_init,
+@@ -138,10 +123,8 @@ static struct sig_alg crypto_mldsa_algs[] = {
+ 		.base.cra_module	= THIS_MODULE,
+ 		.base.cra_priority	= 5000,
+ 	}, {
+-		.sign			= crypto_mldsa_sign,
+ 		.verify			= crypto_mldsa_verify,
+ 		.set_pub_key		= crypto_mldsa_set_pub_key,
+-		.set_priv_key		= crypto_mldsa_set_priv_key,
+ 		.key_size		= crypto_mldsa_key_size,
+ 		.max_size		= crypto_mldsa_max_size,
+ 		.init			= crypto_mldsa65_alg_init,
+@@ -152,10 +135,8 @@ static struct sig_alg crypto_mldsa_algs[] = {
+ 		.base.cra_module	= THIS_MODULE,
+ 		.base.cra_priority	= 5000,
+ 	}, {
+-		.sign			= crypto_mldsa_sign,
+ 		.verify			= crypto_mldsa_verify,
+ 		.set_pub_key		= crypto_mldsa_set_pub_key,
+-		.set_priv_key		= crypto_mldsa_set_priv_key,
+ 		.key_size		= crypto_mldsa_key_size,
+ 		.max_size		= crypto_mldsa_max_size,
+ 		.init			= crypto_mldsa87_alg_init,

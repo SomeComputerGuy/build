@@ -1,0 +1,202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 21:00:00 +0000
+Subject: crypto: sig - Let users ask for an implementation that can sign
+
+ecdsa-generic verifies only.  A driver that can also sign ranks below it
+when its verify is slower, so crypto_alloc_sig("ecdsa-nist-p256") never
+returns it and a caller with a private key gets -ENOSYS.
+
+Set CRYPTO_SIG_ALG_CAN_SIGN on algorithms with sign and set_priv_key.  A
+caller that needs to sign passes it in type and mask.  Add
+sig_check_attr_type() so sig templates take that request; rsassa-pkcs1
+uses it and always signs.  x962 and p1363 pass the request on and sign
+only when the implementation below them signs.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ crypto/ecdsa-p1363.c          | 11 +++++++----
+ crypto/ecdsa-x962.c           | 11 +++++++----
+ crypto/rsassa-pkcs1.c         |  2 +-
+ crypto/sig.c                  | 36 ++++++++++++++++++++++++++++++++++-
+ include/crypto/internal/sig.h |  2 ++
+ include/crypto/sig.h          |  6 ++++++
+ 6 files changed, 58 insertions(+), 10 deletions(-)
+
+diff --git a/crypto/ecdsa-p1363.c b/crypto/ecdsa-p1363.c
+index 4f66d67..ce50ff7 100644
+--- a/crypto/ecdsa-p1363.c
++++ b/crypto/ecdsa-p1363.c
+@@ -132,10 +132,11 @@ static int ecdsa_p1363_create(struct crypto_template *tmpl, struct rtattr **tb)
+ 	struct crypto_sig_spawn *spawn;
+ 	struct sig_instance *inst;
+ 	struct sig_alg *ecdsa_alg;
+-	u32 mask;
++	u32 mask, type;
++	bool sign;
+ 	int err;
+ 
+-	err = crypto_check_attr_type(tb, CRYPTO_ALG_TYPE_SIG, &mask);
++	err = sig_check_attr_type(tb, &mask, &sign);
+ 	if (err)
+ 		return err;
+ 
+@@ -145,8 +146,9 @@ static int ecdsa_p1363_create(struct crypto_template *tmpl, struct rtattr **tb)
+ 
+ 	spawn = sig_instance_ctx(inst);
+ 
++	type = sign ? CRYPTO_SIG_ALG_CAN_SIGN : 0;
+ 	err = crypto_grab_sig(spawn, sig_crypto_instance(inst),
+-			      crypto_attr_alg_name(tb[1]), 0, mask);
++			      crypto_attr_alg_name(tb[1]), type, mask | type);
+ 	if (err)
+ 		goto err_free_inst;
+ 
+@@ -167,7 +169,8 @@ static int ecdsa_p1363_create(struct crypto_template *tmpl, struct rtattr **tb)
+ 	inst->alg.init = ecdsa_p1363_init_tfm;
+ 	inst->alg.exit = ecdsa_p1363_exit_tfm;
+ 
+-	inst->alg.sign = ecdsa_p1363_sign;
++	if (ecdsa_alg->base.cra_flags & CRYPTO_SIG_ALG_CAN_SIGN)
++		inst->alg.sign = ecdsa_p1363_sign;
+ 	inst->alg.verify = ecdsa_p1363_verify;
+ 	inst->alg.key_size = ecdsa_p1363_key_size;
+ 	inst->alg.max_size = ecdsa_p1363_max_size;
+diff --git a/crypto/ecdsa-x962.c b/crypto/ecdsa-x962.c
+index c1ff7ca..6bde8f1 100644
+--- a/crypto/ecdsa-x962.c
++++ b/crypto/ecdsa-x962.c
+@@ -237,10 +237,11 @@ static int ecdsa_x962_create(struct crypto_template *tmpl, struct rtattr **tb)
+ 	struct crypto_sig_spawn *spawn;
+ 	struct sig_instance *inst;
+ 	struct sig_alg *ecdsa_alg;
+-	u32 mask;
++	u32 mask, type;
++	bool sign;
+ 	int err;
+ 
+-	err = crypto_check_attr_type(tb, CRYPTO_ALG_TYPE_SIG, &mask);
++	err = sig_check_attr_type(tb, &mask, &sign);
+ 	if (err)
+ 		return err;
+ 
+@@ -250,8 +251,9 @@ static int ecdsa_x962_create(struct crypto_template *tmpl, struct rtattr **tb)
+ 
+ 	spawn = sig_instance_ctx(inst);
+ 
++	type = sign ? CRYPTO_SIG_ALG_CAN_SIGN : 0;
+ 	err = crypto_grab_sig(spawn, sig_crypto_instance(inst),
+-			      crypto_attr_alg_name(tb[1]), 0, mask);
++			      crypto_attr_alg_name(tb[1]), type, mask | type);
+ 	if (err)
+ 		goto err_free_inst;
+ 
+@@ -272,7 +274,8 @@ static int ecdsa_x962_create(struct crypto_template *tmpl, struct rtattr **tb)
+ 	inst->alg.init = ecdsa_x962_init_tfm;
+ 	inst->alg.exit = ecdsa_x962_exit_tfm;
+ 
+-	inst->alg.sign = ecdsa_x962_sign;
++	if (ecdsa_alg->base.cra_flags & CRYPTO_SIG_ALG_CAN_SIGN)
++		inst->alg.sign = ecdsa_x962_sign;
+ 	inst->alg.verify = ecdsa_x962_verify;
+ 	inst->alg.key_size = ecdsa_x962_key_size;
+ 	inst->alg.max_size = ecdsa_x962_max_size;
+diff --git a/crypto/rsassa-pkcs1.c b/crypto/rsassa-pkcs1.c
+index 94fa5e9..1e54a45 100644
+--- a/crypto/rsassa-pkcs1.c
++++ b/crypto/rsassa-pkcs1.c
+@@ -361,7 +361,7 @@ static int rsassa_pkcs1_create(struct crypto_template *tmpl, struct rtattr **tb)
+ 	u32 mask;
+ 	int err;
+ 
+-	err = crypto_check_attr_type(tb, CRYPTO_ALG_TYPE_SIG, &mask);
++	err = sig_check_attr_type(tb, &mask, NULL);
+ 	if (err)
+ 		return err;
+ 
+diff --git a/crypto/sig.c b/crypto/sig.c
+index 7d2048d..cb4d044 100644
+--- a/crypto/sig.c
++++ b/crypto/sig.c
+@@ -128,8 +128,11 @@ static int sig_prepare_alg(struct sig_alg *alg)
+ 		alg->digest_size = sig_default_size;
+ 
+ 	base->cra_type = &crypto_sig_type;
+-	base->cra_flags &= ~CRYPTO_ALG_TYPE_MASK;
++	base->cra_flags &= ~(CRYPTO_ALG_TYPE_MASK | CRYPTO_SIG_ALG_CAN_SIGN);
+ 	base->cra_flags |= CRYPTO_ALG_TYPE_SIG;
++	if (alg->sign != sig_default_sign &&
++	    alg->set_priv_key != sig_default_set_key)
++		base->cra_flags |= CRYPTO_SIG_ALG_CAN_SIGN;
+ 
+ 	return 0;
+ }
+@@ -169,6 +172,37 @@ int sig_register_instance(struct crypto_template *tmpl,
+ }
+ EXPORT_SYMBOL_GPL(sig_register_instance);
+ 
++/**
++ * sig_check_attr_type() - check the type of a sig template instance
++ * @tb: template parameters
++ * @mask_ret: mask to pass to crypto_grab_*()
++ * @sign_ret: if not NULL, set when the user asked for CRYPTO_SIG_ALG_CAN_SIGN
++ *
++ * Like crypto_check_attr_type(), but also takes a request for
++ * CRYPTO_SIG_ALG_CAN_SIGN.  An instance that signs only when the algorithm
++ * below it signs passes that request on to crypto_grab_sig().
++ *
++ * Return: zero on success; error code in case of error
++ */
++int sig_check_attr_type(struct rtattr **tb, u32 *mask_ret, bool *sign_ret)
++{
++	struct crypto_attr_type *algt;
++
++	algt = crypto_get_attr_type(tb);
++	if (IS_ERR(algt))
++		return PTR_ERR(algt);
++
++	if ((algt->type ^ CRYPTO_ALG_TYPE_SIG) & algt->mask &
++	    ~CRYPTO_SIG_ALG_CAN_SIGN)
++		return -EINVAL;
++
++	*mask_ret = crypto_algt_inherited_mask(algt);
++	if (sign_ret)
++		*sign_ret = algt->type & algt->mask & CRYPTO_SIG_ALG_CAN_SIGN;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(sig_check_attr_type);
++
+ int crypto_grab_sig(struct crypto_sig_spawn *spawn,
+ 		    struct crypto_instance *inst,
+ 		    const char *name, u32 type, u32 mask)
+diff --git a/include/crypto/internal/sig.h b/include/crypto/internal/sig.h
+index b16648c..b23fc4e 100644
+--- a/include/crypto/internal/sig.h
++++ b/include/crypto/internal/sig.h
+@@ -74,6 +74,8 @@ static inline void *sig_instance_ctx(struct sig_instance *inst)
+ 	return crypto_instance_ctx(sig_crypto_instance(inst));
+ }
+ 
++int sig_check_attr_type(struct rtattr **tb, u32 *mask_ret, bool *sign_ret);
++
+ int crypto_grab_sig(struct crypto_sig_spawn *spawn,
+ 		    struct crypto_instance *inst,
+ 		    const char *name, u32 type, u32 mask);
+diff --git a/include/crypto/sig.h b/include/crypto/sig.h
+index fa6dafa..722301f 100644
+--- a/include/crypto/sig.h
++++ b/include/crypto/sig.h
+@@ -9,6 +9,12 @@
+ 
+ #include <linux/crypto.h>
+ 
++/*
++ * Set by the API on algorithms with sign and set_priv_key.  Pass it in type
++ * and mask to crypto_alloc_sig() to get an implementation that can sign.
++ */
++#define CRYPTO_SIG_ALG_CAN_SIGN	0x01000000
++
+ /**
+  * struct crypto_sig - user-instantiated objects which encapsulate
+  * algorithms and core processing logic
