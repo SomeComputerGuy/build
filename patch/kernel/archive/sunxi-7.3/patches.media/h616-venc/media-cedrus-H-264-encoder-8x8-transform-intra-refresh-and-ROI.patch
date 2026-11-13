@@ -1,0 +1,470 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 17:24:08 +0000
+Subject: media: cedrus: H.264 encoder 8x8 transform, intra refresh and ROI
+
+PARA1 bit 27 turns the 8x8 transform off on the H6 and H616 engines:
+the vendor library sets it unless a high profile PPS has
+transform_8x8_mode_flag. Clear it when the PPS asks for the 8x8
+transform.
+
+Cyclic intra refresh of macroblock columns (0xb28), from
+INTRA_REFRESH_PERIOD or CYCLIC_INTRA_REFRESH_MB.
+
+Regions of interest from the ROI_MB_DELTA_QP map. The engine has four
+areas, each with a 6-bit QP offset (0xbcc-0xbdc); a map that needs more
+is rejected.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc.h b/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
+@@ -44,8 +44,8 @@ struct file;
+ #define CEDRUS_ENC_FLAG_ISP_SIZE_8PX		BIT(1)
+ /*
+  * Encoder parameters of the vendor library for these engines: dynamic
+- * motion estimation with its thresholds, PARA1 bit 27, the ME_PARA value
+- * 0x11000 and no chroma QP offset.
++ * motion estimation with its thresholds, the 8x8 transform switch of
++ * PARA1, the ME_PARA value 0x11000 and no chroma QP offset.
+  */
+ #define CEDRUS_ENC_FLAG_H6_PARAMS		BIT(2)
+ 
+@@ -62,6 +62,9 @@ struct file;
+ /* The largest value of the stream size register, in bits (vendor library). */
+ #define CEDRUS_ENC_STM_BIT_MAX			0x0fff0000
+ 
++/* Macroblocks of the largest picture, 4096x4096. */
++#define CEDRUS_ENC_MBS_MAX			(256 * 256)
++
+ /* P pictures narrower than 13 macroblocks never finish on the H616. */
+ #define CEDRUS_ENC_INTER_MIN_WIDTH_MBS		13
+ 
+@@ -105,6 +108,18 @@ struct cedrus_enc_h264_aux {
+ 	size_t		tfcnt_offset;
+ };
+ 
++/* Regions of interest: the four areas of the encoder. */
++#define CEDRUS_ENC_ROI_AREAS			4
++#define CEDRUS_ENC_ROI_MB_SIZE			16
++
++struct cedrus_enc_roi_area {
++	u8	left;
++	u8	right;
++	u8	top;
++	u8	bottom;
++	s8	delta_qp;
++};
++
+ struct cedrus_enc_h264_ctx {
+ 	struct v4l2_h264_enc	enc;
+ 	struct v4l2_fract	timeperframe;
+@@ -112,6 +127,9 @@ struct cedrus_enc_h264_ctx {
+ 	unsigned int		width_mbs;
+ 	unsigned int		height_mbs;
+ 
++	/* Cyclic intra refresh: the column group of the next P picture. */
++	unsigned int		intra_refresh_pos;
++
+ 	void			*mb_info;
+ 	dma_addr_t		mb_info_dma;
+ 	size_t			mb_info_size;
+@@ -211,6 +229,9 @@ extern const struct v4l2_ioctl_ops cedru
+ extern const struct v4l2_ioctl_ops cedrus_enc_jpeg_ioctl_ops;
+ 
+ u32 cedrus_enc_addr(struct cedrus_ctx *ctx, dma_addr_t addr);
++int cedrus_enc_roi_areas(const s8 *map, unsigned int count,
++			 unsigned int width_mbs, unsigned int height_mbs,
++			 struct cedrus_enc_roi_area *areas);
+ const struct cedrus_enc_raw_format *cedrus_enc_raw_format_find(u32 pixelformat);
+ int cedrus_enc_enum_raw_format(struct v4l2_fmtdesc *f);
+ void cedrus_enc_prepare_raw_format(struct v4l2_pix_format *pix_fmt,
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+@@ -1355,8 +1355,11 @@
+ #define VE_ENC_AVC_PARA1			(VE_ENGINE_ENC_AVC + 0x08)
+ #define VE_ENC_AVC_PARA1_MODE_OPTIMIZE_EN	BIT(31)
+ #define VE_ENC_AVC_PARA1_MODE_OPTIMIZE_PAR(v)	SHIFT_AND_MASK_BITS(v, 30, 28)
+-/* Set by the vendor library on the 0x12011 encoders, meaning unknown. */
+-#define VE_ENC_AVC_PARA1_H6_UNKNOWN27		BIT(27)
++/*
++ * 0x12011 encoders: no 8x8 transform. The vendor library sets it unless the
++ * PPS of a high profile stream has transform_8x8_mode_flag.
++ */
++#define VE_ENC_AVC_PARA1_TRANSFORM_8X8_DIS	BIT(27)
+ #define VE_ENC_AVC_PARA1_CLIP_MV_EN		BIT(26)
+ #define VE_ENC_AVC_PARA1_CLIP_MV_PAR(v)		SHIFT_AND_MASK_BITS(v, 25, 24)
+ #define VE_ENC_AVC_PARA1_TEMP_FILTER_HIS_OUT_DIS	BIT(19)
+@@ -1471,8 +1474,17 @@
+ #define VE_ENC_AVC_DEBLK_ADDR			(VE_ENGINE_ENC_AVC + 0xc4)
+ #define VE_ENC_AVC_TFCNT_ADDR			(VE_ENGINE_ENC_AVC + 0xc8)
+ 
++/*
++ * Four regions of interest: a 6-bit QP offset per region (byte n) and an
++ * area per region, in macroblocks, the right and bottom ones included.
++ */
+ #define VE_ENC_AVC_ROI_QP_OFFSET		(VE_ENGINE_ENC_AVC + 0xcc)
++#define VE_ENC_AVC_ROI_QP_OFFSET_N(n, v)	(((v) & 0x3f) << (8 * (n)))
+ #define VE_ENC_AVC_ROI_AREA(n)			(VE_ENGINE_ENC_AVC + 0xd0 + 4 * (n))
++#define VE_ENC_AVC_ROI_AREA_BOTTOM_MB(v)	SHIFT_AND_MASK_BITS(v, 31, 24)
++#define VE_ENC_AVC_ROI_AREA_TOP_MB(v)		SHIFT_AND_MASK_BITS(v, 23, 16)
++#define VE_ENC_AVC_ROI_AREA_RIGHT_MB(v)		SHIFT_AND_MASK_BITS(v, 15, 8)
++#define VE_ENC_AVC_ROI_AREA_LEFT_MB(v)		SHIFT_AND_MASK_BITS(v, 7, 0)
+ 
+ /*
+  * Internal memory port of the block: an auto-incrementing index and the
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+@@ -47,6 +47,105 @@ static const struct v4l2_frmsize_stepwis
+ 
+ /* Controls */
+ 
++static bool cedrus_enc_roi_in_areas(const struct cedrus_enc_roi_area *areas,
++				    unsigned int count, unsigned int x,
++				    unsigned int y)
++{
++	unsigned int i;
++
++	for (i = 0; i < count; i++)
++		if (x >= areas[i].left && x <= areas[i].right &&
++		    y >= areas[i].top && y <= areas[i].bottom)
++			return true;
++
++	return false;
++}
++
++static bool cedrus_enc_roi_row_takes(const s8 *row, unsigned int left,
++				     unsigned int right, s8 delta_qp)
++{
++	unsigned int x;
++
++	for (x = left; x <= right; x++)
++		if (row[x] != delta_qp)
++			return false;
++
++	return true;
++}
++
++/*
++ * Cover the non-zero entries of a ROI delta QP map, one per macroblock in
++ * raster order, with rectangles of one delta QP each: the encoder has four.
++ * Returns how many, or -EINVAL for a map that needs more or does not match
++ * the picture. A map of zeros, of any size, has none.
++ */
++int cedrus_enc_roi_areas(const s8 *map, unsigned int count,
++			 unsigned int width_mbs, unsigned int height_mbs,
++			 struct cedrus_enc_roi_area *areas)
++{
++	unsigned int n = 0, x, y, right, bottom;
++	s8 delta_qp;
++
++	if (!memchr_inv(map, 0, count))
++		return 0;
++
++	if (count != width_mbs * height_mbs)
++		return -EINVAL;
++
++	for (y = 0; y < height_mbs; y++) {
++		for (x = 0; x < width_mbs; x++) {
++			delta_qp = map[y * width_mbs + x];
++			if (!delta_qp || cedrus_enc_roi_in_areas(areas, n, x, y))
++				continue;
++
++			if (n == CEDRUS_ENC_ROI_AREAS)
++				return -EINVAL;
++
++			right = x;
++			while (right + 1 < width_mbs &&
++			       map[y * width_mbs + right + 1] == delta_qp &&
++			       !cedrus_enc_roi_in_areas(areas, n, right + 1, y))
++				right++;
++
++			bottom = y;
++			while (bottom + 1 < height_mbs &&
++			       cedrus_enc_roi_row_takes(&map[(bottom + 1) * width_mbs],
++							x, right, delta_qp))
++				bottom++;
++
++			areas[n].left = x;
++			areas[n].right = right;
++			areas[n].top = y;
++			areas[n].bottom = bottom;
++			areas[n].delta_qp = delta_qp;
++			n++;
++		}
++	}
++
++	return n;
++}
++
++static int cedrus_enc_roi_try_ctrl(struct v4l2_ctrl *ctrl)
++{
++	struct cedrus_ctx *ctx = container_of(ctrl->handler, struct cedrus_ctx,
++					      hdl);
++	struct cedrus_enc_roi_area areas[CEDRUS_ENC_ROI_AREAS];
++	int ret;
++
++	ret = cedrus_enc_roi_areas(ctrl->p_new.p_s8, ctrl->new_elems,
++				   DIV_ROUND_UP(ctx->src_fmt.width,
++						CEDRUS_ENC_ROI_MB_SIZE),
++				   DIV_ROUND_UP(ctx->src_fmt.height,
++						CEDRUS_ENC_ROI_MB_SIZE),
++				   areas);
++
++	return ret < 0 ? ret : 0;
++}
++
++static const struct v4l2_ctrl_ops cedrus_enc_roi_ctrl_ops = {
++	.try_ctrl = cedrus_enc_roi_try_ctrl,
++};
++
+ const struct cedrus_control cedrus_enc_controls[] = {
+ 	{
+ 		.cfg = {
+@@ -250,6 +349,64 @@ const struct cedrus_control cedrus_enc_c
+ 		},
+ 		.capabilities	= CEDRUS_CAPABILITY_H264_ENC,
+ 	},
++	/*
++	 * Cyclic intra refresh of whole macroblock columns: over a period of
++	 * P pictures, or a number of macroblocks per P picture (rounded up to
++	 * whole columns). The period takes precedence.
++	 */
++	{
++		.cfg = {
++			.id	= V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE,
++			.min	= V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE_CYCLIC,
++			.max	= V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE_CYCLIC,
++			.def	= V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD_TYPE_CYCLIC,
++		},
++		.capabilities	= CEDRUS_CAPABILITY_H264_ENC,
++	},
++	{
++		.cfg = {
++			.id	= V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD,
++			.min	= 0,
++			.max	= 256,
++			.step	= 1,
++			.def	= 0,
++		},
++		.capabilities	= CEDRUS_CAPABILITY_H264_ENC,
++	},
++	{
++		.cfg = {
++			.id	= V4L2_CID_MPEG_VIDEO_CYCLIC_INTRA_REFRESH_MB,
++			.min	= 0,
++			.max	= CEDRUS_ENC_MBS_MAX,
++			.step	= 1,
++			.def	= 0,
++		},
++		.capabilities	= CEDRUS_CAPABILITY_H264_ENC,
++	},
++	/* Regions of interest: a delta QP per macroblock, in four areas. */
++	{
++		.cfg = {
++			.id	= V4L2_CID_MPEG_VIDEO_ROI_MB_SIZE,
++			.min	= CEDRUS_ENC_ROI_MB_SIZE,
++			.max	= CEDRUS_ENC_ROI_MB_SIZE,
++			.step	= 1,
++			.def	= CEDRUS_ENC_ROI_MB_SIZE,
++		},
++		.capabilities	= CEDRUS_CAPABILITY_H264_ENC,
++	},
++	{
++		.cfg = {
++			.id	= V4L2_CID_MPEG_VIDEO_ROI_MB_DELTA_QP,
++			.ops	= &cedrus_enc_roi_ctrl_ops,
++			/* The 6-bit offsets of the encoder. */
++			.min	= -32,
++			.max	= 31,
++			.step	= 1,
++			.def	= 0,
++			.dims	= { CEDRUS_ENC_MBS_MAX },
++		},
++		.capabilities	= CEDRUS_CAPABILITY_H264_ENC,
++	},
+ };
+ 
+ const unsigned int cedrus_enc_controls_count = ARRAY_SIZE(cedrus_enc_controls);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -209,14 +209,17 @@ static int cedrus_enc_h264_state_constra
+ 
+ 	/*
+ 	 * CABAC (bit 8 of PARA0) in the main and high profiles; the baseline
+-	 * profile has CAVLC only. No 8x8 transform: the high profile allows
+-	 * the 4x4 transform alone, and no register for the 8x8 one is known.
++	 * profile has CAVLC only. The 8x8 transform (PARA1) in the high
++	 * profile, on the engines whose switch is known.
+ 	 */
+ 	if (sps->profile_idc == 66)
+ 		pps->flags &= ~V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE;
+ 
+-	pps->flags &= ~(V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE |
+-			V4L2_H264_PPS_FLAG_CONSTRAINED_INTRA_PRED);
++	if (sps->profile_idc != 100 ||
++	    !(ctx->dev->enc_flags & CEDRUS_ENC_FLAG_H6_PARAMS))
++		pps->flags &= ~V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE;
++
++	pps->flags &= ~V4L2_H264_PPS_FLAG_CONSTRAINED_INTRA_PRED;
+ 
+ 	/* The deblocking filter is set per slice (PARA0). */
+ 	pps->flags |= V4L2_H264_PPS_FLAG_DEBLOCKING_FILTER_CONTROL_PRESENT;
+@@ -416,6 +419,7 @@ static int cedrus_enc_h264_start(struct
+ 
+ 	h264_ctx->width_mbs = DIV_ROUND_UP(ctx->src_fmt.width, 16);
+ 	h264_ctx->height_mbs = DIV_ROUND_UP(ctx->src_fmt.height, 16);
++	h264_ctx->intra_refresh_pos = 0;
+ 
+ 	/*
+ 	 * Macroblock information buffer (0xbc0). The V3s register map gives
+@@ -546,6 +550,91 @@ static void cedrus_enc_h264_record_layou
+ 			      ref_rec->subpix_size);
+ }
+ 
++/*
++ * Cyclic intra refresh: each P picture codes the next group of macroblock
++ * columns intra; an I picture restarts the cycle. Groups as in the vendor
++ * library: the width split into the period, the first ones a column wider.
++ */
++static u32 cedrus_enc_h264_intra_refresh(struct cedrus_ctx *ctx,
++					 const struct v4l2_ctrl_h264_encode_params *encode)
++{
++	struct cedrus_enc_h264_ctx *h264_ctx = &ctx->codec.enc_h264;
++	unsigned int width_mbs = h264_ctx->width_mbs;
++	unsigned int height_mbs = h264_ctx->height_mbs;
++	unsigned int period, mbs, columns, groups, pos, start, end;
++
++	period = *(s32 *)cedrus_find_control_data(ctx,
++			V4L2_CID_MPEG_VIDEO_INTRA_REFRESH_PERIOD);
++	mbs = *(s32 *)cedrus_find_control_data(ctx,
++			V4L2_CID_MPEG_VIDEO_CYCLIC_INTRA_REFRESH_MB);
++
++	if (encode->slice_type != V4L2_H264_SLICE_TYPE_P || (!period && !mbs)) {
++		h264_ctx->intra_refresh_pos = 0;
++		return 0;
++	}
++
++	if (period) {
++		groups = min(period, width_mbs);
++		pos = h264_ctx->intra_refresh_pos % groups;
++		columns = width_mbs / groups;
++		start = columns * pos + min(pos, width_mbs % groups);
++		end = start + columns + (pos < width_mbs % groups) - 1;
++	} else {
++		columns = clamp(DIV_ROUND_UP(mbs, height_mbs), 1U, width_mbs);
++		groups = DIV_ROUND_UP(width_mbs, columns);
++		pos = h264_ctx->intra_refresh_pos % groups;
++		start = columns * pos;
++		end = min(start + columns, width_mbs) - 1;
++	}
++
++	h264_ctx->intra_refresh_pos = (pos + 1) % groups;
++
++	return VE_ENC_AVC_CYCLIC_INTRA_REFRESH_EN |
++	       VE_ENC_AVC_CYCLIC_INTRA_REFRESH_COL_START_MB(start) |
++	       VE_ENC_AVC_CYCLIC_INTRA_REFRESH_COL_END_MB(end);
++}
++
++/*
++ * Regions of interest from the delta QP map: the areas and their offsets,
++ * with each region's QP kept within 0..51. Returns the number of areas; a
++ * map that does not fit the picture (set before a format change) is not
++ * applied.
++ */
++static unsigned int cedrus_enc_h264_setup_roi(struct cedrus_ctx *ctx,
++					      unsigned int qp)
++{
++	struct cedrus_dev *dev = ctx->dev;
++	struct cedrus_enc_h264_ctx *h264_ctx = &ctx->codec.enc_h264;
++	struct cedrus_enc_roi_area areas[CEDRUS_ENC_ROI_AREAS] = {};
++	u32 offsets = 0;
++	u32 id = V4L2_CID_MPEG_VIDEO_ROI_MB_DELTA_QP;
++	int count, delta_qp, i;
++
++	count = cedrus_enc_roi_areas(cedrus_find_control_data(ctx, id),
++				     cedrus_get_num_of_controls(ctx, id),
++				     h264_ctx->width_mbs, h264_ctx->height_mbs,
++				     areas);
++	if (count < 0)
++		count = 0;
++
++	for (i = 0; i < CEDRUS_ENC_ROI_AREAS; i++) {
++		delta_qp = 0;
++		if (i < count)
++			delta_qp = clamp_t(int, qp + areas[i].delta_qp, 0, 51) - qp;
++
++		offsets |= VE_ENC_AVC_ROI_QP_OFFSET_N(i, delta_qp);
++		cedrus_write(dev, VE_ENC_AVC_ROI_AREA(i),
++			     VE_ENC_AVC_ROI_AREA_LEFT_MB(areas[i].left) |
++			     VE_ENC_AVC_ROI_AREA_RIGHT_MB(areas[i].right) |
++			     VE_ENC_AVC_ROI_AREA_TOP_MB(areas[i].top) |
++			     VE_ENC_AVC_ROI_AREA_BOTTOM_MB(areas[i].bottom));
++	}
++
++	cedrus_write(dev, VE_ENC_AVC_ROI_QP_OFFSET, offsets);
++
++	return count;
++}
++
+ static int cedrus_enc_h264_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ {
+ 	struct cedrus_dev *dev = ctx->dev;
+@@ -561,7 +650,7 @@ static int cedrus_enc_h264_setup(struct
+ 	unsigned int stride_mbs = ctx->src_fmt.bytesperline / 16;
+ 	unsigned int coded_size = vb2_plane_size(dst_buf, 0);
+ 	dma_addr_t coded_dma = vb2_dma_contig_plane_dma_addr(dst_buf, 0);
+-	u32 value;
++	u32 value, me_para;
+ 	int ret;
+ 
+ 	cedrus_enc_h264_engine_enable(ctx);
+@@ -702,7 +791,8 @@ static int cedrus_enc_h264_setup(struct
+ 		     cedrus_enc_addr(ctx, aux->dma + aux->line_offset));
+ 	cedrus_write(dev, VE_ENC_AVC_TFCNT_ADDR,
+ 		     cedrus_enc_addr(ctx, aux->dma + aux->tfcnt_offset));
+-	cedrus_write(dev, VE_ENC_AVC_CYCLIC_INTRA_REFRESH, 0);
++	cedrus_write(dev, VE_ENC_AVC_CYCLIC_INTRA_REFRESH,
++		     cedrus_enc_h264_intra_refresh(ctx, encode));
+ 
+ 	cedrus_enc_h264_record_layout(ctx, run, rec, ref_rec);
+ 
+@@ -712,9 +802,13 @@ static int cedrus_enc_h264_setup(struct
+ 		VE_ENC_AVC_PARA1_FIXED_QP(enc->rc.qp) |
+ 		VE_ENC_AVC_PARA1_STRIDE_MBS_DIV_48(DIV_ROUND_UP(stride_mbs, 48));
+ 
++	me_para = cedrus_enc_h264_setup_roi(ctx, enc->rc.qp) ?
++		  VE_ENC_AVC_ME_PARA_ROI_EN : 0;
++
+ 	if (dev->enc_flags & CEDRUS_ENC_FLAG_H6_PARAMS) {
+-		value |= VE_ENC_AVC_PARA1_DYNAMIC_ME_EN |
+-			 VE_ENC_AVC_PARA1_H6_UNKNOWN27;
++		value |= VE_ENC_AVC_PARA1_DYNAMIC_ME_EN;
++		if (!(pps->flags & V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE))
++			value |= VE_ENC_AVC_PARA1_TRANSFORM_8X8_DIS;
+ 
+ 		/* The vendor library's thresholds, from the stride. */
+ 		cedrus_write(dev, VE_ENC_AVC_DYNAMIC_ME_PAR0,
+@@ -724,7 +818,7 @@ static int cedrus_enc_h264_setup(struct
+ 			     VE_ENC_AVC_DYNAMIC_ME_PAR1_TH3(32 * stride_mbs / 10) |
+ 			     VE_ENC_AVC_DYNAMIC_ME_PAR1_TH2(26 * stride_mbs / 10));
+ 
+-		cedrus_write(dev, VE_ENC_AVC_ME_PARA,
++		cedrus_write(dev, VE_ENC_AVC_ME_PARA, me_para |
+ 			     VE_ENC_AVC_ME_PARA_WB_MV_INFO_DIS |
+ 			     VE_ENC_AVC_ME_PARA_QUANT_THRESHOLD_DIS);
+ 	} else {
+@@ -733,7 +827,7 @@ static int cedrus_enc_h264_setup(struct
+ 		cedrus_write(dev, VE_ENC_AVC_DYNAMIC_ME_PAR0, 0);
+ 		cedrus_write(dev, VE_ENC_AVC_DYNAMIC_ME_PAR1, 0);
+ 
+-		cedrus_write(dev, VE_ENC_AVC_ME_PARA,
++		cedrus_write(dev, VE_ENC_AVC_ME_PARA, me_para |
+ 			     VE_ENC_AVC_ME_PARA_WB_MV_INFO_DIS |
+ 			     VE_ENC_AVC_ME_PARA_FME_SEARCH_LEVEL(2));
+ 	}

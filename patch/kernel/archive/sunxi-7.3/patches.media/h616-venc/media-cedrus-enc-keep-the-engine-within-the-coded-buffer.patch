@@ -1,0 +1,83 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 17:24:08 +0000
+Subject: media: cedrus: enc: keep the engine within the coded buffer
+
+The stream end register keeps its two low bits set, so with an end
+aligned to 256 bytes the engine could write 768 bytes past the buffer.
+Give it whole KiB.
+
+The stream size register takes at most 0x0fff0000 bits (vendor
+library); coded buffers above 32 MiB overflowed it. Clamp it, as the
+JPEG encoder does.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc.h b/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.h
+@@ -49,12 +49,18 @@ struct file;
+  */
+ #define CEDRUS_ENC_FLAG_H6_PARAMS		BIT(2)
+ 
+-/* The encoder coded buffer address registers have 256 byte granularity. */
+-#define CEDRUS_ENC_CODED_ALIGN			256
++/*
++ * The stream start and end registers count in units of 256 bytes and keep
++ * their two low bits at 0 and 1: the engine writes from a 1 KiB boundary
++ * up to the end of a 1 KiB block, so a coded buffer starts 1 KiB aligned
++ * and the engine gets whole KiB of it.
++ */
++#define CEDRUS_ENC_CODED_ALIGN			SZ_1K
+ /* The stream size register counts in units of 65536 bits (0x12011). */
+ #define CEDRUS_ENC_CODED_MIN_SIZE		SZ_64K
+-/* Keeps the stream size in bits (VE_ENC_AVC_STM_BIT_MAX) within 32 bits. */
+ #define CEDRUS_ENC_CODED_MAX_SIZE		SZ_64M
++/* The largest value of the stream size register, in bits (vendor library). */
++#define CEDRUS_ENC_STM_BIT_MAX			0x0fff0000
+ 
+ /* P pictures narrower than 13 macroblocks never finish on the H616. */
+ #define CEDRUS_ENC_INTER_MIN_WIDTH_MBS		13
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -578,11 +578,15 @@ static int cedrus_enc_h264_setup(struct
+ 	cedrus_write(dev, VE_ENC_AVC_STM_BIT_OFFSET, 0);
+ 
+ 	coded_size = ALIGN_DOWN(coded_size, CEDRUS_ENC_CODED_ALIGN);
++	if (!IS_ALIGNED(coded_dma, CEDRUS_ENC_CODED_ALIGN) || !coded_size)
++		return -EINVAL;
++
+ 	cedrus_write(dev, VE_ENC_AVC_STM_START_ADDR,
+ 		     cedrus_enc_addr(ctx, coded_dma));
+ 	cedrus_write(dev, VE_ENC_AVC_STM_END_ADDR,
+ 		     cedrus_enc_addr(ctx, coded_dma + coded_size - 1));
+-	cedrus_write(dev, VE_ENC_AVC_STM_BIT_MAX, coded_size * 8);
++	cedrus_write(dev, VE_ENC_AVC_STM_BIT_MAX,
++		     min_t(u64, (u64)coded_size * 8, CEDRUS_ENC_STM_BIT_MAX));
+ 
+ 	cedrus_write(dev, VE_ENC_AVC_STM_BIT_LEN, 0);
+ 	cedrus_write(dev, VE_ENC_AVC_HEADER_BITS, 0);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
+@@ -141,9 +141,6 @@ static void cedrus_enc_jpeg_scale_tables
+  */
+ #define CEDRUS_ENC_JPEG_SCAN_ALIGN	SZ_1K
+ 
+-/* The largest value of the stream size register, in bits. */
+-#define CEDRUS_ENC_JPEG_BIT_MAX		0x0fff0000
+-
+ /*
+  * SOI, JFIF APP0, DQT, SOF0 (three components, 4:2:0), DHT (the Annex K
+  * tables), a comment segment that pads the headers to a multiple of
+@@ -730,7 +727,7 @@ static int cedrus_enc_jpeg_setup(struct
+ 	cedrus_write(dev, VE_ENC_AVC_STM_END_ADDR,
+ 		     cedrus_enc_addr(ctx, scan_dma + scan_size - 1));
+ 	cedrus_write(dev, VE_ENC_AVC_STM_BIT_MAX,
+-		     min_t(u64, (u64)scan_size * 8, CEDRUS_ENC_JPEG_BIT_MAX));
++		     min_t(u64, (u64)scan_size * 8, CEDRUS_ENC_STM_BIT_MAX));
+ 	cedrus_write(dev, VE_ENC_AVC_STM_BIT_LEN, 0);
+ 	cedrus_write(dev, VE_ENC_AVC_HEADER_BITS, 0);
+ 	cedrus_write(dev, VE_ENC_AVC_RESIDUAL_BITS, 0);

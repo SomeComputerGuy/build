@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Deepa Guthyappa Madivalara <deepa.madivalara@oss.qualcomm.com>
+Date: Fri, 16 Oct 2026 16:00:33 -0700
+Subject: [PATCH] media: uapi: Introduce new control for video encoder ROI
+
+Add array control, V4L2_CID_MPEG_VIDEO_ROI_MB_DELTA_QP for
+video encoder Region of Interest to allow applications to specify
+different quality levels for specific regions in video frames. Define
+V4L2_CID_MPEG_VIDEO_ROI_MB_SIZE to retrieve supported MB size based on
+codec from the hardware encoder and set the corresponding ROI MB delta_qp
+map that adjusts quantization relative to the frame QP's base value.
+
+This enables use cases like prioritizing quality for faces in video
+conferencing or important objects in surveillance footage while reducing
+bitrate for less critical areas.
+
+Link: https://lore.kernel.org/r/20261016-enc_roi_enable-v10-2-bc5bd37b6f3e@oss.qualcomm.com
+Reviewed-by: Hans Verkuil <hverkuil+cisco@kernel.org>
+Signed-off-by: Deepa Guthyappa Madivalara <deepa.madivalara@oss.qualcomm.com>
+---
+diff --git a/Documentation/userspace-api/media/v4l/ext-ctrls-codec.rst b/Documentation/userspace-api/media/v4l/ext-ctrls-codec.rst
+--- a/Documentation/userspace-api/media/v4l/ext-ctrls-codec.rst
++++ b/Documentation/userspace-api/media/v4l/ext-ctrls-codec.rst
+@@ -1674,6 +1674,33 @@ enum v4l2_mpeg_video_h264_hierarchical_c
+     Codecs need to always use the specified range, rather then a HW custom range.
+     Applicable to encoders
+ 
++``V4L2_CID_MPEG_VIDEO_ROI_MB_DELTA_QP (__s8 array)``
++    This control is a dynamically sized 1-dimensional array,
++    V4L2_CTRL_FLAG_DYNAMIC_ARRAY flag must be set when using it.
++    This array control is used to set ROI MB map delta_Qp for the whole frame.
++    The frame is divided into a grid of MB Size by MB Size pixels (MB Size is
++    obtained from querying ``V4L2_CID_MPEG_VIDEO_ROI_MB_SIZE``). Each block
++    is configured with delta_Qp in raster order. The valid range for delta_Qp
++    is encoder dependent. Driver can ignore the control if it is not set
++    along with the current frame.
++    Applicable to encoders.
++
++``V4L2_CID_MPEG_VIDEO_ROI_MB_SIZE`` (integer)
++    A read-only control that reports the MB Size used for the ROI delta_QP map.
++    The supported MB Size depends on the encoder codec.
++    Only square MBs are supported. The value returned represents the
++    width and height of each block in pixels. The ROI delta_QP map provided
++    through the ROI control must use the MB Size reported by this control.
++    The number of entries in the ROI delta_QP array is determined by the
++    frame resolution and the reported MB Size. If frame_width or frame_height
++    is not MB Size aligned, they must be ceiled using ceil(frame_width/MB Size)
++    ceil(frame_height/MB Size) for calculating the array size.
++    For example, for a QCIF frame if reported MB Size is 16,
++    the delta_QP array must contain 99 entries, ceil(176/16) * ceil(144/16) = 99.
++    For frame resolutions that are not aligned to the MB size, for example
++    1920x1080, if the reported MB size is 32, the delta_qp array
++    must contain ceil(1920/32) * ceil(1080/32) = 2040 entries.
++
+ .. raw:: latex
+ 
+     \normalsize
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls-core.c b/drivers/media/v4l2-core/v4l2-ctrls-core.c
+--- a/drivers/media/v4l2-core/v4l2-ctrls-core.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls-core.c
+@@ -2273,6 +2273,9 @@ static int std_validate_compound(const s
+ 			return -EINVAL;
+ 		break;
+ 
++	case V4L2_CID_MPEG_VIDEO_ROI_MB_DELTA_QP:
++		break;
++
+ 	default:
+ 		return -EINVAL;
+ 	}
+diff --git a/drivers/media/v4l2-core/v4l2-ctrls-defs.c b/drivers/media/v4l2-core/v4l2-ctrls-defs.c
+--- a/drivers/media/v4l2-core/v4l2-ctrls-defs.c
++++ b/drivers/media/v4l2-core/v4l2-ctrls-defs.c
+@@ -995,6 +995,8 @@ const char *v4l2_ctrl_get_name(u32 id)
+ 	case V4L2_CID_MPEG_VIDEO_AVERAGE_QP:			return "Average QP Value";
+ 	case V4L2_CID_FWHT_I_FRAME_QP:				return "FWHT I-Frame QP Value";
+ 	case V4L2_CID_FWHT_P_FRAME_QP:				return "FWHT P-Frame QP Value";
++	case V4L2_CID_MPEG_VIDEO_ROI_MB_DELTA_QP:		return "Encoder ROI MB Delta QP";
++	case V4L2_CID_MPEG_VIDEO_ROI_MB_SIZE:			return "Encoder ROI MB Size";
+ 
+ 	/* VPX controls */
+ 	case V4L2_CID_MPEG_VIDEO_VPX_NUM_PARTITIONS:		return "VPX Number of Partitions";
+@@ -1730,6 +1732,14 @@ void v4l2_ctrl_fill(u32 id, const char *
+ 	case V4L2_CID_COLORIMETRY_HDR10_MASTERING_DISPLAY:
+ 		*type = V4L2_CTRL_TYPE_HDR10_MASTERING_DISPLAY;
+ 		break;
++	case V4L2_CID_MPEG_VIDEO_ROI_MB_DELTA_QP:
++		*type = V4L2_CTRL_TYPE_S8;
++		*flags |= V4L2_CTRL_FLAG_DYNAMIC_ARRAY;
++		break;
++	case V4L2_CID_MPEG_VIDEO_ROI_MB_SIZE:
++		*type = V4L2_CTRL_TYPE_U8;
++		*flags |= V4L2_CTRL_FLAG_READ_ONLY;
++		break;
+ 	default:
+ 		*type = V4L2_CTRL_TYPE_INTEGER;
+ 		break;
+diff --git a/include/uapi/linux/v4l2-controls.h b/include/uapi/linux/v4l2-controls.h
+--- a/include/uapi/linux/v4l2-controls.h
++++ b/include/uapi/linux/v4l2-controls.h
+@@ -927,6 +927,8 @@ enum v4l2_mpeg_video_av1_level {
+ };
+ 
+ #define V4L2_CID_MPEG_VIDEO_AVERAGE_QP  (V4L2_CID_CODEC_BASE + 657)
++#define V4L2_CID_MPEG_VIDEO_ROI_MB_DELTA_QP  (V4L2_CID_CODEC_BASE + 658)
++#define V4L2_CID_MPEG_VIDEO_ROI_MB_SIZE  (V4L2_CID_CODEC_BASE + 659)
+ 
+ #define V4L2_CID_MPEG_VIDEO_VC1_PROFILE	(V4L2_CID_CODEC_BASE + 660)
+ enum v4l2_mpeg_video_vc1_profile {
