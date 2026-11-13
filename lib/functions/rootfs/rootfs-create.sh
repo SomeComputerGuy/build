@@ -26,15 +26,18 @@ function create_new_rootfs_cache_tarball() {
 	tar cp --xattrs --directory="$SDCARD"/ --exclude='./dev/*' --exclude='./proc/*' --exclude='./run/*' \
 		--exclude='./tmp/*' --exclude='./sys/*' --exclude='./home/*' --exclude='./root/*' . |
 		pv -p -b -r -s "$(du -sb "$SDCARD"/ | cut -f1)" -N "$(logging_echo_prefix_for_pv "store_rootfs") $cache_name" |
-		zstdmt "-${compression_ratio_rootfs}" -c > "${cache_fname}"
+		zstdmt "-${compression_ratio_rootfs}" -c > "${cache_fname}.partial"
 
 	declare -a pv_tar_zstdmt_pipe_status=("${PIPESTATUS[@]}") # capture and the pipe_status array from PIPESTATUS
 	declare one_pipe_status
 	for one_pipe_status in "${pv_tar_zstdmt_pipe_status[@]}"; do
 		if [[ "$one_pipe_status" != "0" ]]; then
+			rm -f "${cache_fname}.partial"
 			exit_with_error "create_new_rootfs_cache_tarball: compress: ${cache_fname} failed (${pv_tar_zstdmt_pipe_status[*]}) - out of disk space?"
 		fi
 	done
+	# Only a complete tarball gets the cache name: an interrupted one must never be reused.
+	mv "${cache_fname}.partial" "${cache_fname}"
 
 	wait_for_disk_sync "after zstd tarball rootfs"
 
@@ -248,8 +251,13 @@ function create_new_rootfs_cache_via_debootstrap() {
 		# /var/cache/apt and /var/lib/apt/lists, as chroot_sdcard_apt_get does, so the desktop's .debs and
 		# lists land in the shared cache instead of the rootfs (which made apt_purge_unneeded_packages_and_clean_apt_caches
 		# warn "SDCARD /var/cache/apt is not empty" on every desktop rootfs build).
+		# stdin from /dev/null: on a failure armbian-config's DIALOG=read message box would otherwise wait for Enter
+		# on the build terminal. The status query fails the build if the desktop did not install.
+		declare -g if_error_detail_message="armbian-config could not install the ${DESKTOP_ENVIRONMENT} desktop"
 		chroot_sdcard_custom_with_apt_logic env "SUDO_USER=" "DIALOG=read" armbian-config --api module_desktops install \
-			"de=${DESKTOP_ENVIRONMENT}" "tier=${DESKTOP_TIER:-mid}" mode=build
+			"de=${DESKTOP_ENVIRONMENT}" "tier=${DESKTOP_TIER:-mid}" mode=build < /dev/null
+		declare -g if_error_detail_message="armbian-config reports the ${DESKTOP_ENVIRONMENT} desktop as not installed"
+		chroot_sdcard env "SUDO_USER=" "DIALOG=read" armbian-config --api module_desktops status "de=${DESKTOP_ENVIRONMENT}" < /dev/null
 	fi
 
 	# stage: check md5 sum of installed packages. Just in case. @TODO: rpardini: this should also be done when a cache is used, not only when it is created

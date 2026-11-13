@@ -26,7 +26,7 @@ function traps_init() {
 # that will receive the actual handlers.
 # First param is the type of trap, the second is the value of "$?"
 # In order of occurrence.
-# 1) Ctrl-C causes INT [stack unreliable], then ERR, then EXIT with trap_exit_code > 0
+# 1) Ctrl-C causes INT [stack unreliable], which exits: EXIT with trap_exit_code 130 (TERM: 143)
 # 2) Stuff failing causes ERR [stack OK], then EXIT with trap_exit_code > 0
 # 3) exit_with_error causes EXIT [stack OK, with extra frame] directly with trap_exit_code == 43
 # 4) EXIT can also be called directly [stack unreliable], with trap_exit_code == 0 if build successful.
@@ -47,7 +47,10 @@ function main_trap_handler() {
 		TERM | INT)
 			display_alert "Build interrupted" "Build interrupted by SIG${trap_type}" "warn"
 			trap_manager_error_handled=1
-			return # Nothing else to do here. Let the ERR trap show the stack, and the EXIT trap do cleanups.
+			# Stop here: the interrupted child may have exited 0 (armbian-config traps INT with a bare "exit"), and
+			# returning would let the build go on and save a broken rootfs cache. The EXIT trap does the cleanups.
+			[[ "${trap_type}" == "INT" ]] && exit 130
+			exit 143
 			;;
 
 		ERR)
