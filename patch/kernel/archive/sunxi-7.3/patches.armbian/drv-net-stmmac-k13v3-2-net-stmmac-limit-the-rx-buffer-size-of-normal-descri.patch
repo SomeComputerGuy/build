@@ -4,7 +4,7 @@ Date: Thu, 12 Nov 2026 17:18:02 +0000
 Subject: [PATCH 2/6] net: stmmac: Limit the RX buffer size of normal
  descriptors to 2032
 
-From an MTU of 1511, stmmac_set_bfsize() picks RX buffers of 2048 bytes
+Above an MTU of 1510, stmmac_set_bfsize() picks RX buffers of 2048 bytes
 (4096 from MTU 2023), which the 11-bit buffer size of normal descriptors
 cannot describe: ndesc_init_rx_desc() writes 2047 instead, while
 stmmac_rx() still counts the full size for every buffer of a frame but
