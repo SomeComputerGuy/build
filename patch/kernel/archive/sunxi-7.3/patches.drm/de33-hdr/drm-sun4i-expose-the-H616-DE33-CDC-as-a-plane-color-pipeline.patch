@@ -1,0 +1,715 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 18:40:24 +0000
+Subject: [PATCH] drm/sun4i: Expose the H616 DE33 CDC as a plane color pipeline
+
+The DE33 VI channels 0 and 1 have a colour conversion unit (CDC) that
+the vendor BSP uses for HDR <-> SDR and gamut conversion: an input CSC,
+a 17x17x17 3D LUT and an output CSC on channel 0, the 3D LUT alone on
+channel 1.
+
+Expose it as the plane color pipeline 3x4 matrix, 3D LUT, 3x4 matrix
+(3D LUT only on channel 1). YCbCr planes are converted to R'G'B' by the
+input CSC with the plane's encoding and range and back by the output
+CSC, so the channel CSC is unchanged. Channel 1 has no CSC and rejects
+an active LUT on YCbCr planes. Unchanged register words are not
+rewritten, so a page flip does not reload the 4913 LUT entries.
+
+The register layout and the LUT bank order follow the vendor BSP
+(de_cdc.c, de_cdc_table.c); the user manual does not document the DE.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/sun4i/Makefile         |   1 +
+ drivers/gpu/drm/sun4i/sun50i_cdc.c     | 481 +++++++++++++++++++++++++
+ drivers/gpu/drm/sun4i/sun50i_cdc.h     |  19 +
+ drivers/gpu/drm/sun4i/sun50i_planes.c  |   2 +
+ drivers/gpu/drm/sun4i/sun8i_csc.c      |  17 +
+ drivers/gpu/drm/sun4i/sun8i_csc.h      |   2 +
+ drivers/gpu/drm/sun4i/sun8i_mixer.h    |   6 +
+ drivers/gpu/drm/sun4i/sun8i_vi_layer.c |  23 +-
+ 8 files changed, 547 insertions(+), 4 deletions(-)
+ create mode 100644 drivers/gpu/drm/sun4i/sun50i_cdc.c
+ create mode 100644 drivers/gpu/drm/sun4i/sun50i_cdc.h
+
+diff --git a/drivers/gpu/drm/sun4i/Makefile b/drivers/gpu/drm/sun4i/Makefile
+index 01422c2e3..80fe29480 100644
+--- a/drivers/gpu/drm/sun4i/Makefile
++++ b/drivers/gpu/drm/sun4i/Makefile
+@@ -18,6 +18,7 @@ sun8i-drm-hdmi-y		+= sun8i_hdmi_phy.o
+ sun8i-drm-hdmi-y		+= sun8i_hdmi_phy_clk.o
+ 
+ sun8i-mixer-y			+= sun50i_afbc.o
++sun8i-mixer-y			+= sun50i_cdc.o
+ sun8i-mixer-y			+= sun50i_shadow.o
+ sun8i-mixer-y			+= sun50i_wb.o
+ sun8i-mixer-y			+= sun50i_fmt.o
+diff --git a/drivers/gpu/drm/sun4i/sun50i_cdc.c b/drivers/gpu/drm/sun4i/sun50i_cdc.c
+new file mode 100644
+index 000000000..b52499173
+--- /dev/null
++++ b/drivers/gpu/drm/sun4i/sun50i_cdc.c
+@@ -0,0 +1,481 @@
++// SPDX-License-Identifier: GPL-2.0-or-later
++/*
++ * H616 DE33 CDC: the colour conversion unit of VI channels 0 and 1, used by
++ * the vendor BSP for HDR <-> SDR and gamut conversion. It is an input CSC, a
++ * 17x17x17 3D LUT and an output CSC (channel 0), or the 3D LUT alone
++ * (channel 1). It sits before the channel CSC and is exposed as a DRM plane
++ * color pipeline: 3x4 matrix, 3D LUT, 3x4 matrix.
++ *
++ * Register layout from the vendor BSP (disp2 de_cdc.c); the UM does not
++ * document the DE.
++ */
++
++#include <linux/math64.h>
++#include <linux/regmap.h>
++#include <linux/slab.h>
++
++#include <drm/drm_atomic.h>
++#include <drm/drm_color_mgmt.h>
++#include <drm/drm_colorop.h>
++#include <drm/drm_framebuffer.h>
++#include <drm/drm_print.h>
++
++#include "sun50i_cdc.h"
++#include "sun8i_csc.h"
++#include "sun8i_mixer.h"
++
++#define SUN50I_CDC_BASE(ch)		((ch) * DE33_CH_SIZE + 0x8000)
++#define SUN50I_CDC_CTL			0x00
++#define SUN50I_CDC_CTL_EN		BIT(0)
++/*
++ * CSC: out = C * (in - D) + K, C in Q2.17, D and K in 10-bit code values.
++ * D is a magnitude that is subtracted, as in the DE33 channel CSC.
++ */
++#define SUN50I_CDC_IN_D(i)		(0x14 + 4 * (i))
++#define SUN50I_CDC_IN_C(r, c)		(0x20 + 0x10 * (r) + 4 * (c))
++#define SUN50I_CDC_OUT_D(i)		(0x54 + 4 * (i))
++#define SUN50I_CDC_OUT_C(r, c)		(0x60 + 0x10 * (r) + 4 * (c))
++#define SUN50I_CDC_REG_WORDS		(0x90 / 4)
++
++/*
++ * 3D LUT: 17 nodes per axis at input codes 0, 64, ..., 1024, entries
++ * R << 20 | G << 10 | B. The nodes are split in eight banks by the parity
++ * of their R (bit 0), G (bit 1) and B (bit 2) index, R fastest in a bank.
++ */
++#define SUN50I_CDC_LUT_DIM		17
++#define SUN50I_CDC_LUT_SIZE		(17 * 17 * 17)
++
++static const u16 sun50i_cdc_lut_bank[8] = {
++	0x1000, 0x1c00, 0x2800, 0x3400, 0x4000, 0x4c00, 0x5800, 0x6400,
++};
++
++#define SUN50I_CDC_FRAC			17
++#define SUN50I_CDC_COEF_MAX		(BIT(19) - 1)
++#define SUN50I_CDC_COEF_MIN		(-(s64)BIT(19))
++#define SUN50I_CDC_CONST_MAX		1023
++
++struct sun50i_cdc {
++	struct drm_colorop	*in_ctm;	/* NULL without CSC */
++	struct drm_colorop	*lut;
++	struct drm_colorop	*out_ctm;	/* NULL without CSC */
++	bool			off;		/* CTL written as 0 */
++	bool			valid;		/* caches match the hardware */
++	u32			regs[SUN50I_CDC_REG_WORDS];
++	u32			lut_hw[SUN50I_CDC_LUT_SIZE];
++};
++
++/* m and k in Q17 (k in 10-bit code values), d subtracted first */
++struct sun50i_cdc_csc {
++	s64	m[3][3];
++	s64	k[3];
++	u32	d[3];
++};
++
++struct sun50i_cdc_cfg {
++	bool			enable;
++	bool			yuv;
++	struct sun50i_cdc_csc	in, out;
++	const struct drm_color_lut32 *lut;	/* NULL: identity */
++};
++
++static const struct drm_colorop_funcs sun50i_cdc_colorop_funcs = {
++	.destroy = drm_colorop_destroy,
++};
++
++static struct drm_colorop_state *
++sun50i_cdc_op_state(struct drm_atomic_commit *state, struct drm_colorop *op)
++{
++	struct drm_colorop_state *s = NULL;
++
++	if (!op)
++		return NULL;
++	if (state)
++		s = drm_atomic_get_new_colorop_state(state, op);
++
++	return s ?: op->state;
++}
++
++static bool sun50i_cdc_op_active(struct drm_colorop_state *s)
++{
++	return s && !s->bypass;
++}
++
++static void sun50i_cdc_csc_identity(struct sun50i_cdc_csc *csc)
++{
++	int i;
++
++	memset(csc, 0, sizeof(*csc));
++	for (i = 0; i < 3; i++)
++		csc->m[i][i] = BIT(SUN50I_CDC_FRAC);
++}
++
++static s64 sun50i_cdc_q17(u64 s31_32)
++{
++	return (s64)drm_color_ctm_s31_32_to_qm_n(s31_32, 15, SUN50I_CDC_FRAC);
++}
++
++static s64 sun50i_cdc_round(s64 q34)
++{
++	return (q34 + BIT_ULL(SUN50I_CDC_FRAC - 1)) >> SUN50I_CDC_FRAC;
++}
++
++/* a = b * a (3x3 part only) */
++static void sun50i_cdc_mul(const s64 b[3][3], s64 a[3][3])
++{
++	s64 t[3][3];
++	int r, c;
++
++	for (r = 0; r < 3; r++)
++		for (c = 0; c < 3; c++)
++			t[r][c] = sun50i_cdc_round(b[r][0] * a[0][c] +
++						   b[r][1] * a[1][c] +
++						   b[r][2] * a[2][c]);
++	memcpy(a, t, sizeof(t));
++}
++
++/* v = m * v */
++static void sun50i_cdc_mul_vec(const s64 m[3][3], s64 v[3])
++{
++	s64 t[3];
++	int r;
++
++	for (r = 0; r < 3; r++)
++		t[r] = sun50i_cdc_round(m[r][0] * v[0] + m[r][1] * v[1] +
++					m[r][2] * v[2]);
++	memcpy(v, t, sizeof(t));
++}
++
++static int sun50i_cdc_invert(const s64 m[3][3], s64 inv[3][3])
++{
++	s64 adj[3][3], det;
++	int r, c;
++
++	for (r = 0; r < 3; r++)
++		for (c = 0; c < 3; c++) {
++			int r1 = (c + 1) % 3, r2 = (c + 2) % 3;
++			int c1 = (r + 1) % 3, c2 = (r + 2) % 3;
++
++			adj[r][c] = m[r1][c1] * m[r2][c2] - m[r1][c2] * m[r2][c1];
++		}
++	det = sun50i_cdc_round(m[0][0] * adj[0][0] + m[0][1] * adj[1][0] +
++			       m[0][2] * adj[2][0]);
++	if (!det)
++		return -EINVAL;
++
++	for (r = 0; r < 3; r++)
++		for (c = 0; c < 3; c++)
++			inv[r][c] = div64_s64(adj[r][c] * BIT(SUN50I_CDC_FRAC), det);
++
++	return 0;
++}
++
++static void sun50i_cdc_from_ctm(struct sun50i_cdc_csc *csc,
++				const struct drm_property_blob *blob)
++{
++	const struct drm_color_ctm_3x4 *ctm;
++	int r, c;
++
++	sun50i_cdc_csc_identity(csc);
++	if (!blob)
++		return;
++
++	ctm = blob->data;
++	for (r = 0; r < 3; r++) {
++		for (c = 0; c < 3; c++)
++			csc->m[r][c] = sun50i_cdc_q17(ctm->matrix[r * 4 + c]);
++		csc->k[r] = sun50i_cdc_q17(ctm->matrix[r * 4 + 3]) * 1023;
++	}
++}
++
++static int sun50i_cdc_csc_valid(const struct sun50i_cdc_csc *csc)
++{
++	int r, c;
++
++	for (r = 0; r < 3; r++) {
++		s64 k = sun50i_cdc_round(csc->k[r]);
++
++		if (k < -SUN50I_CDC_CONST_MAX || k > SUN50I_CDC_CONST_MAX)
++			return -ERANGE;
++		for (c = 0; c < 3; c++)
++			if (csc->m[r][c] < SUN50I_CDC_COEF_MIN ||
++			    csc->m[r][c] > SUN50I_CDC_COEF_MAX)
++				return -ERANGE;
++	}
++
++	return 0;
++}
++
++static int sun50i_cdc_get_cfg(struct sun8i_layer *layer,
++			      struct drm_atomic_commit *state,
++			      struct drm_plane_state *plane_state,
++			      struct sun50i_cdc_cfg *cfg)
++{
++	struct sun50i_cdc *cdc = layer->cdc;
++	struct drm_colorop_state *in, *lut, *out;
++	struct sun50i_cdc_csc yuv = {};
++	s64 inv[3][3];
++	int i, ret;
++
++	memset(cfg, 0, sizeof(*cfg));
++	if (!plane_state->color_pipeline || !plane_state->fb)
++		return 0;
++
++	in = sun50i_cdc_op_state(state, cdc->in_ctm);
++	lut = sun50i_cdc_op_state(state, cdc->lut);
++	out = sun50i_cdc_op_state(state, cdc->out_ctm);
++	cfg->enable = sun50i_cdc_op_active(in) || sun50i_cdc_op_active(lut) ||
++		      sun50i_cdc_op_active(out);
++	if (!cfg->enable)
++		return 0;
++
++	if (sun50i_cdc_op_active(lut) && lut->data)
++		cfg->lut = lut->data->data;
++
++	cfg->yuv = plane_state->fb->format->is_yuv;
++	if (!cdc->in_ctm)
++		/* without a CSC the LUT would see YCbCr */
++		return cfg->yuv ? -EINVAL : 0;
++
++	sun50i_cdc_csc_identity(&cfg->in);
++	sun50i_cdc_csc_identity(&cfg->out);
++
++	/*
++	 * The colour pipeline works on R'G'B'. For YCbCr the input CSC first
++	 * converts with the plane's encoding and range, and the output CSC
++	 * converts back, so the channel CSC sees the plane's format.
++	 */
++	if (cfg->yuv) {
++		sun8i_de33_csc_yuv2rgb(plane_state->color_encoding,
++				       plane_state->color_range, yuv.m, yuv.d);
++		memcpy(cfg->in.m, yuv.m, sizeof(yuv.m));
++		memcpy(cfg->in.d, yuv.d, sizeof(yuv.d));
++	}
++
++	if (sun50i_cdc_op_active(in)) {
++		struct sun50i_cdc_csc a;
++
++		sun50i_cdc_from_ctm(&a, in->data);
++		sun50i_cdc_mul(a.m, cfg->in.m);
++		memcpy(cfg->in.k, a.k, sizeof(a.k));
++	}
++
++	if (sun50i_cdc_op_active(out))
++		sun50i_cdc_from_ctm(&cfg->out, out->data);
++
++	if (cfg->yuv) {
++		ret = sun50i_cdc_invert(yuv.m, inv);
++		if (ret)
++			return ret;
++		sun50i_cdc_mul(inv, cfg->out.m);
++		sun50i_cdc_mul_vec(inv, cfg->out.k);
++		for (i = 0; i < 3; i++)
++			cfg->out.k[i] += (s64)yuv.d[i] << SUN50I_CDC_FRAC;
++	}
++
++	ret = sun50i_cdc_csc_valid(&cfg->in);
++	if (!ret)
++		ret = sun50i_cdc_csc_valid(&cfg->out);
++
++	return ret;
++}
++
++int sun50i_cdc_atomic_check(struct sun8i_layer *layer,
++			    struct drm_atomic_commit *state,
++			    struct drm_plane_state *plane_state)
++{
++	struct sun50i_cdc_cfg cfg;
++	int ret;
++
++	if (!layer->cdc)
++		return 0;
++
++	ret = sun50i_cdc_get_cfg(layer, state, plane_state, &cfg);
++	if (ret)
++		drm_dbg_atomic(plane_state->plane->dev,
++			       "[PLANE:%d] colour pipeline not possible: %d\n",
++			       plane_state->plane->base.id, ret);
++
++	return ret ? -EINVAL : 0;
++}
++
++static void sun50i_cdc_write(struct sun8i_layer *layer, u32 reg, u32 val)
++{
++	struct sun50i_cdc *cdc = layer->cdc;
++
++	if (cdc->valid && cdc->regs[reg / 4] == val)
++		return;
++
++	regmap_write(layer->regs, SUN50I_CDC_BASE(layer->channel) + reg, val);
++	cdc->regs[reg / 4] = val;
++}
++
++static void sun50i_cdc_write_csc(struct sun8i_layer *layer,
++				 const struct sun50i_cdc_csc *csc, bool in)
++{
++	int r, c;
++
++	for (r = 0; r < 3; r++) {
++		sun50i_cdc_write(layer, in ? SUN50I_CDC_IN_D(r) : SUN50I_CDC_OUT_D(r),
++				 csc->d[r]);
++		for (c = 0; c < 3; c++)
++			sun50i_cdc_write(layer, in ? SUN50I_CDC_IN_C(r, c) :
++					 SUN50I_CDC_OUT_C(r, c), (u32)csc->m[r][c]);
++		sun50i_cdc_write(layer, in ? SUN50I_CDC_IN_C(r, 3) :
++				 SUN50I_CDC_OUT_C(r, 3),
++				 (u32)sun50i_cdc_round(csc->k[r]));
++	}
++}
++
++static u32 sun50i_cdc_lut10(u32 v)
++{
++	return ((u64)v * 1023 + BIT_ULL(31)) >> 32;
++}
++
++static void sun50i_cdc_write_lut(struct sun8i_layer *layer,
++				 const struct drm_color_lut32 *lut)
++{
++	struct sun50i_cdc *cdc = layer->cdc;
++	u32 base = SUN50I_CDC_BASE(layer->channel);
++	unsigned int r, g, b, i = 0;
++
++	for (b = 0; b < SUN50I_CDC_LUT_DIM; b++)
++		for (g = 0; g < SUN50I_CDC_LUT_DIM; g++)
++			for (r = 0; r < SUN50I_CDC_LUT_DIM; r++, i++) {
++				unsigned int bank = (r & 1) | (g & 1) << 1 | (b & 1) << 2;
++				unsigned int nr = 9 - (r & 1), ng = 9 - (g & 1);
++				unsigned int pos = (r >> 1) + nr * ((g >> 1) + ng * (b >> 1));
++				u32 val;
++
++				if (lut)
++					val = sun50i_cdc_lut10(lut[i].red) << 20 |
++					      sun50i_cdc_lut10(lut[i].green) << 10 |
++					      sun50i_cdc_lut10(lut[i].blue);
++				else
++					val = min(r * 64, 1023U) << 20 |
++					      min(g * 64, 1023U) << 10 |
++					      min(b * 64, 1023U);
++
++				if (cdc->valid && cdc->lut_hw[i] == val)
++					continue;
++				regmap_write(layer->regs,
++					     base + sun50i_cdc_lut_bank[bank] + 4 * pos,
++					     val);
++				cdc->lut_hw[i] = val;
++			}
++}
++
++void sun50i_cdc_disable(struct sun8i_layer *layer)
++{
++	struct sun50i_cdc *cdc = layer->cdc;
++
++	if (!cdc || cdc->off)
++		return;
++
++	regmap_write(layer->regs, SUN50I_CDC_BASE(layer->channel) + SUN50I_CDC_CTL, 0);
++	cdc->off = true;
++	cdc->valid = false;
++}
++
++void sun50i_cdc_atomic_update(struct sun8i_layer *layer,
++			      struct drm_atomic_commit *state,
++			      struct drm_plane_state *plane_state)
++{
++	struct sun50i_cdc *cdc = layer->cdc;
++	struct sun50i_cdc_cfg cfg;
++
++	if (!cdc)
++		return;
++
++	if (sun50i_cdc_get_cfg(layer, state, plane_state, &cfg) || !cfg.enable) {
++		sun50i_cdc_disable(layer);
++		return;
++	}
++
++	if (cdc->in_ctm) {
++		sun50i_cdc_write_csc(layer, &cfg.in, true);
++		sun50i_cdc_write_csc(layer, &cfg.out, false);
++	}
++	sun50i_cdc_write_lut(layer, cfg.lut);
++	sun50i_cdc_write(layer, SUN50I_CDC_CTL, SUN50I_CDC_CTL_EN);
++	cdc->off = false;
++	cdc->valid = true;
++}
++
++static struct drm_colorop *sun50i_cdc_add_op(struct drm_plane *plane,
++					     struct drm_colorop *prev,
++					     enum drm_colorop_type type)
++{
++	struct drm_colorop *op;
++	int ret;
++
++	op = kzalloc_obj(*op);
++	if (!op)
++		return ERR_PTR(-ENOMEM);
++
++	if (type == DRM_COLOROP_3D_LUT)
++		ret = drm_plane_colorop_3dlut_init(plane->dev, op, plane,
++						   &sun50i_cdc_colorop_funcs,
++						   SUN50I_CDC_LUT_DIM,
++						   DRM_COLOROP_LUT3D_INTERPOLATION_TETRAHEDRAL,
++						   DRM_COLOROP_FLAG_ALLOW_BYPASS);
++	else
++		ret = drm_plane_colorop_ctm_3x4_init(plane->dev, op, plane,
++						     &sun50i_cdc_colorop_funcs,
++						     DRM_COLOROP_FLAG_ALLOW_BYPASS);
++	if (ret) {
++		kfree(op);
++		return ERR_PTR(ret);
++	}
++
++	if (prev)
++		drm_colorop_set_next_property(prev, op);
++
++	return op;
++}
++
++int sun50i_cdc_init(struct sun8i_layer *layer)
++{
++	struct drm_plane *plane = &layer->plane;
++	struct drm_prop_enum_list pipeline;
++	bool has_csc = layer->cfg->cdc_csc_mask & BIT(layer->channel);
++	struct drm_colorop *first, *prev = NULL;
++	struct sun50i_cdc *cdc;
++	int ret;
++
++	cdc = devm_kzalloc(plane->dev->dev, sizeof(*cdc), GFP_KERNEL);
++	if (!cdc)
++		return -ENOMEM;
++
++	/* colorops left on failure are freed by drm_mode_config_cleanup() */
++	if (has_csc) {
++		cdc->in_ctm = sun50i_cdc_add_op(plane, NULL, DRM_COLOROP_CTM_3X4);
++		if (IS_ERR(cdc->in_ctm))
++			return PTR_ERR(cdc->in_ctm);
++		prev = cdc->in_ctm;
++	}
++
++	cdc->lut = sun50i_cdc_add_op(plane, prev, DRM_COLOROP_3D_LUT);
++	if (IS_ERR(cdc->lut))
++		return PTR_ERR(cdc->lut);
++	first = has_csc ? cdc->in_ctm : cdc->lut;
++
++	if (has_csc) {
++		cdc->out_ctm = sun50i_cdc_add_op(plane, cdc->lut, DRM_COLOROP_CTM_3X4);
++		if (IS_ERR(cdc->out_ctm))
++			return PTR_ERR(cdc->out_ctm);
++	}
++
++	pipeline.type = first->base.id;
++	pipeline.name = kasprintf(GFP_KERNEL, "Color Pipeline %u", first->base.id);
++	if (!pipeline.name)
++		return -ENOMEM;
++	ret = drm_plane_create_color_pipeline_property(plane, &pipeline, 1);
++	kfree(pipeline.name);
++	if (ret)
++		return ret;
++
++	layer->cdc = cdc;
++	sun50i_cdc_disable(layer);
++
++	return 0;
++}
+diff --git a/drivers/gpu/drm/sun4i/sun50i_cdc.h b/drivers/gpu/drm/sun4i/sun50i_cdc.h
+new file mode 100644
+index 000000000..c856c9a55
+--- /dev/null
++++ b/drivers/gpu/drm/sun4i/sun50i_cdc.h
+@@ -0,0 +1,19 @@
++/* SPDX-License-Identifier: GPL-2.0-or-later */
++
++#ifndef _SUN50I_CDC_H_
++#define _SUN50I_CDC_H_
++
++struct drm_atomic_commit;
++struct drm_plane_state;
++struct sun8i_layer;
++
++int sun50i_cdc_init(struct sun8i_layer *layer);
++int sun50i_cdc_atomic_check(struct sun8i_layer *layer,
++			    struct drm_atomic_commit *state,
++			    struct drm_plane_state *plane_state);
++void sun50i_cdc_atomic_update(struct sun8i_layer *layer,
++			      struct drm_atomic_commit *state,
++			      struct drm_plane_state *plane_state);
++void sun50i_cdc_disable(struct sun8i_layer *layer);
++
++#endif /* _SUN50I_CDC_H_ */
+diff --git a/drivers/gpu/drm/sun4i/sun50i_planes.c b/drivers/gpu/drm/sun4i/sun50i_planes.c
+index ce7a94bcf..b4013881d 100644
+--- a/drivers/gpu/drm/sun4i/sun50i_planes.c
++++ b/drivers/gpu/drm/sun4i/sun50i_planes.c
+@@ -32,6 +32,8 @@ static const struct sun50i_planes_quirks sun50i_h616_planes_quirks = {
+ 	.cfg = {
+ 		.de_type	= SUN8I_MIXER_DE33,
+ 		.afbc_mask	= BIT(0),
++		.cdc_mask	= BIT(0) | BIT(1),
++		.cdc_csc_mask	= BIT(0),
+ 		.scaler_type    = {
+ 			[0] = SUN8I_SCALER_VI_ED,
+ 			[1] = SUN8I_SCALER_VI_8,
+diff --git a/drivers/gpu/drm/sun4i/sun8i_csc.c b/drivers/gpu/drm/sun4i/sun8i_csc.c
+index 87a3566f1..ed2ce1455 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_csc.c
++++ b/drivers/gpu/drm/sun4i/sun8i_csc.c
+@@ -397,6 +397,23 @@ void sun8i_de33_csc_get_table(enum sun8i_csc_mode mode,
+ 	sun8i_de33_convert_table(table, dst);
+ }
+ 
++/*
++ * The YCbCr to R'G'B' conversion of the channel CSC as a matrix in Q2.17
++ * and the magnitudes subtracted from Y, Cb and Cr before it.
++ */
++void sun8i_de33_csc_yuv2rgb(enum drm_color_encoding encoding,
++			    enum drm_color_range range, s64 m[3][3], u32 d[3])
++{
++	const u32 *table = yuv2rgb_de3[range][encoding];
++	int r, c;
++
++	for (r = 0; r < 3; r++) {
++		for (c = 0; c < 3; c++)
++			m[r][c] = (s32)table[r * 4 + c];
++		d[r] = -(s16)(table[r * 4 + 3] >> 16);
++	}
++}
++
+ static void sun8i_de33_ccsc_setup(struct regmap *map, int layer,
+ 				  enum sun8i_csc_mode mode,
+ 				  enum drm_color_encoding encoding,
+diff --git a/drivers/gpu/drm/sun4i/sun8i_csc.h b/drivers/gpu/drm/sun4i/sun8i_csc.h
+index 788812cd6..7e909f1f3 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_csc.h
++++ b/drivers/gpu/drm/sun4i/sun8i_csc.h
+@@ -45,5 +45,7 @@ void sun8i_de3_ccsc_init(struct regmap *map);
+ #define SUN8I_DE33_CSC_TABLE_LEN	15
+ void sun8i_de33_csc_get_table(enum sun8i_csc_mode mode,
+ 			      enum drm_color_encoding encoding, u32 *dst);
++void sun8i_de33_csc_yuv2rgb(enum drm_color_encoding encoding,
++			    enum drm_color_range range, s64 m[3][3], u32 d[3]);
+ 
+ #endif
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.h b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+index f4959f230..15873e198 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.h
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.h
+@@ -16,6 +16,7 @@
+ #include "sunxi_engine.h"
+ #include "sun55i_de.h"
+ 
++struct sun50i_cdc;
+ struct sun50i_shadow;
+ struct sun50i_wb;
+ 
+@@ -232,6 +233,8 @@ enum sun8i_scaler_type {
+  *	mode.
+  * @de2_fcc_alpha: use FCC for missing DE2 VI alpha capability
+  *	Most DE2 cores has FCC. If number of VI planes is one, enable this.
++ * @cdc_mask: bitmask of physical channels with a DE33 CDC unit.
++ * @cdc_csc_mask: bitmask of the channels whose CDC has input and output CSCs.
+  */
+ struct sun8i_layer_cfg {
+ 	unsigned int	vi_scaler_num;
+@@ -239,6 +242,8 @@ struct sun8i_layer_cfg {
+ 	int		ccsc;
+ 	unsigned int	de_type;
+ 	unsigned int	afbc_mask;
++	unsigned int	cdc_mask;
++	unsigned int	cdc_csc_mask;
+ 	unsigned int	scanline_yuv[MAX_CHANNELS];
+ 	unsigned int	scanline_rgb[MAX_CHANNELS];
+ 	unsigned int	scanline_ed[MAX_CHANNELS];
+@@ -330,6 +335,7 @@ struct sun8i_layer {
+ 	int				overlay;
+ 	struct regmap			*regs;
+ 	u32				afbc_base;
++	struct sun50i_cdc		*cdc;
+ 	const struct sun8i_layer_cfg	*cfg;
+ };
+ 
+diff --git a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+index 08ec45c27..d4fb1b81f 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+@@ -17,6 +17,7 @@
+ 
+ #include "sun4i_crtc.h"
+ #include "sun50i_afbc.h"
++#include "sun50i_cdc.h"
+ #include "sun8i_csc.h"
+ #include "sun8i_mixer.h"
+ #include "sun8i_vi_layer.h"
+@@ -29,6 +30,7 @@ static void sun8i_vi_layer_disable(struct sun8i_layer *layer)
+ 	regmap_write(layer->regs,
+ 		     SUN8I_MIXER_CHAN_VI_LAYER_ATTR(ch_base, layer->overlay), 0);
+ 	sun50i_afbc_disable(layer);
++	sun50i_cdc_disable(layer);
+ }
+ 
+ static void sun8i_vi_layer_update_attributes(struct sun8i_layer *layer,
+@@ -294,10 +296,14 @@ static int sun8i_vi_layer_atomic_check(struct drm_plane *plane,
+ 		max_scale = SUN8I_VI_SCALER_SCALE_MAX;
+ 	}
+ 
+-	return drm_atomic_helper_check_plane_state(new_plane_state,
+-						   crtc_state,
+-						   min_scale, max_scale,
+-						   true, true);
++	ret = drm_atomic_helper_check_plane_state(new_plane_state,
++						  crtc_state,
++						  min_scale, max_scale,
++						  true, true);
++	if (ret)
++		return ret;
++
++	return sun50i_cdc_atomic_check(layer, state, new_plane_state);
+ }
+ 
+ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
+@@ -328,6 +334,7 @@ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
+ 		sun8i_csc_config(layer, new_state);
+ 		sun8i_vi_layer_update_buffer(layer, plane);
+ 	}
++	sun50i_cdc_atomic_update(layer, state, new_state);
+ }
+ 
+ static bool sun8i_vi_layer_format_mod_supported(struct drm_plane *plane,
+@@ -569,6 +576,14 @@ struct sun8i_layer *sun8i_vi_layer_init_one(struct drm_device *drm,
+ 		return ERR_PTR(ret);
+ 	}
+ 
++	if (layer->cfg->cdc_mask & BIT(phy_index)) {
++		ret = sun50i_cdc_init(layer);
++		if (ret) {
++			dev_err(drm->dev, "Couldn't add the colour pipeline\n");
++			return ERR_PTR(ret);
++		}
++	}
++
+ 	drm_plane_helper_add(&layer->plane, &sun8i_vi_layer_helper_funcs);
+ 
+ 	return layer;
+-- 
+2.55.0
+
