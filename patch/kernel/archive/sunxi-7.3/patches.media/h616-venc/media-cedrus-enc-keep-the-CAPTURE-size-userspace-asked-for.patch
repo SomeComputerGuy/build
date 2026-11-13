@@ -1,0 +1,72 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 11:30:00 +0000
+Subject: media: cedrus: enc: keep the CAPTURE size userspace asked for
+
+S_FMT on OUTPUT reset the CAPTURE sizeimage to the default. A client
+that sets CAPTURE first, as the stateful encoder interface says, lost
+its size: GStreamer's v4l2jpegenc asked for 8 MiB, got 2.7 MiB buffers
+and failed. Keep the requested size; the default stays for 0.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/staging/media/sunxi/cedrus/cedrus.h          | 2 ++
+ drivers/staging/media/sunxi/cedrus/cedrus_enc.c      | 3 ++-
+ drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c | 3 ++-
+ 3 files changed, 6 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -247,6 +247,8 @@
+ 	bool				is_enc;
+ 	/* Context of the JPEG encoder video device (cedrus_enc_jpeg.c). */
+ 	bool				is_jpeg_enc;
++	/* Encoder CAPTURE sizeimage from userspace, 0 for the default. */
++	unsigned int			coded_size;
+ 
+ 	struct v4l2_ctrl_handler	hdl;
+ 	struct v4l2_ctrl		**ctrls;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+@@ -504,6 +504,7 @@
+ 	if (vb2_is_busy(vq))
+ 		return -EBUSY;
+ 
++	ctx->coded_size = f->fmt.pix.sizeimage;
+ 	cedrus_enc_prepare_coded_format(ctx, &f->fmt.pix);
+ 	ctx->dst_fmt = f->fmt.pix;
+ 
+@@ -527,7 +528,7 @@
+ 	cedrus_enc_prepare_raw_format(&f->fmt.pix, &cedrus_enc_frmsize);
+ 	ctx->src_fmt = f->fmt.pix;
+ 
+-	ctx->dst_fmt.sizeimage = 0;
++	ctx->dst_fmt.sizeimage = ctx->coded_size;
+ 	cedrus_enc_prepare_coded_format(ctx, &ctx->dst_fmt);
+ 
+ 	return 0;
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_jpeg.c
+@@ -392,6 +392,7 @@
+ 	if (vb2_is_busy(vq))
+ 		return -EBUSY;
+ 
++	ctx->coded_size = f->fmt.pix.sizeimage;
+ 	cedrus_enc_jpeg_prepare_coded_format(ctx, &f->fmt.pix);
+ 	ctx->dst_fmt = f->fmt.pix;
+ 
+@@ -415,7 +416,7 @@
+ 	cedrus_enc_jpeg_prepare_raw_format(&f->fmt.pix);
+ 	ctx->src_fmt = f->fmt.pix;
+ 
+-	ctx->dst_fmt.sizeimage = 0;
++	ctx->dst_fmt.sizeimage = ctx->coded_size;
+ 	cedrus_enc_jpeg_prepare_coded_format(ctx, &ctx->dst_fmt);
+ 
+ 	return 0;
+-- 
+2.55.0
