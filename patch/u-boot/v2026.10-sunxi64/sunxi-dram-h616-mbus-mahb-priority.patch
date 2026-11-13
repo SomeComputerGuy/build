@@ -1,0 +1,28 @@
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Subject: [PATCH] sunxi: dram: h616: give the MAHB MBUS port priority
+
+The EMAC is an AHB master and reaches DRAM through MBUS port 2 (MAHB).
+It starts a frame larger than its 4 KiB TX FIFO once the FIFO is full
+and must then read the rest from DRAM at line rate. Under CPU and video
+decoder load, port 2 without priority loses arbitration long enough
+for the TX FIFO to run empty: in MAC loopback at 1 Gbit/s, 30 to 75%
+of the frames of 9 to 16 KiB underflowed; with the priority bit set,
+0 of 4000 (frames 60 to 16376 bytes), the load unchanged.
+
+Set the priority bit of port 2, as already done for port 25.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/arch/arm/mach-sunxi/dram_sun50i_h616.c b/arch/arm/mach-sunxi/dram_sun50i_h616.c
+--- a/arch/arm/mach-sunxi/dram_sun50i_h616.c
++++ b/arch/arm/mach-sunxi/dram_sun50i_h616.c
+@@ -71,7 +71,8 @@
+ 
+ 	MBUS_CONF(0, false, HIGHEST, 0,  256,  128,  100);
+ 	MBUS_CONF(1, false,    HIGH, 0, 1536, 1400,  256);
+-	MBUS_CONF(2, false, HIGHEST, 0,  512,  256,   96);
++	/* MAHB: the EMAC TX FIFO underflows under load without priority */
++	MBUS_CONF(2,  true, HIGHEST, 0,  512,  256,   96);
+ 	MBUS_CONF(3, false,    HIGH, 0,  256,  100,   80);
+ 	MBUS_CONF(4, false,    HIGH, 2, 8192, 5500, 5000);
+ 	MBUS_CONF(5, false,    HIGH, 2,  100,   64,   32);
