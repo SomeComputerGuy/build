@@ -1,0 +1,55 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 06:30:00 +0000
+Subject: media: cedrus: AVS2: do not offer the 32x32 tiled capture format
+
+The AVS2 mode of the H.265 engine does not write NV12_32L32: 8-bit
+pictures come out wrong or the job times out. The vendor library never
+uses it for AVS2. GStreamer picked it by default.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/staging/media/sunxi/cedrus/cedrus_video.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -186,6 +186,14 @@
+ 
+ #define CEDRUS_FORMATS_COUNT	ARRAY_SIZE(cedrus_formats)
+ 
++/* The AVS2 mode of the H.265 engine does not write NV12_32L32. */
++static bool cedrus_format_unsupported(struct cedrus_ctx *ctx,
++				      const struct cedrus_format *fmt)
++{
++	return fmt->pixelformat == V4L2_PIX_FMT_NV12_32L32 &&
++	       ctx->src_fmt.pixelformat == V4L2_PIX_FMT_AVS2_FRAME;
++}
++
+ static struct cedrus_format *cedrus_find_format(struct cedrus_ctx *ctx,
+ 						u32 pixelformat, u32 directions)
+ {
+@@ -207,6 +215,9 @@
+ 		    fmt->src_format != ctx->src_fmt.pixelformat)
+ 			continue;
+ 
++		if (cedrus_format_unsupported(ctx, fmt))
++			continue;
++
+ 		if (fmt->pixelformat == pixelformat)
+ 			break;
+ 
+@@ -396,6 +407,9 @@
+ 		    fmt->src_format != ctx->src_fmt.pixelformat)
+ 			continue;
+ 
++		if (cedrus_format_unsupported(ctx, fmt))
++			continue;
++
+ 		if (index == f->index)
+ 			break;
+ 
+-- 
+2.55.0

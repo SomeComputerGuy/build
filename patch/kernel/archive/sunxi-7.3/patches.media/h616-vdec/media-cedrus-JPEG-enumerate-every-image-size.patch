@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 07:00:00 +0000
+Subject: media: cedrus: JPEG: enumerate every image size
+
+ENUM_FRAMESIZES gave JPEG a step of 16, so GStreamer's v4l2jpegdec
+refused 1920x1080 MJPEG, which the driver decodes. Use a step of 1.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/staging/media/sunxi/cedrus/cedrus_video.c | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -446,7 +446,7 @@
+ 				  struct v4l2_frmsizeenum *fsize)
+ {
+ 	struct cedrus_ctx *ctx = cedrus_file2ctx(file);
+-	unsigned int max_width, max_height;
++	unsigned int max_width, max_height, step;
+ 	struct cedrus_format *fmt;
+ 
+ 	/*
+@@ -476,13 +476,16 @@
+ 
+ 	cedrus_max_size(ctx->dev, fmt->pixelformat, &max_width, &max_height);
+ 
++	/* JPEG images have any size; the capture buffer is MCU padded. */
++	step = fmt->pixelformat == V4L2_PIX_FMT_JPEG ? 1 : 16;
++
+ 	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
+ 	fsize->stepwise.min_width = CEDRUS_MIN_WIDTH;
+ 	fsize->stepwise.max_width = max_width;
+-	fsize->stepwise.step_width = 16;
++	fsize->stepwise.step_width = step;
+ 	fsize->stepwise.min_height = CEDRUS_MIN_HEIGHT;
+ 	fsize->stepwise.max_height = max_height;
+-	fsize->stepwise.step_height = 16;
++	fsize->stepwise.step_height = step;
+ 	memset(fsize->reserved, 0, sizeof(fsize->reserved));
+ 
+ 	return 0;
+-- 
+2.55.0
