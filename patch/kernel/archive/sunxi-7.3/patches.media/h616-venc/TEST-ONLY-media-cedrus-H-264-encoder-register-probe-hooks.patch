@@ -1,0 +1,103 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 20:30:00 +0000
+Subject: TEST ONLY: media: cedrus: H.264 encoder register probe hooks
+
+Module parameters, off by default, to look for the 8x8 transform
+switch of the H616 encoder: test_enc_pps_8x8 keeps
+transform_8x8_mode_flag in a high profile PPS, test_enc_reg and
+test_enc_xor flip bits of encoder/ISP registers before each picture
+starts, test_enc_base and test_enc_seen read the values back.
+Not for the image.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c | 52 +++++++++++++++++++++-
+ 1 file changed, 50 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
+@@ -21,6 +21,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/iopoll.h>
+ #include <linux/math64.h>
++#include <linux/moduleparam.h>
+ #include <linux/sizes.h>
+ #include <linux/types.h>
+ #include <linux/videodev2.h>
+@@ -165,6 +166,50 @@
+ 	.align		= cedrus_enc_h264_rbsp_align,
+ };
+ 
++/*
++ * TEST ONLY: register probe. test_enc_pps_8x8 keeps transform_8x8_mode_flag
++ * in a high profile PPS; test_enc_reg/test_enc_xor flip bits of encoder or
++ * ISP registers (0xa00-0xbfc) after the setup of each picture, before the
++ * start; test_enc_base/test_enc_seen read back the last picture's values
++ * before and after. Register 0 is ignored. Not for the image.
++ */
++#define TEST_ENC_REGS	8
++static bool test_enc_pps_8x8;
++module_param(test_enc_pps_8x8, bool, 0644);
++static unsigned int test_enc_reg[TEST_ENC_REGS];
++static unsigned int test_enc_reg_n;
++module_param_array(test_enc_reg, uint, &test_enc_reg_n, 0644);
++static unsigned int test_enc_xor[TEST_ENC_REGS];
++static unsigned int test_enc_xor_n;
++module_param_array(test_enc_xor, uint, &test_enc_xor_n, 0644);
++static unsigned int test_enc_base[TEST_ENC_REGS];
++static unsigned int test_enc_base_n;
++module_param_array(test_enc_base, uint, &test_enc_base_n, 0444);
++static unsigned int test_enc_seen[TEST_ENC_REGS];
++static unsigned int test_enc_seen_n;
++module_param_array(test_enc_seen, uint, &test_enc_seen_n, 0444);
++
++static void cedrus_enc_h264_test_regs(struct cedrus_dev *dev)
++{
++	unsigned int i, n = min_t(unsigned int, test_enc_reg_n, TEST_ENC_REGS);
++
++	for (i = 0; i < n; i++) {
++		u32 reg = test_enc_reg[i];
++		u32 xor = i < test_enc_xor_n ? test_enc_xor[i] : 0;
++
++		test_enc_base[i] = 0;
++		test_enc_seen[i] = 0;
++		if (reg < 0xa00 || reg > 0xbfc || reg & 3)
++			continue;
++
++		test_enc_base[i] = cedrus_read(dev, reg);
++		cedrus_write(dev, reg, test_enc_base[i] ^ xor);
++		test_enc_seen[i] = cedrus_read(dev, reg);
++	}
++	test_enc_base_n = n;
++	test_enc_seen_n = n;
++}
++
+ /* Encode core operations */
+ 
+ static int cedrus_enc_h264_state_constrain(struct v4l2_h264_enc *enc,
+@@ -215,8 +260,9 @@
+ 	if (sps->profile_idc == 66)
+ 		pps->flags &= ~V4L2_H264_PPS_FLAG_ENTROPY_CODING_MODE;
+ 
+-	pps->flags &= ~(V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE |
+-			V4L2_H264_PPS_FLAG_CONSTRAINED_INTRA_PRED);
++	if (!test_enc_pps_8x8 || sps->profile_idc != 100)
++		pps->flags &= ~V4L2_H264_PPS_FLAG_TRANSFORM_8X8_MODE;
++	pps->flags &= ~V4L2_H264_PPS_FLAG_CONSTRAINED_INTRA_PRED;
+ 
+ 	/* The deblocking filter is set per slice (PARA0). */
+ 	pps->flags |= V4L2_H264_PPS_FLAG_DEBLOCKING_FILTER_CONTROL_PRESENT;
+@@ -844,6 +890,8 @@
+ 	cedrus_write(dev, VE_ENC_AVC_OVERTIME_MB, 0);
+ 	cedrus_write(dev, VE_ENC_AVC_ME_INFO, 0);
+ 
++	cedrus_enc_h264_test_regs(dev);
++
+ 	return 0;
+ }
+ 
+-- 
+2.47.3
+
