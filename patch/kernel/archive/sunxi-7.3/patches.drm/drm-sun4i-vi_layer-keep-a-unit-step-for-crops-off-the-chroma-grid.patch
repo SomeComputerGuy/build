@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 19:00:00 +0000
+Subject: [PATCH] drm/sun4i: vi_layer: Keep a unit step for crops off the chroma grid
+
+For subsampled formats the fetch window is aligned to the chroma grid:
+an odd crop width loses a column, an odd crop x moves the start one
+pixel left and adds a phase. The scaler step was computed from that
+aligned size, so a 1:1 plane with an odd crop was resampled by e.g.
+1022/1023 across its whole width.
+
+Compute the step from the crop, as the vendor driver does
+(de_vsu_calc_scaler_para), and keep the aligned size for the fetch
+window. A 1:1 plane now maps every pixel 1:1; only a column or row the
+aligned window drops repeats its neighbour.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
+@@ -74,6 +74,7 @@
+ 	struct sun8i_mixer *mixer = engine_to_sun8i_mixer(scrtc->engine);
+ 	const struct drm_format_info *format = state->fb->format;
+ 	u32 src_w, src_h, dst_w, dst_h;
++	u32 crop_w, crop_h;
+ 	u32 outsize, insize;
+ 	u32 hphase, vphase;
+ 	u32 hn = 0, hm = 0;
+@@ -86,8 +87,10 @@
+ 
+ 	ch_base = sun8i_channel_base(layer);
+ 
+-	src_w = drm_rect_width(&state->src) >> 16;
+-	src_h = drm_rect_height(&state->src) >> 16;
++	crop_w = drm_rect_width(&state->src);
++	crop_h = drm_rect_height(&state->src);
++	src_w = crop_w >> 16;
++	src_h = crop_h >> 16;
+ 	dst_w = drm_rect_width(&state->dst);
+ 	dst_h = drm_rect_height(&state->dst);
+ 
+@@ -156,6 +159,7 @@
+ 			vm = src_h;
+ 			vn = (u32)ability * dst_h / 100;
+ 			src_h = vn;
++			crop_h = vn << 16;
+ 		}
+ 
+ 		if (subsampled)
+@@ -168,10 +172,15 @@
+ 			hm = src_w;
+ 			hn = scanline;
+ 			src_w = hn;
++			crop_w = hn << 16;
+ 		}
+ 
+-		hscale = (src_w << 16) / dst_w;
+-		vscale = (src_h << 16) / dst_h;
++		/*
++		 * The step follows the crop, not the fetch size aligned to
++		 * the chroma grid above, or a 1:1 plane gets resampled.
++		 */
++		hscale = crop_w / dst_w;
++		vscale = crop_h / dst_h;
+ 
+ 		sun8i_vi_scaler_setup(layer, src_w, src_h, dst_w, dst_h,
+ 				      hscale, vscale, hphase, vphase, format,
