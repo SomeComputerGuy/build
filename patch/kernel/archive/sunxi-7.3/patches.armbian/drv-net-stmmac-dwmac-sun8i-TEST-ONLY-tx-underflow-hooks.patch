@@ -81,10 +81,10 @@ index 20a7260..bf9ce5b 100644
  
  enum dma_irq_status {
 diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
-index bd25213..064f87e 100644
+index 024449d..043ee79 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
-@@ -332,6 +332,14 @@ static const struct emac_variant emac_variant_h6 = {
+@@ -326,6 +326,14 @@ static const struct emac_variant emac_variant_h6 = {
  #define SYSCON_ETCS_EXT_GMII	0x1
  #define SYSCON_ETCS_INT_GMII	0x2
  
@@ -99,7 +99,7 @@ index bd25213..064f87e 100644
  static int sun8i_dwmac_reset(void __iomem *ioaddr)
  {
  	u32 v;
-@@ -552,6 +560,28 @@ static int sun8i_dwmac_dma_interrupt(struct stmmac_priv *priv,
+@@ -546,6 +554,28 @@ static int sun8i_dwmac_dma_interrupt(struct stmmac_priv *priv,
  	 * closed, when this interrupt cannot race with them.
  	 */
  	if (v & EMAC_TX_UNDERFLOW_INT) {
@@ -128,7 +128,7 @@ index bd25213..064f87e 100644
  		writel(readl(ioaddr + EMAC_TX_CTL1) | EMAC_TX_DMA_START,
  		       ioaddr + EMAC_TX_CTL1);
  		ret |= handle_tx;
-@@ -733,6 +763,9 @@ static void sun8i_dwmac_core_init(struct mac_device_info *hw,
+@@ -722,6 +752,9 @@ static void sun8i_dwmac_core_init(struct mac_device_info *hw,
  	void __iomem *ioaddr = hw->pcsr;
  	u32 v;
  
