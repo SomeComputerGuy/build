@@ -1,12 +1,14 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 17:00:00 +0000
-Subject: TEST ONLY: media: sunxi: sun50i-g2d: sweep the register windows at
+Subject: TEST ONLY: media: sunxi: sun50i-g2d: sweep one register window per
  probe
 
-For the item 15 proof job: log which G2D register windows hold a value
-and which TOP bits exist, once per module clock parent (the BSP uses
-pll-periph0-2x). Revert after the job.
+For the item 15 proof job: with the "sweep" parameter, the probe tests
+one access group (a register window, the TOP bits, the old self-test or
+nothing) on the clock parent given by "sweep_parent", logging "start"
+before the first access. A probe with the full sweep hung the board
+(watchdog reset, no log). Revert after the job.
 
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
@@ -21,14 +23,24 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  #include <linux/dma-mapping.h>
  #include <linux/interrupt.h>
  #include <linux/io.h>
-@@ -1044,6 +1045,92 @@
- 	return "ok";
- }
+@@ -1144,6 +1145,128 @@
+ 	.device_run	= g2d_device_run,
+ };
  
 +/*
-+ * TEST ONLY (item 15 proof job): which register windows hold a written
-+ * value and read anything back, and which TOP bits exist.
++ * TEST ONLY (item 15 proof job): one access group per probe, chosen by
++ * the module parameters, since an access to an absent block can stall
++ * the bus until the watchdog resets the board. Without "sweep" the probe
++ * runs g2d_selftest() as before.
 + */
++static char *sweep;
++module_param(sweep, charp, 0444);
++MODULE_PARM_DESC(sweep, "TEST ONLY: idle, selftest, top or a register window");
++
++static int sweep_parent = -1;
++module_param(sweep_parent, int, 0444);
++MODULE_PARM_DESC(sweep_parent, "TEST ONLY: module clock parent index (-1 keep)");
++
 +static const struct {
 +	const char *name;
 +	u32 reg;	/* a size/coordinate register of the window */
@@ -46,79 +58,109 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 +	{ "gsu", 0x30040, 0x30000 },
 +};
 +
-+static void g2d_selftest_sweep(struct g2d_dev *dev, const char *tag)
-+{
-+	char buf[384];
-+	unsigned int i, j, nz, len = 0;
-+	u32 got, top[4];
-+
-+	g2d_engines_reset(dev);
-+	for (i = 0; i < ARRAY_SIZE(g2d_sweep_win); i++) {
-+		bool held = g2d_reg_holds(dev, g2d_sweep_win[i].reg,
-+					  0x00230011, &got);
-+
-+		g2d_write(dev, g2d_sweep_win[i].reg, 0);
-+		for (nz = 0, j = 0; j < 64; j++)
-+			nz += !!g2d_read(dev, g2d_sweep_win[i].base + 4 * j);
-+		len += scnprintf(buf + len, sizeof(buf) - len, " %s %s/%u",
-+				 g2d_sweep_win[i].name, held ? "hold" : "dead",
-+				 nz);
-+	}
-+	g2d_write(dev, G2D_MIXER_INT, 0);
-+
-+	for (i = 0; i < 4; i++) {
-+		u32 old = g2d_read(dev, 4 * i);
-+
-+		g2d_write(dev, 4 * i, 0xffffffff);
-+		top[i] = g2d_read(dev, 4 * i);
-+		g2d_write(dev, 4 * i, old);
-+	}
-+
-+	dev_info(dev->dev,
-+		 "selftest sweep %s: clk %s %lu top-bits %08x/%08x/%08x div %08x ip %08x%s\n",
-+		 tag, __clk_get_name(clk_get_parent(dev->mod_clk)),
-+		 clk_get_rate(dev->mod_clk), top[0], top[1], top[2], top[3],
-+		 g2d_read(dev, G2D_TOP_IP_VERSION), buf);
-+}
-+
-+/* TEST ONLY: sweep with the module clock on each parent (BSP: periph0-2x) */
-+static void g2d_selftest_parents(struct g2d_dev *dev)
++static int g2d_sweep_set_parent(struct g2d_dev *dev, int index)
 +{
 +	struct clk_hw *hw = __clk_get_hw(dev->mod_clk);
-+	struct clk *old = clk_get_parent(dev->mod_clk);
-+	unsigned int i;
++	struct clk_hw *phw;
++	struct clk *p;
++	int ret;
 +
-+	g2d_selftest_sweep(dev, "boot");
-+	for (i = 0; hw && i < clk_hw_get_num_parents(hw); i++) {
-+		struct clk_hw *phw = clk_hw_get_parent_by_index(hw, i);
-+		struct clk *p;
++	if (!hw || index >= clk_hw_get_num_parents(hw))
++		return -EINVAL;
++	phw = clk_hw_get_parent_by_index(hw, index);
++	if (!phw)
++		return -ENOENT;
++	p = clk_hw_get_clk(phw, "g2d-selftest");
++	if (IS_ERR(p))
++		return PTR_ERR(p);
++	ret = clk_set_parent(dev->mod_clk, p);
++	if (!ret)
++		ret = clk_set_rate(dev->mod_clk, G2D_CLK_RATE);
++	clk_put(p);
 +
-+		if (!phw)
-+			continue;
-+		p = clk_hw_get_clk(phw, "g2d-selftest");
-+		if (IS_ERR(p))
-+			continue;
-+		if (!clk_set_parent(dev->mod_clk, p) &&
-+		    !clk_set_rate(dev->mod_clk, G2D_CLK_RATE))
-+			g2d_selftest_sweep(dev, clk_hw_get_name(phw));
-+		else
-+			dev_info(dev->dev, "selftest sweep %s: parent not set\n",
-+				 clk_hw_get_name(phw));
-+		clk_put(p);
-+	}
-+	clk_set_parent(dev->mod_clk, old);
-+	clk_set_rate(dev->mod_clk, G2D_CLK_RATE);
-+	g2d_engines_reset(dev);
++	return ret;
 +}
 +
- static void g2d_selftest(struct g2d_dev *dev)
++static void g2d_sweep_one(struct g2d_dev *dev, const char *pname)
++{
++	unsigned int i, j, nz;
++	u32 got, top[4];
++	bool held;
++
++	if (!strcmp(sweep, "idle"))
++		return;
++	if (!strcmp(sweep, "selftest")) {
++		g2d_selftest(dev);
++		return;
++	}
++	if (!strcmp(sweep, "top")) {
++		for (i = 0; i < ARRAY_SIZE(top); i++) {
++			u32 old = g2d_read(dev, 4 * i);
++
++			g2d_write(dev, 4 * i, 0xffffffff);
++			top[i] = g2d_read(dev, 4 * i);
++			g2d_write(dev, 4 * i, old);
++		}
++		dev_info(dev->dev,
++			 "selftest sweep %s top: bits %08x/%08x/%08x div %08x\n",
++			 pname, top[0], top[1], top[2], top[3]);
++		return;
++	}
++	for (i = 0; i < ARRAY_SIZE(g2d_sweep_win); i++)
++		if (!strcmp(sweep, g2d_sweep_win[i].name))
++			break;
++	if (i == ARRAY_SIZE(g2d_sweep_win)) {
++		dev_info(dev->dev, "selftest sweep %s %s: unknown\n", pname,
++			 sweep);
++		return;
++	}
++	held = g2d_reg_holds(dev, g2d_sweep_win[i].reg, 0x00230011, &got);
++	g2d_write(dev, g2d_sweep_win[i].reg, 0);
++	for (nz = 0, j = 0; j < 64; j++)
++		nz += !!g2d_read(dev, g2d_sweep_win[i].base + 4 * j);
++	dev_info(dev->dev, "selftest sweep %s %s: %s/%u (read %08x)\n", pname,
++		 sweep, held ? "hold" : "dead", nz, got);
++}
++
++/* TEST ONLY: the access group named by "sweep", on the chosen clock parent */
++static void g2d_sweep(struct g2d_dev *dev)
++{
++	struct clk *old = clk_get_parent(dev->mod_clk);
++	const char *pname;
++	int ret = 0;
++
++	if (sweep_parent >= 0)
++		ret = g2d_sweep_set_parent(dev, sweep_parent);
++	pname = __clk_get_name(clk_get_parent(dev->mod_clk));
++	if (ret) {
++		dev_info(dev->dev, "selftest sweep %d %s: parent not set (%d)\n",
++			 sweep_parent, sweep, ret);
++		goto out;
++	}
++	dev_info(dev->dev, "selftest sweep %s %s: start, clk %lu ip %08x\n",
++		 pname, sweep, clk_get_rate(dev->mod_clk),
++		 g2d_read(dev, G2D_TOP_IP_VERSION));
++	g2d_engines_reset(dev);
++	g2d_sweep_one(dev, pname);
++	g2d_engines_reset(dev);
++	dev_info(dev->dev, "selftest sweep %s %s: end\n", pname, sweep);
++out:
++	clk_set_parent(dev->mod_clk, old);
++	clk_set_rate(dev->mod_clk, G2D_CLK_RATE);
++}
++
+ static int g2d_runtime_resume(struct device *device)
  {
- 	const unsigned int n = G2D_SELFTEST_SIZE * G2D_SELFTEST_SIZE;
-@@ -1293,6 +1380,7 @@
+ 	struct g2d_dev *dev = dev_get_drvdata(device);
+@@ -1292,7 +1415,10 @@
+ 		goto err_pm;
  	v4l2_info(&dev->v4l2_dev, "G2D IP version %08x, module clock %lu Hz\n",
  		  g2d_read(dev, G2D_TOP_IP_VERSION), clk_get_rate(dev->mod_clk));
- 	g2d_selftest(dev);
-+	g2d_selftest_parents(dev);
+-	g2d_selftest(dev);
++	if (sweep)
++		g2d_sweep(dev);
++	else
++		g2d_selftest(dev);
  	pm_runtime_put(dev->dev);
  
  	ret = video_register_device(vfd, VFL_TYPE_VIDEO, 0);
