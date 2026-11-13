@@ -1,0 +1,27 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 06:00:00 +0000
+Subject: [PATCH] arm64: dts: allwinner: h616: emac0: DMA burst length of 32
+
+With the default burst length of 8 words the TX DMA of the EMAC is no
+faster than a 1 Gbit/s link, so the 4 KiB TX FIFO runs empty inside
+frames that do not fit in it. Use bursts of 32 words, which lets
+dwmac-sun8i allow MTUs up to 16358.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+index 1111111..2222222 100644
+--- a/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
++++ b/arch/arm64/boot/dts/allwinner/sun50i-h616.dtsi
+@@ -1119,6 +1119,7 @@ emac0: ethernet@5020000 {
+ 			resets = <&ccu RST_BUS_EMAC0>;
+ 			reset-names = "stmmaceth";
+ 			syscon = <&syscon>;
++			snps,pbl = <32>;
+ 			status = "disabled";
+ 
+ 			mdio0: mdio {
