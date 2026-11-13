@@ -81,7 +81,7 @@ index 20a7260..bf9ce5b 100644
  
  enum dma_irq_status {
 diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
-index 6a438dd..c2ad866 100644
+index d3314ea..dc96b40 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
 @@ -321,6 +321,14 @@ static const struct emac_variant emac_variant_h6 = {
@@ -128,7 +128,7 @@ index 6a438dd..c2ad866 100644
  		writel(readl(ioaddr + EMAC_TX_CTL1) | EMAC_TX_DMA_START,
  		       ioaddr + EMAC_TX_CTL1);
  		ret |= handle_tx;
-@@ -714,6 +744,9 @@ static void sun8i_dwmac_core_init(struct mac_device_info *hw,
+@@ -722,6 +752,9 @@ static void sun8i_dwmac_core_init(struct mac_device_info *hw,
  	void __iomem *ioaddr = hw->pcsr;
  	u32 v;
  
@@ -160,7 +160,7 @@ index 562177f..ee6b7d6 100644
  
  	if (tdes0 & TDES0_VLAN_FRAME)
 diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac.h b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
-index d2d387f..3c23246 100644
+index 8ad6b57..33fec94 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/stmmac.h
 +++ b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
 @@ -80,6 +80,9 @@ struct stmmac_tx_queue {
@@ -181,9 +181,9 @@ index d2d387f..3c23246 100644
 +
  struct stmmac_dma_conf {
  	unsigned int dma_buf_sz;
- 
+ 	/* largest frame of the MTU, with two VLAN tags and the FCS */
 diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-index a385d5e..be2d544 100644
+index 68e01bf..01c714f 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 @@ -106,6 +106,135 @@ MODULE_PARM_DESC(pause, "Flow Control Pause Time (units of 512 bit times)");
@@ -403,7 +403,7 @@ index a385d5e..be2d544 100644
  	/* Combine decisions from TX clean and XSK TX */
  	return max(count, xmits);
  }
-@@ -4162,6 +4331,9 @@ static int __stmmac_open(struct net_device *dev,
+@@ -4163,6 +4332,9 @@ static int __stmmac_open(struct net_device *dev,
  			dma_conf->tx_queue[i].tbs = priv->dma_conf.tx_queue[i].tbs;
  	memcpy(&priv->dma_conf, dma_conf, sizeof(*dma_conf));
  
@@ -413,7 +413,7 @@ index a385d5e..be2d544 100644
  	/* The PHY is suspended when the interface is reopened without
  	 * disconnecting the PHY, e.g. on MTU change. IEEE 802.3 allows PHYs
  	 * to stop their receive clock while powered down, but the DMA
-@@ -4854,7 +5026,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
+@@ -4855,7 +5027,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
  	 */
  	if (priv->descriptor_mode == STMMAC_CHAIN_MODE &&
  	    priv->hw->desc == &ndesc_ops && nfrags &&
@@ -422,7 +422,7 @@ index a385d5e..be2d544 100644
  		if (skb_linearize(skb))
  			goto max_sdu_err;
  		nfrags = 0;
-@@ -5790,6 +5962,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+@@ -5791,6 +5963,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
  	bool fcs_stripped = false;
  	int xdp_status = 0;
  	int bufsz;
@@ -430,7 +430,7 @@ index a385d5e..be2d544 100644
  
  	dma_dir = page_pool_get_dma_dir(rx_q->page_pool);
  	bufsz = DIV_ROUND_UP(priv->dma_conf.dma_buf_sz, PAGE_SIZE) * PAGE_SIZE;
-@@ -5838,6 +6011,8 @@ read_again:
+@@ -5839,6 +6012,8 @@ read_again:
  		/* check if managed by the DMA otherwise go ahead */
  		if (unlikely(status & dma_own))
  			break;
@@ -439,7 +439,7 @@ index a385d5e..be2d544 100644
  
  		next_entry = STMMAC_NEXT_ENTRY(rx_q->cur_rx,
  					       priv->dma_conf.dma_rx_size);
-@@ -6040,10 +6215,14 @@ drain_data:
+@@ -6041,10 +6216,14 @@ drain_data:
  		skb->protocol = eth_type_trans(skb, priv->dev);
  
  		if (unlikely(!coe) || !stmmac_has_ip_ethertype(skb) ||
