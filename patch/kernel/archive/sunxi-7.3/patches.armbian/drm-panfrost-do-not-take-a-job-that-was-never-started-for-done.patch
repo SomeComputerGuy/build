@@ -1,7 +1,7 @@
-From 17bfb4dc105b5f00a093ac216fd5a086a8c61d10 Mon Sep 17 00:00:00 2001
+From 56a67fc05dfe10a51b8c5875ef9e3b0d6fdf1d09 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 03:17:39 +0000
-Subject: [PATCH 10/13] drm/panfrost: Don't take a job that was never started
+Subject: [PATCH 11/14] drm/panfrost: Don't take a job that was never started
  for done
 
 While a reset is pending, panfrost_job_hw_submit() puts the job in
@@ -28,7 +28,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  2 files changed, 8 insertions(+), 2 deletions(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index 7645f19..31a3b56 100644
+index e1de9da..3b0b690 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -259,6 +259,7 @@ static int panfrost_job_hw_submit(struct panfrost_job *job, int js)

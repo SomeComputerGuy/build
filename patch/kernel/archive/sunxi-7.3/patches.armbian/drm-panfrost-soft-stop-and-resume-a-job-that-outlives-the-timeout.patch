@@ -1,7 +1,7 @@
-From e298fd5a2489441765366a8c5c478072e6536f0a Mon Sep 17 00:00:00 2001
+From ef16ab1ea793085fa91c8ca01732071d2de5c034 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 05:00:27 +0000
-Subject: [PATCH 12/13] drm/panfrost: Soft-stop and resume a job that outlives
+Subject: [PATCH 13/14] drm/panfrost: Soft-stop and resume a job that outlives
  the timeout
 
 JOB_TIMEOUT_MS is 500 ms, and when it fires panfrost resets the GPU and
@@ -72,7 +72,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 205 insertions(+), 30 deletions(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index cdcafa9..e26addf 100644
+index 26d39d7..6c76873 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -25,6 +25,25 @@
@@ -402,7 +402,7 @@ index cdcafa9..e26addf 100644
  
  	return DRM_GPU_SCHED_STAT_RESET;
  }
-@@ -863,7 +1038,7 @@ static void panfrost_reset_work(struct work_struct *work)
+@@ -862,7 +1037,7 @@ static void panfrost_reset_work(struct work_struct *work)
  		return;
  	}
  

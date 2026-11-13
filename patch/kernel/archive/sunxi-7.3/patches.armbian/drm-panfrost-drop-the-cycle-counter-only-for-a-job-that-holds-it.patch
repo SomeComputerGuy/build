@@ -1,7 +1,7 @@
-From 2f2693f8f5113dd1d52b112da206e6bfff5f8959 Mon Sep 17 00:00:00 2001
+From a3b0d7b7be72170704c82d926e3087596bb8bcf0 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 03:17:23 +0000
-Subject: [PATCH 09/13] drm/panfrost: Drop the cycle counter only for a job
+Subject: [PATCH 10/14] drm/panfrost: Drop the cycle counter only for a job
  that holds it
 
 panfrost_job_hw_submit() takes a cycle counter reference only when it
@@ -32,7 +32,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  2 files changed, 15 insertions(+), 6 deletions(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index b813493..7645f19 100644
+index c61a775..e1de9da 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -158,6 +158,14 @@ panfrost_get_job_chain_flag(const struct panfrost_job *job)

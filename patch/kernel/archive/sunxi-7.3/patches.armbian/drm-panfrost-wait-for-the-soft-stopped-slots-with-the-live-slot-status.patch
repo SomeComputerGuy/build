@@ -1,7 +1,7 @@
-From 06d2ee8ed91b3402c196fe812bfe25aa5941fca1 Mon Sep 17 00:00:00 2001
+From 715c24c6ef21e82db927a1d0eb91c3714f2d8056 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 05:00:19 +0000
-Subject: [PATCH 11/13] drm/panfrost: Wait for the soft-stopped slots with the
+Subject: [PATCH 12/14] drm/panfrost: Wait for the soft-stopped slots with the
  live slot status
 
 panfrost_reset() soft-stops the slots and waits for them to go idle by
@@ -39,7 +39,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 26 insertions(+), 22 deletions(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index 31a3b56..cdcafa9 100644
+index 3b0b690..26d39d7 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -171,7 +171,11 @@ panfrost_dequeue_job(struct panfrost_device *pfdev, int slot)

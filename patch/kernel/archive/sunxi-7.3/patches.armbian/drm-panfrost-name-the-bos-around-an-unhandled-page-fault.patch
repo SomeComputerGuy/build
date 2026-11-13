@@ -1,7 +1,7 @@
-From f8f4a7d11e1f1064410dbf7ed23a5940ff2a993f Mon Sep 17 00:00:00 2001
+From 873d685eb310979b1a49936f4d570bd84e94122c Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 05:00:27 +0000
-Subject: [PATCH 13/13] drm/panfrost: Name the BOs around an unhandled page
+Subject: [PATCH 14/14] drm/panfrost: Name the BOs around an unhandled page
  fault
 
 An unhandled GPU page fault only reports the faulting VA. That does not
@@ -34,7 +34,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 88 insertions(+)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_mmu.c b/drivers/gpu/drm/panfrost/panfrost_mmu.c
-index c9ade97..34ff2ca 100644
+index 9b7591b..a0c062f 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_mmu.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_mmu.c
 @@ -596,6 +596,93 @@ out:
@@ -131,7 +131,7 @@ index c9ade97..34ff2ca 100644
  #define NUM_FAULT_PAGES (SZ_2M / PAGE_SIZE)
  
  /*
-@@ -979,6 +1066,7 @@ static irqreturn_t panfrost_mmu_irq_handler_thread(int irq, void *data)
+@@ -981,6 +1068,7 @@ static irqreturn_t panfrost_mmu_irq_handler_thread(int irq, void *data)
  				exception_type, panfrost_exception_name(exception_type),
  				access_type, access_type_name(pfdev, fault_status),
  				source_id);
