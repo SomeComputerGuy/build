@@ -19,10 +19,10 @@ open).
 Assisted-by: Claude
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- .../net/ethernet/stmicro/stmmac/chain_mode.c  |  7 +-
- .../net/ethernet/stmicro/stmmac/dwmac-sun8i.c | 33 +++++++
- drivers/net/ethernet/stmicro/stmmac/stmmac.h  |  2 +
- .../net/ethernet/stmicro/stmmac/stmmac_main.c | 90 ++++++++++++++++++-
+ drivers/net/ethernet/stmicro/stmmac/chain_mode.c  |  7 +-
+ drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c | 33 +++++++++
+ drivers/net/ethernet/stmicro/stmmac/stmmac.h      |  2 +
+ drivers/net/ethernet/stmicro/stmmac/stmmac_main.c | 90 ++++++++++++++++++++++-
  4 files changed, 128 insertions(+), 4 deletions(-)
 
 diff --git a/drivers/net/ethernet/stmicro/stmmac/chain_mode.c b/drivers/net/ethernet/stmicro/stmmac/chain_mode.c
@@ -58,10 +58,10 @@ index 42bf7a5..33cc03d 100644
  
  	return ret;
 diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
-index a8d5899..eddf58a 100644
+index b149d18..67dac91 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
-@@ -302,6 +302,14 @@ static const struct emac_variant emac_variant_h6 = {
+@@ -305,6 +305,14 @@ static const struct emac_variant emac_variant_h6 = {
  #define SYSCON_ETCS_EXT_GMII	0x1
  #define SYSCON_ETCS_INT_GMII	0x2
  
@@ -76,7 +76,7 @@ index a8d5899..eddf58a 100644
  static int sun8i_dwmac_reset(void __iomem *ioaddr)
  {
  	u32 v;
-@@ -518,6 +526,28 @@ static int sun8i_dwmac_dma_interrupt(struct stmmac_priv *priv,
+@@ -521,6 +529,28 @@ static int sun8i_dwmac_dma_interrupt(struct stmmac_priv *priv,
  	 * next frame instead of resetting the whole TX ring.
  	 */
  	if (v & EMAC_TX_UNDERFLOW_INT) {
@@ -105,14 +105,14 @@ index a8d5899..eddf58a 100644
  		writel(readl(ioaddr + EMAC_TX_CTL1) | EMAC_TX_DMA_START,
  		       ioaddr + EMAC_TX_CTL1);
  		ret |= handle_tx;
-@@ -677,6 +707,9 @@ static void sun8i_dwmac_core_init(struct mac_device_info *hw,
+@@ -681,6 +711,9 @@ static void sun8i_dwmac_core_init(struct mac_device_info *hw,
  	void __iomem *ioaddr = hw->pcsr;
  	u32 v;
  
 +	/* TEST ONLY: TX COE above MTU 1500 (fix_features runs after open) */
-+	((struct stmmac_priv *)netdev_priv(dev))->plat->bugged_jumbo = !test_coe_jumbo;
++	priv->plat->bugged_jumbo = !test_coe_jumbo;
 +
- 	v = (8 << EMAC_BURSTLEN_SHIFT); /* burst len */
+ 	v = priv->plat->dma_cfg->pbl << EMAC_BURSTLEN_SHIFT;
  	writel(v, ioaddr + EMAC_BASIC_CTL1);
  
 diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac.h b/drivers/net/ethernet/stmicro/stmmac/stmmac.h
@@ -129,7 +129,7 @@ index e8376d9..dfbc1a8 100644
  	unsigned int dma_buf_sz;
  	/* largest frame of the MTU: with two VLAN tags and the FCS */
 diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-index 588d6cf..5d69d82 100644
+index 5e4a22b..3e0cf36 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 @@ -106,6 +106,84 @@ MODULE_PARM_DESC(pause, "Flow Control Pause Time (units of 512 bit times)");
