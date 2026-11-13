@@ -1,0 +1,124 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 17:00:00 +0000
+Subject: TEST ONLY: media: sunxi: sun50i-g2d: sweep the register windows at
+ probe
+
+For the item 15 proof job: log which G2D register windows hold a value
+and which TOP bits exist, once per module clock parent (the BSP uses
+pll-periph0-2x). Revert after the job.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/media/platform/sunxi/sun50i-g2d/sun50i-g2d.c
++++ b/drivers/media/platform/sunxi/sun50i-g2d/sun50i-g2d.c
+@@ -11,6 +11,7 @@
+  */
+ 
+ #include <linux/clk.h>
++#include <linux/clk-provider.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/interrupt.h>
+ #include <linux/io.h>
+@@ -1044,6 +1045,92 @@
+ 	return "ok";
+ }
+ 
++/*
++ * TEST ONLY (item 15 proof job): which register windows hold a written
++ * value and read anything back, and which TOP bits exist.
++ */
++static const struct {
++	const char *name;
++	u32 reg;	/* a size/coordinate register of the window */
++	u32 base;	/* first 64 words are read back */
++} g2d_sweep_win[] = {
++	{ "mixer", 0x0104, 0x0100 },
++	{ "bld", 0x0448, 0x0400 },
++	{ "v0", 0x0808, 0x0800 },
++	{ "ui0", 0x1008, 0x1000 },
++	{ "ui1", 0x1808, 0x1800 },
++	{ "ui2", 0x2008, 0x2000 },
++	{ "wb", 0x3004, 0x3000 },
++	{ "vsu", 0x8040, 0x8000 },
++	{ "rot", 0x28024, 0x28000 },
++	{ "gsu", 0x30040, 0x30000 },
++};
++
++static void g2d_selftest_sweep(struct g2d_dev *dev, const char *tag)
++{
++	char buf[384];
++	unsigned int i, j, nz, len = 0;
++	u32 got, top[4];
++
++	g2d_engines_reset(dev);
++	for (i = 0; i < ARRAY_SIZE(g2d_sweep_win); i++) {
++		bool held = g2d_reg_holds(dev, g2d_sweep_win[i].reg,
++					  0x00230011, &got);
++
++		g2d_write(dev, g2d_sweep_win[i].reg, 0);
++		for (nz = 0, j = 0; j < 64; j++)
++			nz += !!g2d_read(dev, g2d_sweep_win[i].base + 4 * j);
++		len += scnprintf(buf + len, sizeof(buf) - len, " %s %s/%u",
++				 g2d_sweep_win[i].name, held ? "hold" : "dead",
++				 nz);
++	}
++	g2d_write(dev, G2D_MIXER_INT, 0);
++
++	for (i = 0; i < 4; i++) {
++		u32 old = g2d_read(dev, 4 * i);
++
++		g2d_write(dev, 4 * i, 0xffffffff);
++		top[i] = g2d_read(dev, 4 * i);
++		g2d_write(dev, 4 * i, old);
++	}
++
++	dev_info(dev->dev,
++		 "selftest sweep %s: clk %s %lu top-bits %08x/%08x/%08x div %08x ip %08x%s\n",
++		 tag, __clk_get_name(clk_get_parent(dev->mod_clk)),
++		 clk_get_rate(dev->mod_clk), top[0], top[1], top[2], top[3],
++		 g2d_read(dev, G2D_TOP_IP_VERSION), buf);
++}
++
++/* TEST ONLY: sweep with the module clock on each parent (BSP: periph0-2x) */
++static void g2d_selftest_parents(struct g2d_dev *dev)
++{
++	struct clk_hw *hw = __clk_get_hw(dev->mod_clk);
++	struct clk *old = clk_get_parent(dev->mod_clk);
++	unsigned int i;
++
++	g2d_selftest_sweep(dev, "boot");
++	for (i = 0; hw && i < clk_hw_get_num_parents(hw); i++) {
++		struct clk_hw *phw = clk_hw_get_parent_by_index(hw, i);
++		struct clk *p;
++
++		if (!phw)
++			continue;
++		p = clk_hw_get_clk(phw, "g2d-selftest");
++		if (IS_ERR(p))
++			continue;
++		if (!clk_set_parent(dev->mod_clk, p) &&
++		    !clk_set_rate(dev->mod_clk, G2D_CLK_RATE))
++			g2d_selftest_sweep(dev, clk_hw_get_name(phw));
++		else
++			dev_info(dev->dev, "selftest sweep %s: parent not set\n",
++				 clk_hw_get_name(phw));
++		clk_put(p);
++	}
++	clk_set_parent(dev->mod_clk, old);
++	clk_set_rate(dev->mod_clk, G2D_CLK_RATE);
++	g2d_engines_reset(dev);
++}
++
+ static void g2d_selftest(struct g2d_dev *dev)
+ {
+ 	const unsigned int n = G2D_SELFTEST_SIZE * G2D_SELFTEST_SIZE;
+@@ -1293,6 +1380,7 @@
+ 	v4l2_info(&dev->v4l2_dev, "G2D IP version %08x, module clock %lu Hz\n",
+ 		  g2d_read(dev, G2D_TOP_IP_VERSION), clk_get_rate(dev->mod_clk));
+ 	g2d_selftest(dev);
++	g2d_selftest_parents(dev);
+ 	pm_runtime_put(dev->dev);
+ 
+ 	ret = video_register_device(vfd, VFL_TYPE_VIDEO, 0);

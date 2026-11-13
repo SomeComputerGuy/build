@@ -1,0 +1,248 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 17:00:00 +0000
+Subject: media: sun8i-rotate: Add the Allwinner H616 G2D rotation engine
+
+The H616 G2D holds the DE2 rotation core at offset 0x28000, behind a
+TOP block that gates and resets it (bit 1 of the SCLK/HCLK gate and AHB
+reset registers at 0x0-0x8). The H616 manual lists only flip and
+0/90/180/270 rotation for the G2D, layers up to 2048x2048. Its mixer
+registers do not hold written values on the Orange Pi Zero2.
+
+Add a variant for it: map the whole G2D, use the core at 0x28000, open
+the TOP gates after the reset is released, take the optional MBUS
+clock, cap the size at 2048x2048 and leave the burst length at 0 as the
+Allwinner G2D driver does.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/media/platform/sunxi/sun8i-rotate/sun8i-rotate.h
++++ b/drivers/media/platform/sunxi/sun8i-rotate/sun8i-rotate.h
+@@ -18,6 +18,13 @@
+ 
+ #define ROTATE_NAME		"sun8i-rotate"
+ 
++/* H616 G2D: TOP block at 0, rotation core at ROTATE_G2D_ROT_OFFSET */
++#define ROTATE_G2D_TOP_SCLK_GATE	0x00
++#define ROTATE_G2D_TOP_HCLK_GATE	0x04
++#define ROTATE_G2D_TOP_AHB_RESET	0x08
++#define ROTATE_G2D_TOP_ROT			BIT(1)
++#define ROTATE_G2D_ROT_OFFSET		0x28000
++
+ #define ROTATE_GLB_CTL			0x00
+ #define ROTATE_GLB_CTL_START			BIT(31)
+ #define ROTATE_GLB_CTL_RESET			BIT(30)
+@@ -101,6 +108,13 @@
+ #define ROTATE_MAX_WIDTH	4096U
+ #define ROTATE_MAX_HEIGHT	4096U
+ 
++struct rotate_variant {
++	unsigned int	max_width;
++	unsigned int	max_height;
++	/* rotation core inside a G2D block, gated by the G2D TOP registers */
++	bool		g2d_top;
++};
++
+ struct rotate_ctx {
+ 	struct v4l2_fh		fh;
+ 	struct rotate_dev	*dev;
+@@ -124,10 +138,14 @@
+ 	/* Device file mutex */
+ 	struct mutex		dev_mutex;
+ 
++	const struct rotate_variant *variant;
++
+ 	void __iomem		*base;
++	void __iomem		*top;
+ 
+ 	struct clk		*bus_clk;
+ 	struct clk		*mod_clk;
++	struct clk		*mbus_clk;
+ 
+ 	struct reset_control	*rstc;
+ };
+--- a/drivers/media/platform/sunxi/sun8i-rotate/sun8i_rotate.c
++++ b/drivers/media/platform/sunxi/sun8i-rotate/sun8i_rotate.c
+@@ -12,6 +12,7 @@
+ #include <linux/module.h>
+ #include <linux/platform_device.h>
+ #include <linux/pm_runtime.h>
++#include <linux/property.h>
+ #include <linux/reset.h>
+ 
+ #include <media/v4l2-device.h>
+@@ -77,10 +78,13 @@
+ 	if (ctx->vflip)
+ 		val |= ROTATE_GLB_CTL_VFLIP;
+ 	val |= ROTATE_GLB_CTL_ROTATION(ctx->rotate / 90);
+-	if (ctx->rotate != 90 && ctx->rotate != 270)
+-		val |= ROTATE_GLB_CTL_BURST_LEN(ROTATE_BURST_64);
+-	else
+-		val |= ROTATE_GLB_CTL_BURST_LEN(ROTATE_BURST_8);
++	/* the G2D BSP leaves the burst length at 0 */
++	if (!dev->variant->g2d_top) {
++		if (ctx->rotate != 90 && ctx->rotate != 270)
++			val |= ROTATE_GLB_CTL_BURST_LEN(ROTATE_BURST_64);
++		else
++			val |= ROTATE_GLB_CTL_BURST_LEN(ROTATE_BURST_8);
++	}
+ 	rotate_write(dev, ROTATE_GLB_CTL, val);
+ 
+ 	fmt = rotate_find_format(ctx->src_fmt.pixelformat);
+@@ -234,6 +238,7 @@
+ static int rotate_enum_framesizes(struct file *file, void *priv,
+ 				  struct v4l2_frmsizeenum *fsize)
+ {
++	struct rotate_dev *dev = video_drvdata(file);
+ 	const struct rotate_format *fmt;
+ 
+ 	if (fsize->index != 0)
+@@ -246,8 +251,8 @@
+ 	fsize->type = V4L2_FRMSIZE_TYPE_STEPWISE;
+ 	fsize->stepwise.min_width = ROTATE_MIN_WIDTH;
+ 	fsize->stepwise.min_height = ROTATE_MIN_HEIGHT;
+-	fsize->stepwise.max_width = ROTATE_MAX_WIDTH;
+-	fsize->stepwise.max_height = ROTATE_MAX_HEIGHT;
++	fsize->stepwise.max_width = dev->variant->max_width;
++	fsize->stepwise.max_height = dev->variant->max_height;
+ 	fsize->stepwise.step_width = fmt->hsub;
+ 	fsize->stepwise.step_height = fmt->vsub;
+ 
+@@ -315,6 +320,8 @@
+ static int rotate_try_fmt_vid_out(struct file *file, void *priv,
+ 				  struct v4l2_format *f)
+ {
++	struct rotate_dev *dev = video_drvdata(file);
++
+ 	if (!rotate_find_format(f->fmt.pix.pixelformat))
+ 		f->fmt.pix.pixelformat = V4L2_PIX_FMT_ARGB32;
+ 
+@@ -323,10 +330,10 @@
+ 	if (f->fmt.pix.height < ROTATE_MIN_HEIGHT)
+ 		f->fmt.pix.height = ROTATE_MIN_HEIGHT;
+ 
+-	if (f->fmt.pix.width > ROTATE_MAX_WIDTH)
+-		f->fmt.pix.width = ROTATE_MAX_WIDTH;
+-	if (f->fmt.pix.height > ROTATE_MAX_HEIGHT)
+-		f->fmt.pix.height = ROTATE_MAX_HEIGHT;
++	if (f->fmt.pix.width > dev->variant->max_width)
++		f->fmt.pix.width = dev->variant->max_width;
++	if (f->fmt.pix.height > dev->variant->max_height)
++		f->fmt.pix.height = dev->variant->max_height;
+ 
+ 	f->fmt.pix.field = V4L2_FIELD_NONE;
+ 
+@@ -740,6 +747,9 @@
+ 
+ 	dev->vfd = rotate_video_device;
+ 	dev->dev = &pdev->dev;
++	dev->variant = device_get_match_data(&pdev->dev);
++	if (!dev->variant)
++		return -EINVAL;
+ 
+ 	irq = platform_get_irq(pdev, 0);
+ 	if (irq <= 0)
+@@ -757,6 +767,11 @@
+ 	if (IS_ERR(dev->base))
+ 		return PTR_ERR(dev->base);
+ 
++	if (dev->variant->g2d_top) {
++		dev->top = dev->base;
++		dev->base += ROTATE_G2D_ROT_OFFSET;
++	}
++
+ 	dev->bus_clk = devm_clk_get(dev->dev, "bus");
+ 	if (IS_ERR(dev->bus_clk)) {
+ 		dev_err(dev->dev, "Failed to get bus clock\n");
+@@ -771,6 +786,13 @@
+ 		return PTR_ERR(dev->mod_clk);
+ 	}
+ 
++	dev->mbus_clk = devm_clk_get_optional(dev->dev, "mbus");
++	if (IS_ERR(dev->mbus_clk)) {
++		dev_err(dev->dev, "Failed to get mbus clock\n");
++
++		return PTR_ERR(dev->mbus_clk);
++	}
++
+ 	dev->rstc = devm_reset_control_get(dev->dev, NULL);
+ 	if (IS_ERR(dev->rstc)) {
+ 		dev_err(dev->dev, "Failed to get reset control\n");
+@@ -858,15 +880,31 @@
+ 		goto err_bus_clk;
+ 	}
+ 
++	ret = clk_prepare_enable(dev->mbus_clk);
++	if (ret) {
++		dev_err(dev->dev, "Failed to enable mbus clock\n");
++
++		goto err_mod_clk;
++	}
++
+ 	ret = reset_control_deassert(dev->rstc);
+ 	if (ret) {
+ 		dev_err(dev->dev, "Failed to apply reset\n");
+ 
+-		goto err_mod_clk;
++		goto err_mbus_clk;
++	}
++
++	if (dev->top) {
++		/* clock and release the rotation engine, as the G2D BSP does */
++		writel(ROTATE_G2D_TOP_ROT, dev->top + ROTATE_G2D_TOP_SCLK_GATE);
++		writel(ROTATE_G2D_TOP_ROT, dev->top + ROTATE_G2D_TOP_HCLK_GATE);
++		writel(ROTATE_G2D_TOP_ROT, dev->top + ROTATE_G2D_TOP_AHB_RESET);
+ 	}
+ 
+ 	return 0;
+ 
++err_mbus_clk:
++	clk_disable_unprepare(dev->mbus_clk);
+ err_mod_clk:
+ 	clk_disable_unprepare(dev->mod_clk);
+ err_bus_clk:
+@@ -879,16 +917,42 @@
+ {
+ 	struct rotate_dev *dev = dev_get_drvdata(device);
+ 
++	if (dev->top) {
++		writel(0, dev->top + ROTATE_G2D_TOP_AHB_RESET);
++		writel(0, dev->top + ROTATE_G2D_TOP_HCLK_GATE);
++		writel(0, dev->top + ROTATE_G2D_TOP_SCLK_GATE);
++	}
++
+ 	reset_control_assert(dev->rstc);
+ 
++	clk_disable_unprepare(dev->mbus_clk);
+ 	clk_disable_unprepare(dev->mod_clk);
+ 	clk_disable_unprepare(dev->bus_clk);
+ 
+ 	return 0;
+ }
+ 
++static const struct rotate_variant sun8i_a83t_rotate_variant = {
++	.max_width	= ROTATE_MAX_WIDTH,
++	.max_height	= ROTATE_MAX_HEIGHT,
++};
++
++/* H616 manual 4.3: layers up to 2048x2048 */
++static const struct rotate_variant sun50i_h616_g2d_variant = {
++	.max_width	= 2048,
++	.max_height	= 2048,
++	.g2d_top	= true,
++};
++
+ static const struct of_device_id rotate_dt_match[] = {
+-	{ .compatible = "allwinner,sun8i-a83t-de2-rotate" },
++	{
++		.compatible = "allwinner,sun8i-a83t-de2-rotate",
++		.data = &sun8i_a83t_rotate_variant,
++	},
++	{
++		.compatible = "allwinner,sun50i-h616-g2d",
++		.data = &sun50i_h616_g2d_variant,
++	},
+ 	{ /* sentinel */ }
+ };
+ MODULE_DEVICE_TABLE(of, rotate_dt_match);
