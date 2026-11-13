@@ -1,0 +1,229 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 12:00:00 +0000
+Subject: crypto: ecdsa - Pass signing through the x962 and p1363 templates
+
+The sig API has sign and set_priv_key, and the asymmetric key code calls
+them for "x962(ecdsa-nist-*)" and "p1363(ecdsa-nist-*)", but the two
+templates only pass verification to the ECDSA implementation below them.
+Pass set_priv_key and sign through too, and encode the r and s the
+implementation returns (struct ecdsa_raw_sig, as verify takes it): r || s
+for P1363, an ECDSA-Sig-Value for X9.62. ecdsa-generic cannot sign, so this
+is for implementations that can.
+
+Add ecc_digits_to_bytes(), the reverse of ecc_digits_from_bytes().
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ crypto/ecc.c                  | 10 ++++++
+ crypto/ecdsa-p1363.c          | 33 +++++++++++++++++++
+ crypto/ecdsa-x962.c           | 61 +++++++++++++++++++++++++++++++++++
+ include/crypto/internal/ecc.h | 12 +++++++
+ 4 files changed, 116 insertions(+)
+
+diff --git a/crypto/ecc.c b/crypto/ecc.c
+index d4d05d8..54ca43c 100644
+--- a/crypto/ecc.c
++++ b/crypto/ecc.c
+@@ -90,6 +90,16 @@ void ecc_digits_from_bytes(const u8 *in, unsigned int nbytes,
+ }
+ EXPORT_SYMBOL(ecc_digits_from_bytes);
+ 
++void ecc_digits_to_bytes(const u64 *in, unsigned int ndigits,
++			 u8 *out, unsigned int nbytes)
++{
++	unsigned int i;
++
++	for (i = 0; i < nbytes; i++)
++		out[nbytes - 1 - i] = i / 8 < ndigits ? in[i / 8] >> (8 * (i % 8)) : 0;
++}
++EXPORT_SYMBOL(ecc_digits_to_bytes);
++
+ struct ecc_point *ecc_alloc_point(unsigned int ndigits)
+ {
+ 	struct ecc_point *p;
+diff --git a/crypto/ecdsa-p1363.c b/crypto/ecdsa-p1363.c
+index e0c55c6..4f66d67 100644
+--- a/crypto/ecdsa-p1363.c
++++ b/crypto/ecdsa-p1363.c
+@@ -35,6 +35,29 @@ static int ecdsa_p1363_verify(struct crypto_sig *tfm,
+ 	return crypto_sig_verify(ctx->child, &sig, sizeof(sig), digest, dlen);
+ }
+ 
++static int ecdsa_p1363_sign(struct crypto_sig *tfm,
++			    const void *src, unsigned int slen,
++			    void *dst, unsigned int dlen)
++{
++	struct ecdsa_p1363_ctx *ctx = crypto_sig_ctx(tfm);
++	unsigned int keylen = DIV_ROUND_UP_POW2(crypto_sig_keysize(ctx->child),
++						BITS_PER_BYTE);
++	unsigned int ndigits = DIV_ROUND_UP_POW2(keylen, sizeof(u64));
++	struct ecdsa_raw_sig sig;
++	int err;
++
++	if (dlen < 2 * keylen)
++		return -EOVERFLOW;
++
++	err = crypto_sig_sign(ctx->child, src, slen, &sig, sizeof(sig));
++	if (err < 0)
++		return err;
++
++	ecc_digits_to_bytes(sig.r, ndigits, dst, keylen);
++	ecc_digits_to_bytes(sig.s, ndigits, dst + keylen, keylen);
++	return 2 * keylen;
++}
++
+ static unsigned int ecdsa_p1363_key_size(struct crypto_sig *tfm)
+ {
+ 	struct ecdsa_p1363_ctx *ctx = crypto_sig_ctx(tfm);
+@@ -65,6 +88,14 @@ static int ecdsa_p1363_set_pub_key(struct crypto_sig *tfm,
+ 	return crypto_sig_set_pubkey(ctx->child, key, keylen);
+ }
+ 
++static int ecdsa_p1363_set_priv_key(struct crypto_sig *tfm,
++				    const void *key, unsigned int keylen)
++{
++	struct ecdsa_p1363_ctx *ctx = crypto_sig_ctx(tfm);
++
++	return crypto_sig_set_privkey(ctx->child, key, keylen);
++}
++
+ static int ecdsa_p1363_init_tfm(struct crypto_sig *tfm)
+ {
+ 	struct sig_instance *inst = sig_alg_instance(tfm);
+@@ -136,11 +167,13 @@ static int ecdsa_p1363_create(struct crypto_template *tmpl, struct rtattr **tb)
+ 	inst->alg.init = ecdsa_p1363_init_tfm;
+ 	inst->alg.exit = ecdsa_p1363_exit_tfm;
+ 
++	inst->alg.sign = ecdsa_p1363_sign;
+ 	inst->alg.verify = ecdsa_p1363_verify;
+ 	inst->alg.key_size = ecdsa_p1363_key_size;
+ 	inst->alg.max_size = ecdsa_p1363_max_size;
+ 	inst->alg.digest_size = ecdsa_p1363_digest_size;
+ 	inst->alg.set_pub_key = ecdsa_p1363_set_pub_key;
++	inst->alg.set_priv_key = ecdsa_p1363_set_priv_key;
+ 
+ 	inst->free = ecdsa_p1363_free;
+ 
+diff --git a/crypto/ecdsa-x962.c b/crypto/ecdsa-x962.c
+index ee71594..c1ff7ca 100644
+--- a/crypto/ecdsa-x962.c
++++ b/crypto/ecdsa-x962.c
+@@ -6,6 +6,7 @@
+  * Copyright (c) 2024 Intel Corporation
+  */
+ 
++#include <linux/asn1.h>
+ #include <linux/asn1_decoder.h>
+ #include <linux/err.h>
+ #include <linux/module.h>
+@@ -92,6 +93,56 @@ static int ecdsa_x962_verify(struct crypto_sig *tfm,
+ 				 digest, dlen);
+ }
+ 
++/* DER INTEGER of @v, @keylen bytes at most plus a sign byte */
++static unsigned int ecdsa_x962_put_int(u8 *p, const u64 *v,
++				       unsigned int ndigits, unsigned int keylen)
++{
++	u8 buf[ECC_MAX_BYTES + 1];
++	unsigned int i, len;
++
++	buf[0] = 0;
++	ecc_digits_to_bytes(v, ndigits, buf + 1, keylen);
++	for (i = 0; i < keylen && !buf[i] && !(buf[i + 1] & 0x80); i++)
++		;
++	len = keylen + 1 - i;
++	p[0] = ASN1_INT;
++	p[1] = len;
++	memcpy(p + 2, buf + i, len);
++	return 2 + len;
++}
++
++static int ecdsa_x962_sign(struct crypto_sig *tfm,
++			   const void *src, unsigned int slen,
++			   void *dst, unsigned int dlen)
++{
++	struct ecdsa_x962_ctx *ctx = crypto_sig_ctx(tfm);
++	unsigned int keylen = DIV_ROUND_UP_POW2(crypto_sig_keysize(ctx->child),
++						BITS_PER_BYTE);
++	unsigned int ndigits = DIV_ROUND_UP_POW2(keylen, sizeof(u64));
++	u8 ints[2 * (2 + ECC_MAX_BYTES + 1)];
++	struct ecdsa_raw_sig sig;
++	unsigned int len, hdr;
++	u8 *p = dst;
++	int err;
++
++	err = crypto_sig_sign(ctx->child, src, slen, &sig, sizeof(sig));
++	if (err < 0)
++		return err;
++
++	len = ecdsa_x962_put_int(ints, sig.r, ndigits, keylen);
++	len += ecdsa_x962_put_int(ints + len, sig.s, ndigits, keylen);
++	hdr = len < 128 ? 2 : 3;
++	if (dlen < hdr + len)
++		return -EOVERFLOW;
++
++	*p++ = (ASN1_CONS << 5) | ASN1_SEQ;
++	if (len >= 128)
++		*p++ = 0x81;
++	*p++ = len;
++	memcpy(p, ints, len);
++	return hdr + len;
++}
++
+ static unsigned int ecdsa_x962_key_size(struct crypto_sig *tfm)
+ {
+ 	struct ecdsa_x962_ctx *ctx = crypto_sig_ctx(tfm);
+@@ -142,6 +193,14 @@ static int ecdsa_x962_set_pub_key(struct crypto_sig *tfm,
+ 	return crypto_sig_set_pubkey(ctx->child, key, keylen);
+ }
+ 
++static int ecdsa_x962_set_priv_key(struct crypto_sig *tfm,
++				   const void *key, unsigned int keylen)
++{
++	struct ecdsa_x962_ctx *ctx = crypto_sig_ctx(tfm);
++
++	return crypto_sig_set_privkey(ctx->child, key, keylen);
++}
++
+ static int ecdsa_x962_init_tfm(struct crypto_sig *tfm)
+ {
+ 	struct sig_instance *inst = sig_alg_instance(tfm);
+@@ -213,11 +272,13 @@ static int ecdsa_x962_create(struct crypto_template *tmpl, struct rtattr **tb)
+ 	inst->alg.init = ecdsa_x962_init_tfm;
+ 	inst->alg.exit = ecdsa_x962_exit_tfm;
+ 
++	inst->alg.sign = ecdsa_x962_sign;
+ 	inst->alg.verify = ecdsa_x962_verify;
+ 	inst->alg.key_size = ecdsa_x962_key_size;
+ 	inst->alg.max_size = ecdsa_x962_max_size;
+ 	inst->alg.digest_size = ecdsa_x962_digest_size;
+ 	inst->alg.set_pub_key = ecdsa_x962_set_pub_key;
++	inst->alg.set_priv_key = ecdsa_x962_set_priv_key;
+ 
+ 	inst->free = ecdsa_x962_free;
+ 
+diff --git a/include/crypto/internal/ecc.h b/include/crypto/internal/ecc.h
+index d67fe13..7d8860c 100644
+--- a/include/crypto/internal/ecc.h
++++ b/include/crypto/internal/ecc.h
+@@ -82,6 +82,18 @@ static inline void ecc_swap_digits(const void *in, u64 *out, unsigned int ndigit
+ void ecc_digits_from_bytes(const u8 *in, unsigned int nbytes,
+ 			   u64 *out, unsigned int ndigits);
+ 
++/**
++ * ecc_digits_to_bytes() - Write a digits array as a big endian byte array
++ * @in:       Input digits array
++ * @ndigits:  Number of digits in the input array
++ * @out:      Output byte array
++ * @nbytes:   Size of the output byte array
++ *
++ * The output is zero padded on the left; digits beyond @nbytes are dropped.
++ */
++void ecc_digits_to_bytes(const u64 *in, unsigned int ndigits,
++			 u8 *out, unsigned int nbytes);
++
+ /**
+  * ecc_is_key_valid() - Validate a given ECDH private key
+  *

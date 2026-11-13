@@ -1,0 +1,191 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 12:00:00 +0000
+Subject: KEYS: pkcs8 - Parse EC private keys
+
+The PKCS#8 parser takes RSA keys only, so an ECDSA key cannot be loaded
+for keyctl pkey_sign, although public_key.c already signs with
+"x962(ecdsa-nist-*)" and "p1363(ecdsa-nist-*)" when the key is private.
+Take id-ecPublicKey keys on the NIST curves the X.509 parser knows, name
+the algorithm from the namedCurve parameter as it does, and pass the
+private key of the ECPrivateKey (RFC 5915) inside, the big endian scalar.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ crypto/asymmetric_keys/Makefile       |  4 +-
+ crypto/asymmetric_keys/ecprivkey.asn1 | 13 +++++
+ crypto/asymmetric_keys/pkcs8.asn1     |  2 +-
+ crypto/asymmetric_keys/pkcs8_parser.c | 80 +++++++++++++++++++++++++--
+ 4 files changed, 93 insertions(+), 6 deletions(-)
+ create mode 100644 crypto/asymmetric_keys/ecprivkey.asn1
+
+diff --git a/crypto/asymmetric_keys/Makefile b/crypto/asymmetric_keys/Makefile
+index bc65d3b..a3e8403 100644
+--- a/crypto/asymmetric_keys/Makefile
++++ b/crypto/asymmetric_keys/Makefile
+@@ -40,12 +40,14 @@ $(obj)/x509_akid.asn1.o: $(obj)/x509_akid.asn1.c $(obj)/x509_akid.asn1.h
+ obj-$(CONFIG_PKCS8_PRIVATE_KEY_PARSER) += pkcs8_key_parser.o
+ pkcs8_key_parser-y := \
+ 	pkcs8.asn1.o \
++	ecprivkey.asn1.o \
+ 	pkcs8_parser.o
+ 
+-$(obj)/pkcs8_parser.o: $(obj)/pkcs8.asn1.h
++$(obj)/pkcs8_parser.o: $(obj)/pkcs8.asn1.h $(obj)/ecprivkey.asn1.h
+ $(obj)/pkcs8-asn1.o: $(obj)/pkcs8.asn1.c $(obj)/pkcs8.asn1.h
+ 
+ clean-files	+= pkcs8.asn1.c pkcs8.asn1.h
++clean-files	+= ecprivkey.asn1.c ecprivkey.asn1.h
+ 
+ #
+ # PKCS#7 message handling
+diff --git a/crypto/asymmetric_keys/ecprivkey.asn1 b/crypto/asymmetric_keys/ecprivkey.asn1
+new file mode 100644
+index 0000000..3ece3d8
+--- /dev/null
++++ b/crypto/asymmetric_keys/ecprivkey.asn1
+@@ -0,0 +1,13 @@
++-- SPDX-License-Identifier: BSD-3-Clause
++--
++-- Copyright (C) 2010 IETF Trust and the persons identified as authors
++-- of the code
++--
++-- https://www.rfc-editor.org/rfc/rfc5915#section-3
++--
++ECPrivateKey ::= SEQUENCE {
++	version		INTEGER ({ ecpriv_note_version }),
++	privateKey	OCTET STRING ({ ecpriv_note_key }),
++	parameters	[0] ANY OPTIONAL,
++	publicKey	[1] ANY OPTIONAL
++}
+diff --git a/crypto/asymmetric_keys/pkcs8.asn1 b/crypto/asymmetric_keys/pkcs8.asn1
+index a2a8af2..60b5cf7 100644
+--- a/crypto/asymmetric_keys/pkcs8.asn1
++++ b/crypto/asymmetric_keys/pkcs8.asn1
+@@ -26,5 +26,5 @@ Attribute ::= ANY
+ 
+ AlgorithmIdentifier ::= SEQUENCE {
+ 	algorithm   OBJECT IDENTIFIER ({ pkcs8_note_OID }),
+-	parameters  ANY OPTIONAL
++	parameters  ANY OPTIONAL ({ pkcs8_note_params })
+ }
+diff --git a/crypto/asymmetric_keys/pkcs8_parser.c b/crypto/asymmetric_keys/pkcs8_parser.c
+index 9dd1c18..1b290c4 100644
+--- a/crypto/asymmetric_keys/pkcs8_parser.c
++++ b/crypto/asymmetric_keys/pkcs8_parser.c
+@@ -1,5 +1,5 @@
+ // SPDX-License-Identifier: GPL-2.0-or-later
+-/* PKCS#8 Private Key parser [RFC 5208].
++/* PKCS#8 Private Key parser [RFC 5208], RSA and EC [RFC 5915] keys.
+  *
+  * Copyright (C) 2016 Red Hat, Inc. All Rights Reserved.
+  * Written by David Howells (dhowells@redhat.com)
+@@ -16,6 +16,7 @@
+ #include <keys/asymmetric-parser.h>
+ #include <crypto/public_key.h>
+ #include "pkcs8.asn1.h"
++#include "ecprivkey.asn1.h"
+ 
+ struct pkcs8_parse_context {
+ 	struct public_key *pub;
+@@ -24,6 +25,8 @@ struct pkcs8_parse_context {
+ 	enum OID	algo_oid;		/* Algorithm OID */
+ 	u32		key_size;
+ 	const void	*key;
++	const void	*params;		/* Algorithm parameters */
++	u32		params_size;
+ };
+ 
+ /*
+@@ -69,11 +72,72 @@ int pkcs8_note_algo(void *context, size_t hdrlen,
+ 		    const void *value, size_t vlen)
+ {
+ 	struct pkcs8_parse_context *ctx = context;
+-
+-	if (ctx->last_oid != OID_rsaEncryption)
++	enum OID oid;
++
++	ctx->algo_oid = ctx->last_oid;
++	switch (ctx->last_oid) {
++	case OID_rsaEncryption:
++		ctx->pub->pkey_algo = "rsa";
++		return 0;
++	case OID_id_ecPublicKey:
++		if (!ctx->params ||
++		    parse_OID(ctx->params, ctx->params_size, &oid) != 0)
++			return -EBADMSG;
++		switch (oid) {
++		case OID_id_prime192v1:
++			ctx->pub->pkey_algo = "ecdsa-nist-p192";
++			return 0;
++		case OID_id_prime256v1:
++			ctx->pub->pkey_algo = "ecdsa-nist-p256";
++			return 0;
++		case OID_id_ansip384r1:
++			ctx->pub->pkey_algo = "ecdsa-nist-p384";
++			return 0;
++		case OID_id_ansip521r1:
++			ctx->pub->pkey_algo = "ecdsa-nist-p521";
++			return 0;
++		default:
++			return -ENOPKG;
++		}
++	default:
+ 		return -ENOPKG;
++	}
++}
++
++/*
++ * Note the algorithm parameters (the curve of an EC key).
++ */
++int pkcs8_note_params(void *context, size_t hdrlen,
++		      unsigned char tag,
++		      const void *value, size_t vlen)
++{
++	struct pkcs8_parse_context *ctx = context;
+ 
+-	ctx->pub->pkey_algo = "rsa";
++	ctx->params = value - hdrlen;
++	ctx->params_size = vlen + hdrlen;
++	return 0;
++}
++
++/*
++ * ECPrivateKey [RFC 5915]: version 1 and the private key.
++ */
++int ecpriv_note_version(void *context, size_t hdrlen,
++			unsigned char tag,
++			const void *value, size_t vlen)
++{
++	if (vlen != 1 || ((const u8 *)value)[0] != 1)
++		return -EBADMSG;
++	return 0;
++}
++
++int ecpriv_note_key(void *context, size_t hdrlen,
++		    unsigned char tag,
++		    const void *value, size_t vlen)
++{
++	struct pkcs8_parse_context *ctx = context;
++
++	ctx->key = value;
++	ctx->key_size = vlen;
+ 	return 0;
+ }
+ 
+@@ -114,6 +178,14 @@ static struct public_key *pkcs8_parse(const void *data, size_t datalen)
+ 	if (ret < 0)
+ 		goto error_decode;
+ 
++	/* EC: the key is the private key of an ECPrivateKey, big endian */
++	if (ctx.algo_oid == OID_id_ecPublicKey) {
++		ret = asn1_ber_decoder(&ecprivkey_decoder, &ctx, ctx.key,
++				       ctx.key_size);
++		if (ret < 0)
++			goto error_decode;
++	}
++
+ 	ret = -ENOMEM;
+ 	pub = ctx.pub;
+ 	pub->key = kmemdup(ctx.key, ctx.key_size, GFP_KERNEL);
