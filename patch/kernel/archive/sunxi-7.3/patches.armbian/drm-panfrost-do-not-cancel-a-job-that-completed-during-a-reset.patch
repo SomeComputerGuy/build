@@ -1,7 +1,7 @@
 From 5849511e6da48905bb299eb94d7d6ec5a5e51309 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 08:39:49 +0000
-Subject: [PATCH 08/11] drm/panfrost: Don't cancel a job that completed during
+Subject: [PATCH 08/13] drm/panfrost: Don't cancel a job that completed during
  a reset
 
 panfrost_reset() stops the schedulers, which detaches them from the done
@@ -31,7 +31,6 @@ Fixes: 03877d621db0 ("drm/scheduler: mark jobs without fence as canceled")
 Cc: stable@vger.kernel.org
 Reported-by: Sashiko <sashiko-bot@kernel.org>
 Closes: https://lore.kernel.org/all/sashiko-outbox-206581@kernel.org/
-Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/panfrost/panfrost_job.c | 9 ++++++---

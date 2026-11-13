@@ -1,7 +1,7 @@
 From 9aa43e995032070ad61171635ce9a6518bc314f4 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 04:59:56 +0000
-Subject: [PATCH 06/11] drm/panfrost: Give back the pages of a heap chunk that
+Subject: [PATCH 06/13] drm/panfrost: Give back the pages of a heap chunk that
  failed to map
 
 panfrost_mmu_map_fault_addr() grows a heap BO by one 2 MB chunk per
@@ -33,7 +33,6 @@ a chunk; the larger-folio case is from reading the code.
 
 Fixes: b49c35ba0ce1 ("drm/panfrost: Fix a page leak in panfrost_mmu_map_fault_addr() when THP is on")
 Cc: stable@vger.kernel.org
-Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/panfrost/panfrost_mmu.c | 51 +++++++++++++++++++++++--

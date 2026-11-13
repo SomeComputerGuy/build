@@ -1,0 +1,100 @@
+From d3d005172cb23cfef788972e17fd7a9626510ad0 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 03:17:23 +0000
+Subject: [PATCH 09/13] drm/panfrost: Drop the cycle counter only for a job
+ that holds it
+
+panfrost_job_hw_submit() takes a cycle counter reference only when it
+starts the job, which it does not while a reset is pending, but the job
+is put in pfdev->jobs[] either way. panfrost_reset() then drops a
+reference for every job in pfdev->jobs[] that wants the counter, and
+use_count goes below zero. The same happens for a job that was stopped
+(its reference dropped at dequeue) and resubmitted while a reset was
+pending: is_profiled is still set from its first run.
+
+The GPU reset that follows hides this, panfrost_gpu_soft_reset() WARNs
+and sets use_count back to 0. Without a reset (next patches) the counter
+stays wrong, and panfrost_cycle_counter_get() no longer starts it.
+
+Record in the job whether it holds a reference, and drop it only then.
+
+Found by code review (Sashiko). Not reproduced.
+
+Fixes: f11b0417eec2 ("drm/panfrost: Add fdinfo support GPU load metrics")
+Cc: stable@vger.kernel.org
+Reported-by: Sashiko <sashiko-bot@kernel.org>
+Closes: https://lore.kernel.org/all/sashiko-outbox-210891@kernel.org/
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/panfrost/panfrost_job.c | 19 +++++++++++++------
+ drivers/gpu/drm/panfrost/panfrost_job.h |  2 ++
+ 2 files changed, 15 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
+index b813493..7645f19 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_job.c
++++ b/drivers/gpu/drm/panfrost/panfrost_job.c
+@@ -158,6 +158,14 @@ panfrost_get_job_chain_flag(const struct panfrost_job *job)
+ 	return (f->seqno & 1) ? JS_CONFIG_JOB_CHAIN_FLAG : 0;
+ }
+ 
++static void panfrost_job_put_cycle_counter(struct panfrost_job *job)
++{
++	if (job->cycle_counter_ref) {
++		panfrost_cycle_counter_put(job->pfdev);
++		job->cycle_counter_ref = false;
++	}
++}
++
+ static struct panfrost_job *
+ panfrost_dequeue_job(struct panfrost_device *pfdev, int slot)
+ {
+@@ -172,8 +180,7 @@ panfrost_dequeue_job(struct panfrost_device *pfdev, int slot)
+ 			panfrost_cycle_counter_read(pfdev) - job->start_cycles;
+ 	}
+ 
+-	if (job->requirements & PANFROST_JD_REQ_CYCLE_COUNT || job->is_profiled)
+-		panfrost_cycle_counter_put(pfdev);
++	panfrost_job_put_cycle_counter(job);
+ 
+ 	pfdev->jobs[slot][0] = pfdev->jobs[slot][1];
+ 	pfdev->jobs[slot][1] = NULL;
+@@ -257,8 +264,10 @@ static int panfrost_job_hw_submit(struct panfrost_job *job, int js)
+ 		job->is_profiled = pfdev->profile_mode;
+ 
+ 		if (job->requirements & PANFROST_JD_REQ_CYCLE_COUNT ||
+-		    job->is_profiled)
++		    job->is_profiled) {
+ 			panfrost_cycle_counter_get(pfdev);
++			job->cycle_counter_ref = true;
++		}
+ 
+ 		if (job->is_profiled) {
+ 			job->start_time = ktime_get();
+@@ -746,9 +755,7 @@ panfrost_reset(struct panfrost_device *pfdev,
+ 			pfdev->jobs[i][pfdev->jobs[i][0] ? 1 : 0] = evicted[i];
+ 
+ 		for (j = 0; j < ARRAY_SIZE(pfdev->jobs[0]) && pfdev->jobs[i][j]; j++) {
+-			if (pfdev->jobs[i][j]->requirements & PANFROST_JD_REQ_CYCLE_COUNT ||
+-			    pfdev->jobs[i][j]->is_profiled)
+-				panfrost_cycle_counter_put(pfdev->jobs[i][j]->pfdev);
++			panfrost_job_put_cycle_counter(pfdev->jobs[i][j]);
+ 			pm_runtime_put_noidle(pfdev->base.dev);
+ 			panfrost_devfreq_record_idle(&pfdev->pfdevfreq);
+ 		}
+diff --git a/drivers/gpu/drm/panfrost/panfrost_job.h b/drivers/gpu/drm/panfrost/panfrost_job.h
+index c3f57e4..ad22d07 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_job.h
++++ b/drivers/gpu/drm/panfrost/panfrost_job.h
+@@ -36,6 +36,8 @@ struct panfrost_job {
+ 
+ 	struct panfrost_engine_usage *engine_usage;
+ 	bool is_profiled;
++	/* Holds a reference on the cycle counter */
++	bool cycle_counter_ref;
+ 	ktime_t start_time;
+ 	u64 start_cycles;
+ };
+-- 
+2.55.0
+

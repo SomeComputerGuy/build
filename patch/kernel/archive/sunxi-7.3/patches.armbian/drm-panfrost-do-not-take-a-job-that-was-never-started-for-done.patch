@@ -1,0 +1,85 @@
+From 2a4ca90c0c0fa6c138c51af1d5b591abb9906ae6 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 03:17:39 +0000
+Subject: [PATCH 10/13] drm/panfrost: Don't take a job that was never started
+ for done
+
+While a reset is pending, panfrost_job_hw_submit() puts the job in
+pfdev->jobs[] but does not start it, so that the reset resubmits it.
+reset.pending is set before panfrost_reset() masks the job interrupt,
+by a timeout or a job fault. If such a job waits behind a running one
+and that job completes in the window, panfrost_jm_handle_irq() finds
+both subslots inactive and takes the waiting job for done as well. Its
+fence is signalled and its jc cleared, so it is never run.
+
+Mark a job as started when JS_COMMAND_START is written for it, and
+leave a job that was not on the slot for the reset.
+
+Found by code review (Sashiko). Not reproduced.
+
+Fixes: 030761e097b4 ("drm/panfrost: Queue jobs on the hardware")
+Cc: stable@vger.kernel.org
+Reported-by: Sashiko <sashiko-bot@kernel.org>
+Closes: https://lore.kernel.org/all/sashiko-outbox-210891@kernel.org/
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/panfrost/panfrost_job.c | 8 ++++++--
+ drivers/gpu/drm/panfrost/panfrost_job.h | 2 ++
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
+index 7645f19..31a3b56 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_job.c
++++ b/drivers/gpu/drm/panfrost/panfrost_job.c
+@@ -259,6 +259,7 @@ static int panfrost_job_hw_submit(struct panfrost_job *job, int js)
+ 
+ 	spin_lock(&pfdev->js->job_lock);
+ 	subslot = panfrost_enqueue_job(pfdev, js, job);
++	job->started = false;
+ 	/* Don't queue the job if a reset is in progress */
+ 	if (!atomic_read(&pfdev->reset.pending)) {
+ 		job->is_profiled = pfdev->profile_mode;
+@@ -274,6 +275,7 @@ static int panfrost_job_hw_submit(struct panfrost_job *job, int js)
+ 			job->start_cycles = panfrost_cycle_counter_read(pfdev);
+ 		}
+ 
++		job->started = true;
+ 		job_write(pfdev, JS_COMMAND_NEXT(js), JS_COMMAND_START);
+ 		dev_dbg(pfdev->base.dev,
+ 			"JS: Submitting atom %p to js[%d][%d] with head=0x%llx AS %d",
+@@ -587,7 +589,8 @@ static void panfrost_jm_handle_irq(struct panfrost_device *pfdev, u32 status)
+ 
+ 		if (failed[j]) {
+ 			panfrost_job_handle_err(pfdev, failed[j], j);
+-		} else if (pfdev->jobs[j][0] && !(js_state & MK_JS_MASK(j))) {
++		} else if (pfdev->jobs[j][0] && pfdev->jobs[j][0]->started &&
++			   !(js_state & MK_JS_MASK(j))) {
+ 			/* When the current job doesn't fail, the JM dequeues
+ 			 * the next job without waiting for an ACK, this means
+ 			 * we can have 2 jobs dequeued and only catch the
+@@ -595,7 +598,8 @@ static void panfrost_jm_handle_irq(struct panfrost_device *pfdev, u32 status)
+ 			 * are inactive, but one job remains in pfdev->jobs[j],
+ 			 * consider it done. Of course that doesn't apply if a
+ 			 * failure happened since we cancelled execution of the
+-			 * job in _NEXT (see above).
++			 * job in _NEXT (see above), or if the job was queued
++			 * while a reset was pending and never started.
+ 			 */
+ 			if (WARN_ON(!done[j][0]))
+ 				done[j][0] = panfrost_dequeue_job(pfdev, j);
+diff --git a/drivers/gpu/drm/panfrost/panfrost_job.h b/drivers/gpu/drm/panfrost/panfrost_job.h
+index ad22d07..c30cf01 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_job.h
++++ b/drivers/gpu/drm/panfrost/panfrost_job.h
+@@ -38,6 +38,8 @@ struct panfrost_job {
+ 	bool is_profiled;
+ 	/* Holds a reference on the cycle counter */
+ 	bool cycle_counter_ref;
++	/* JS_COMMAND_START was written for this submission */
++	bool started;
+ 	ktime_t start_time;
+ 	u64 start_cycles;
+ };
+-- 
+2.55.0
+
