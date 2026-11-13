@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 12:00:00 +0000
+Subject: crypto: ecc - Take P-521 private keys of 66 bytes and generate them in range
+
+ecc_gen_privkey() takes ndigits * 8 = 72 random bytes for P-521, a
+576-bit number, which is almost never below the 521-bit order: key
+generation fails. Keep the order's bit length of the random bits, as
+FIPS 186-5 A.2.2 asks.
+
+ecc_is_key_valid() wants the key to be ndigits * 8 bytes long; for P-521
+also take the curve size, 66 bytes.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ crypto/ecc.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/crypto/ecc.c b/crypto/ecc.c
+index c7366eb..d4d05d8 100644
+--- a/crypto/ecc.c
++++ b/crypto/ecc.c
+@@ -1556,7 +1556,9 @@ int ecc_is_key_valid(unsigned int curve_id, unsigned int ndigits,
+ 
+ 	nbytes = ndigits << ECC_DIGITS_TO_BYTES_SHIFT;
+ 
+-	if (private_key_len != nbytes)
++	/* P-521: 66 or 72 bytes */
++	if (private_key_len != nbytes &&
++	    private_key_len != DIV_ROUND_UP(curve->nbits, 8))
+ 		return -EINVAL;
+ 
+ 	return __ecc_is_key_valid(curve, private_key, ndigits);
+@@ -1600,6 +1602,8 @@ int ecc_gen_privkey(unsigned int curve_id, unsigned int ndigits,
+ 	err = crypto_stdrng_get_bytes(private_key, nbytes);
+ 	if (err)
+ 		return err;
++	if (nbits % 64)
++		private_key[ndigits - 1] &= GENMASK_ULL(nbits % 64 - 1, 0);
+ 
+ 	/* Step 4: make sure the private key is in the valid range. */
+ 	if (__ecc_is_key_valid(curve, private_key, ndigits))

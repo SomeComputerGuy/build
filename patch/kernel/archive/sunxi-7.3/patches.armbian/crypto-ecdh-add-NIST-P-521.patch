@@ -1,0 +1,197 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 12:00:00 +0000
+Subject: crypto: ecdh - Add NIST P-521
+
+The ECC code has P-521 since ECDSA got it, but ECDH does not offer it.
+Register ecdh-nist-p521, with a test vector made with OpenSSL. As for the
+other curves, points and the shared secret are ndigits * 8 = 72 bytes per
+coordinate, big endian; the private key is 66 or 72 bytes.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ crypto/Kconfig   |  2 +-
+ crypto/ecdh.c    | 33 +++++++++++++++++++++
+ crypto/testmgr.c |  7 +++++
+ crypto/testmgr.h | 76 ++++++++++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 117 insertions(+), 1 deletion(-)
+
+diff --git a/crypto/Kconfig b/crypto/Kconfig
+index 981d5dc..fcc9d9e 100644
+--- a/crypto/Kconfig
++++ b/crypto/Kconfig
+@@ -313,7 +313,7 @@ config CRYPTO_ECDH
+ 	select CRYPTO_KPP
+ 	help
+ 	  ECDH (Elliptic Curve Diffie-Hellman) key exchange algorithm
+-	  using curves P-192, P-256, and P-384 (FIPS 186)
++	  using curves P-192, P-256, P-384 and P-521 (FIPS 186)
+ 
+ config CRYPTO_ECDSA
+ 	tristate "ECDSA (Elliptic Curve Digital Signature Algorithm)"
+diff --git a/crypto/ecdh.c b/crypto/ecdh.c
+index 9f0b93b..5984a4d 100644
+--- a/crypto/ecdh.c
++++ b/crypto/ecdh.c
+@@ -203,6 +203,31 @@ static struct kpp_alg ecdh_nist_p384 = {
+ 	},
+ };
+ 
++static int ecdh_nist_p521_init_tfm(struct crypto_kpp *tfm)
++{
++	struct ecdh_ctx *ctx = ecdh_get_ctx(tfm);
++
++	ctx->curve_id = ECC_CURVE_NIST_P521;
++	ctx->ndigits = ECC_CURVE_NIST_P521_DIGITS;
++
++	return 0;
++}
++
++static struct kpp_alg ecdh_nist_p521 = {
++	.set_secret = ecdh_set_secret,
++	.generate_public_key = ecdh_compute_value,
++	.compute_shared_secret = ecdh_compute_value,
++	.max_size = ecdh_max_size,
++	.init = ecdh_nist_p521_init_tfm,
++	.base = {
++		.cra_name = "ecdh-nist-p521",
++		.cra_driver_name = "ecdh-nist-p521-generic",
++		.cra_priority = 100,
++		.cra_module = THIS_MODULE,
++		.cra_ctxsize = sizeof(struct ecdh_ctx),
++	},
++};
++
+ static bool ecdh_nist_p192_registered;
+ 
+ static int __init ecdh_init(void)
+@@ -221,8 +246,15 @@ static int __init ecdh_init(void)
+ 	if (ret)
+ 		goto nist_p384_error;
+ 
++	ret = crypto_register_kpp(&ecdh_nist_p521);
++	if (ret)
++		goto nist_p521_error;
++
+ 	return 0;
+ 
++nist_p521_error:
++	crypto_unregister_kpp(&ecdh_nist_p384);
++
+ nist_p384_error:
+ 	crypto_unregister_kpp(&ecdh_nist_p256);
+ 
+@@ -238,6 +270,7 @@ static void __exit ecdh_exit(void)
+ 		crypto_unregister_kpp(&ecdh_nist_p192);
+ 	crypto_unregister_kpp(&ecdh_nist_p256);
+ 	crypto_unregister_kpp(&ecdh_nist_p384);
++	crypto_unregister_kpp(&ecdh_nist_p521);
+ }
+ 
+ module_init(ecdh_init);
+diff --git a/crypto/testmgr.c b/crypto/testmgr.c
+index 9419d61..aa7ee16 100644
+--- a/crypto/testmgr.c
++++ b/crypto/testmgr.c
+@@ -4802,6 +4802,13 @@ static const struct alg_test_desc alg_test_descs[] = {
+ 		.suite = {
+ 			.kpp = __VECS(ecdh_p384_tv_template)
+ 		}
++	}, {
++		.alg = "ecdh-nist-p521",
++		.test = alg_test_kpp,
++		.fips_allowed = 1,
++		.suite = {
++			.kpp = __VECS(ecdh_p521_tv_template)
++		}
+ 	}, {
+ 		.alg = "ecdsa-nist-p192",
+ 		.test = alg_test_sig,
+diff --git a/crypto/testmgr.h b/crypto/testmgr.h
+index 0ee15a8..2cefc44 100644
+--- a/crypto/testmgr.h
++++ b/crypto/testmgr.h
+@@ -4306,6 +4306,82 @@ static const struct kpp_testvec ecdh_p384_tv_template[] = {
+ 	}
+ };
+ 
++static const struct kpp_testvec ecdh_p521_tv_template[] = {
++	{
++	.secret =
++#ifdef __LITTLE_ENDIAN
++	"\x02\x00" /* type */
++	"\x48\x00" /* len */
++	"\x42\x00" /* key_size */
++#else
++	"\x00\x02" /* type */
++	"\x00\x48" /* len */
++	"\x00\x42" /* key_size */
++#endif
++	"\x00\x04\x9D\x2C\xB0\x60\x09\xD7"
++	"\xCE\x9B\xEB\x1D\xCB\xA0\xAC\xBE"
++	"\x6C\x66\x3B\xDD\xF0\x12\x68\xFB"
++	"\x9E\xE4\xCC\xBE\xA4\x43\x7D\x00"
++	"\x9D\x04\x05\x93\x80\x6F\x86\x1D"
++	"\xF7\x3F\x97\xD8\x31\xC5\x59\xCA"
++	"\xC4\x80\x1B\x7F\x65\xE9\xED\x1A"
++	"\xB5\x52\x53\x78\x00\x53\x34\xDD"
++	"\x07\x31",
++	.b_public =
++	"\x00\x00\x00\x00\x00\x00\x00\x8A"
++	"\x1F\x06\xD7\x2C\xB9\x9B\x7F\x9D"
++	"\x2C\xB5\x50\x37\xD5\x5D\x70\x77"
++	"\xEE\x58\xB8\x63\x8C\x59\x76\x1C"
++	"\x0B\x91\x24\xA5\xB6\x2F\x99\x6D"
++	"\xB3\x90\x05\x4C\xAB\x2A\x8D\x40"
++	"\x85\x23\x06\xE6\x1A\xD7\xC6\xFA"
++	"\x37\x60\x18\x11\x8F\x99\xF1\x57"
++	"\xEB\x02\x7D\x34\x5A\xF6\x51\xE4"
++	"\x00\x00\x00\x00\x00\x00\x01\x60"
++	"\xD1\x45\x2F\x77\x08\x71\x68\xCA"
++	"\x56\x0B\x10\xD8\xF3\x2B\x8B\x3B"
++	"\x39\x83\x04\x94\x3D\x8B\xE8\xA2"
++	"\x19\xEC\xF8\xAC\xF1\xBD\x3D\x14"
++	"\x82\x11\x79\x5B\x6B\x5D\x8E\x66"
++	"\x2E\xD1\x1D\xFB\xA3\x07\x98\xE0"
++	"\xE2\x87\x67\x43\x0D\x83\xAC\x73"
++	"\x9D\x1D\xC9\x1B\x22\x66\x1D\x96",
++	.expected_a_public =
++	"\x00\x00\x00\x00\x00\x00\x00\x0D"
++	"\x57\x31\x5E\xCC\x73\x18\xAE\xA6"
++	"\x91\x4F\xD9\x78\x71\x8A\xDA\xFE"
++	"\xF8\x21\x1D\xDE\x16\x8A\xDC\x0A"
++	"\x64\xFF\xD1\x8F\x69\x77\xBF\x57"
++	"\x3C\xA4\xD8\xEF\x09\x2B\xC5\xD8"
++	"\x2A\x7C\xC7\x96\xA2\x75\xD8\xFB"
++	"\xD9\x7B\x38\x30\x68\x51\xD9\x60"
++	"\x6C\x83\x81\x6B\x71\xEE\xFA\xC7"
++	"\x00\x00\x00\x00\x00\x00\x01\x70"
++	"\x66\x73\xAE\x51\xAF\xA8\xFD\x13"
++	"\x0E\xDC\xDC\x35\xD7\xF6\x00\x10"
++	"\xF2\x62\x5F\x2E\xEA\x38\x17\xC4"
++	"\x83\xC1\x7B\xE6\x27\x9C\x87\x21"
++	"\xC0\xC6\xD6\x88\xD9\x65\x4E\xB8"
++	"\x0E\xD1\xFA\xC1\x28\xAA\x4A\xD0"
++	"\x45\x74\x00\xA0\x1D\xCD\xD4\xFB"
++	"\x41\xC1\x4E\x1F\x07\xB5\xAB\xA9",
++	.expected_ss =
++	"\x00\x00\x00\x00\x00\x00\x00\x43"
++	"\x30\xAB\x0B\x88\xAE\xFC\x87\x31"
++	"\xB0\x94\xDB\xF1\xED\xEA\xE4\xCB"
++	"\xC9\xAC\x53\x2D\x9C\xCC\xEF\x76"
++	"\x9F\xF5\x57\x58\xAE\xE7\xB3\x43"
++	"\x1C\x26\x6C\x93\xDE\x55\x03\x43"
++	"\xBB\x40\x6E\x3A\xA2\xA6\xDD\xB6"
++	"\xBA\x87\xDE\x05\x83\xFF\x18\x66"
++	"\xE8\x6A\x30\x96\x98\xDF\x3C\xA8",
++	.secret_size = 72,
++	.b_public_size = 144,
++	.expected_a_public_size = 144,
++	.expected_ss_size = 72
++	}
++};
++
+ /*
+  * MD4 test vectors from RFC1320
+  */
