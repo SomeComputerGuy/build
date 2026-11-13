@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 13 Nov 2026 10:00:00 +0000
+Subject: [PATCH] net: stmmac: dwmac-sun8i: drop received control frames
+
+sun8i_dwmac_set_filter() sets CTL_FRM_FILTER to "receive all control
+frames", so every PAUSE frame from the link partner reaches the stack
+and is counted in rx_dropped. RX_FLOW_CTL_EN decodes PAUSE frames
+either way. Drop control frames, as the vendor driver does.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
+index bc668d9..6a438dd 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
+@@ -217,7 +217,6 @@ static const struct emac_variant emac_variant_h6 = {
+ 
+ /* Used in EMAC_RX_FRM_FLT */
+ #define EMAC_FRM_FLT_RXALL              BIT(0)
+-#define EMAC_FRM_FLT_CTL                BIT(13)
+ #define EMAC_FRM_FLT_MULTICAST          BIT(16)
+ 
+ /* Used in RX_CTL1*/
+@@ -810,7 +809,8 @@ static void sun8i_dwmac_set_filter(struct mac_device_info *hw,
+ 	struct netdev_hw_addr *ha;
+ 	int macaddrs = netdev_uc_count(dev) + netdev_mc_count(dev) + 1;
+ 
+-	v = EMAC_FRM_FLT_CTL;
++	/* drop control frames; RX_FLOW_CTL_EN still acts on PAUSE */
++	v = 0;
+ 
+ 	if (dev->flags & IFF_PROMISC) {
+ 		v = EMAC_FRM_FLT_RXALL;
+-- 
+Armbian
