@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 12 Nov 2026 20:49:02 +0000
+Subject: [PATCH 4/6] net: stmmac: dwmac-sun8i: No TX checksum insertion above
+ MTU 1500
+
+On an Allwinner H616, the EMAC inserts wrong checksums into some frames
+longer than 2032 bytes, and sometimes corrupts the frame sent after such
+a frame. Measured with an earlier version of these patches, which left
+checksum insertion on at MTU 4070, in MAC loopback:
+- UDP frames of 2036 and 2040 bytes: 0 of 40 had valid checksums (the
+  payload was intact);
+- 2044-byte UDP frames checksummed in software, sent right after them:
+  4 of 20 intact;
+- 2054-byte raw frames: 1 of 30 had 2 bytes changed at offset 24.
+UDP frames of 2032 bytes were fine; untagged frames of 2033 to 2035
+bytes were not tried. With checksum insertion off, all of these frames
+were intact. With another earlier version, which kept checksum insertion
+on at MTU 2018, VLAN UDP frames of 2033 to 2036 bytes got valid
+checksums (20 of 20 each), so the limit is not a plain frame length. I
+have not found the cause, and only the H616 was measured.
+
+Rather than a length limit that is not understood, set bugged_jumbo, as
+the dwmac 3.40a, 3.610 and 3.710 cores do, so that stmmac_fix_features()
+turns TX checksum offload off above MTU 1500. All dwmac-sun8i variants
+get it, as they share the EMAC design. TX stays in store-and-forward
+mode, which stmmac selects from plat->tx_coe.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
+index 3de46f8..42f42ca 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
+@@ -1261,6 +1261,8 @@ static int sun8i_dwmac_probe(struct platform_device *pdev)
+ 	 */
+ 	plat_dat->rx_coe = STMMAC_RX_COE_TYPE2;
+ 	plat_dat->tx_coe = true;
++	/* TX checksum insertion corrupts some frames above 2032 bytes */
++	plat_dat->bugged_jumbo = true;
+ 	plat_dat->flags |= STMMAC_FLAG_HAS_SUN8I;
+ 	plat_dat->bsp_priv = gmac;
+ 	plat_dat->init = sun8i_dwmac_init;

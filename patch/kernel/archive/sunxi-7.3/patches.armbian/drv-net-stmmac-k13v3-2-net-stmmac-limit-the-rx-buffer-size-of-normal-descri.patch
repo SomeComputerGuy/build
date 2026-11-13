@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 12 Nov 2026 17:18:02 +0000
+Subject: [PATCH 2/6] net: stmmac: Limit the RX buffer size of normal
+ descriptors to 2032
+
+From an MTU of 1511, stmmac_set_bfsize() picks RX buffers of 2048 bytes
+(4096 from MTU 2023), which the 11-bit buffer size of normal descriptors
+cannot describe: ndesc_init_rx_desc() writes 2047 instead, while
+stmmac_rx() still counts the full size for every buffer of a frame but
+the last. The DMA also only fills whole bus words of a buffer, and the
+buffer size must be a multiple of 4, 8 or 16 bytes on a 32, 64 or
+128-bit bus (see common.h); on an Allwinner H616, with 2047 programmed,
+a 2045-byte frame already spills into a second descriptor.
+
+Limit the RX buffer size of normal descriptors in
+stmmac_setup_dma_desc() to 2032 bytes, the largest multiple of 16 that
+fits, so that dma_buf_sz is what the DMA writes into each buffer at any
+bus width. The other size used with normal descriptors, 1536, is a
+multiple of 16 already.
+
+In ring mode, this also stops ndesc_rx_set_on_ring() from enabling a
+second buffer, whose address (des3) is only set up for 16 KiB buffers.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/net/ethernet/stmicro/stmmac/stmmac_main.c | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index ef34b2d..ec2b17c 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -4088,6 +4088,14 @@ stmmac_setup_dma_desc(struct stmmac_priv *priv, unsigned int mtu)
+ 	if (bfsize < BUF_SIZE_16KiB)
+ 		bfsize = stmmac_set_bfsize(len);
+ 
++	/* A frame larger than the buffer continues in the next descriptor,
++	 * and the DMA only fills whole bus words of a buffer, so the buffer
++	 * size must be a multiple of the bus width (up to 16 bytes) that
++	 * fits the descriptor.
++	 */
++	if (priv->hw->desc == &ndesc_ops)
++		bfsize = min(bfsize, BUF_SIZE_NDESC);
++
+ 	dma_conf->dma_buf_sz = bfsize;
+ 	/* Chose the tx/rx size from the already defined one in the
+ 	 * priv struct. (if defined)

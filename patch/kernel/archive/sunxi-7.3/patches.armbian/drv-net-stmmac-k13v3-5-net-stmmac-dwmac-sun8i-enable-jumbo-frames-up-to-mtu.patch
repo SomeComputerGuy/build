@@ -1,0 +1,90 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 12 Nov 2026 19:34:08 +0000
+Subject: [PATCH 5/6] net: stmmac: dwmac-sun8i: Enable jumbo frames up to MTU
+ 4070
+
+The EMAC drops every frame longer than 1518 bytes (1522 with a VLAN
+tag) as a length error, because EMAC_RX_CTL0 bit 29 (JUMBO_FRM_EN) is
+never set. The Allwinner BSP driver sets it at init. Set it in
+core_init, which also runs after the DMA reset of an MTU change. As on
+dwmac4, longer frames from a link partner are then passed up at any
+MTU.
+
+Limit the MTU to 4070, so that a frame with two VLAN tags and the FCS
+fits in the 4 KiB TX FIFO and is sent in store-and-forward mode (stmmac
+selects it as tx_coe is set); stmmac_change_mtu() already refuses an
+MTU above the TX FIFO size. Larger frames would need threshold mode.
+With an earlier version of these patches, in threshold mode, the TX
+FIFO underflowed now and then while the DMA moved a frame over several
+descriptors: on an H616, 28 of 944 frames of 4110 to 16334 bytes were
+lost. I have not found the cause.
+
+Until the stmmac core allows jumbo MTUs with normal descriptors, the
+maximum stays at 3712.
+
+[backport to 7.3.3: context changes only]
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../net/ethernet/stmicro/stmmac/dwmac-sun8i.c | 19 ++++++++++++++++++-
+ 1 file changed, 18 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
+index 42f42ca..6ad13e1 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
+@@ -7,6 +7,7 @@
+ 
+ #include <linux/clk.h>
+ #include <linux/etherdevice.h>
++#include <linux/if_vlan.h>
+ #include <linux/io.h>
+ 
+ extern int sunxi_get_soc_chipid(unsigned char *chipid);
+@@ -221,12 +222,20 @@ static const struct emac_variant emac_variant_h6 = {
+ 
+ /* Used in RX_CTL0 */
+ #define EMAC_RX_RECEIVER_EN             BIT(31)
++#define EMAC_RX_JUMBO_FRM_EN		BIT(29)
+ #define EMAC_RX_DO_CRC BIT(27)
+ #define EMAC_RX_FLOW_CTL_EN             BIT(16)
+ 
+ /* Used in TX_CTL0 */
+ #define EMAC_TX_TRANSMITTER_EN  BIT(31)
+ 
++/* Frames must fit in the 4 KiB TX FIFO, to be sent in store-and-forward
++ * mode, with two VLAN tags and the FCS.
++ */
++#define EMAC_TX_FIFO_SIZE	4096
++#define EMAC_MAX_MTU		(EMAC_TX_FIFO_SIZE - ETH_HLEN - \
++				 2 * VLAN_HLEN - ETH_FCS_LEN)
++
+ /* Used in EMAC_TX_FLOW_CTL */
+ #define EMAC_TX_FLOW_CTL_EN             BIT(0)
+ 
+@@ -655,6 +664,13 @@ static void sun8i_dwmac_core_init(struct mac_device_info *hw,
+ 
+ 	v = (8 << EMAC_BURSTLEN_SHIFT); /* burst len */
+ 	writel(v, ioaddr + EMAC_BASIC_CTL1);
++
++	/* Without JUMBO_FRM_EN, frames longer than 1518 bytes (1522 with a
++	 * VLAN tag) are dropped as length errors.
++	 */
++	v = readl(ioaddr + EMAC_RX_CTL0);
++	v |= EMAC_RX_JUMBO_FRM_EN;
++	writel(v, ioaddr + EMAC_RX_CTL0);
+ }
+ 
+ static void sun8i_dwmac_set_mac(void __iomem *ioaddr, bool enable)
+@@ -1268,8 +1284,9 @@ static int sun8i_dwmac_probe(struct platform_device *pdev)
+ 	plat_dat->init = sun8i_dwmac_init;
+ 	plat_dat->exit = sun8i_dwmac_exit;
+ 	plat_dat->mac_setup = sun8i_dwmac_setup;
+-	plat_dat->tx_fifo_size = 4096;
++	plat_dat->tx_fifo_size = EMAC_TX_FIFO_SIZE;
+ 	plat_dat->rx_fifo_size = 16384;
++	plat_dat->maxmtu = EMAC_MAX_MTU;
+ 
+ 	ret = sun8i_dwmac_set_syscon(&pdev->dev, plat_dat);
+ 	if (ret)

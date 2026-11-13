@@ -1,0 +1,122 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 12 Nov 2026 17:17:50 +0000
+Subject: [PATCH 1/6] net: stmmac: Split TX jumbo frames with normal
+ descriptors
+
+stmmac_xmit() only looks for jumbo frames with enhanced descriptors.
+Normal descriptors have an 11-bit buffer size, so a linear frame longer
+than 2047 bytes goes into one descriptor and its length is truncated by
+norm_set_tx_desc_len_on_chain(). dwmac-sun8i, for example, allows an
+MTU of up to 3712.
+
+In chain mode, check for jumbo frames with normal descriptors too, so
+that they are split over several descriptors. Split at 2032 bytes, the
+largest multiple of 16 that fits the field, which the next patch also
+uses as the RX buffer size; the 2048 used so far for normal descriptors
+does not fit the field. Ring mode is left as it is: there a frame above
+2047 bytes uses the second buffer of the descriptor, whose address is
+never set. The check stays for the other cores: dwmac4 and XGMAC do not
+set enh_desc either, and must not take this path.
+
+jumbo_frm() only splits the linear part of a frame and marks its last
+descriptor as the last segment, so in chain mode linearize longer frames
+that have fragments; this also keeps every fragment within one
+descriptor. On dwmac-sun8i, which keeps scatter-gather on without TX
+checksum offload, this path is taken by such frames from MTU 2015 with a
+VLAN tag and from MTU 2019 without.
+
+As a frame now often spans several descriptors, set the OWN bit of the
+first one after a dma_wmb(), as enh_desc_prepare_tx_desc() does.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/net/ethernet/stmicro/stmmac/chain_mode.c |  4 ++--
+ drivers/net/ethernet/stmicro/stmmac/common.h     |  2 ++
+ drivers/net/ethernet/stmicro/stmmac/norm_desc.c  |  2 ++
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c    | 16 +++++++++++++++-
+ 4 files changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/chain_mode.c b/drivers/net/ethernet/stmicro/stmmac/chain_mode.c
+index 66025e2..42bf7a5 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/chain_mode.c
++++ b/drivers/net/ethernet/stmicro/stmmac/chain_mode.c
+@@ -30,7 +30,7 @@ static int jumbo_frm(struct stmmac_tx_queue *tx_q, struct sk_buff *skb,
+ 	if (priv->plat->enh_desc)
+ 		bmax = BUF_SIZE_8KiB;
+ 	else
+-		bmax = BUF_SIZE_2KiB;
++		bmax = BUF_SIZE_NDESC;
+ 
+ 	buf_len = min_t(unsigned int, nopaged_len, bmax);
+ 	len = nopaged_len - buf_len;
+@@ -90,7 +90,7 @@ static bool is_jumbo_frm(unsigned int len, bool enh_desc)
+ 	bool ret = false;
+ 
+ 	if ((enh_desc && (len > BUF_SIZE_8KiB)) ||
+-	    (!enh_desc && (len > BUF_SIZE_2KiB)))
++	    (!enh_desc && (len > BUF_SIZE_NDESC)))
+ 		ret = true;
+ 
+ 	return ret;
+diff --git a/drivers/net/ethernet/stmicro/stmmac/common.h b/drivers/net/ethernet/stmicro/stmmac/common.h
+index 927ea62..20a7260 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/common.h
++++ b/drivers/net/ethernet/stmicro/stmmac/common.h
+@@ -522,6 +522,8 @@ struct dma_features {
+ #define BUF_SIZE_8KiB 8188
+ #define BUF_SIZE_4KiB 4096
+ #define BUF_SIZE_2KiB 2048
++/* Largest multiple of 16 that fits the 11-bit buffer size of normal descriptors */
++#define BUF_SIZE_NDESC 2032
+ 
+ /* Power Down and WOL */
+ #define PMT_NOT_SUPPORTED 0
+diff --git a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c b/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
+index 63eaf80..2cc273b 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
++++ b/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
+@@ -144,6 +144,8 @@ static void ndesc_init_tx_desc(struct dma_desc *p, u8 descriptor_mode, int end)
+ 
+ static void ndesc_set_tx_owner(struct dma_desc *p)
+ {
++	/* The other descriptors of the frame must be visible first */
++	dma_wmb();
+ 	p->des0 |= cpu_to_le32(TDES0_OWN);
+ }
+ 
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index f7800a0..ef34b2d 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -4840,6 +4840,19 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		}
+ 	}
+ 
++	/* Normal descriptors in chain mode: only the linear part of a frame
++	 * is split over several descriptors, and a fragment must fit in one
++	 * descriptor.
++	 */
++	if (priv->descriptor_mode == STMMAC_CHAIN_MODE &&
++	    priv->hw->desc == &ndesc_ops && nfrags &&
++	    skb->len > BUF_SIZE_NDESC) {
++		if (skb_linearize(skb))
++			goto max_sdu_err;
++		nfrags = 0;
++		nopaged_len = skb_headlen(skb);
++	}
++
+ 	if (unlikely(stmmac_tx_avail(priv, queue) < nfrags + 1)) {
+ 		if (!netif_tx_queue_stopped(netdev_get_tx_queue(dev, queue))) {
+ 			netif_tx_stop_queue(netdev_get_tx_queue(priv->dev,
+@@ -4870,7 +4883,8 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
+ 
+ 	enh_desc = priv->plat->enh_desc;
+ 	/* To program the descriptors according to the size of the frame */
+-	if (enh_desc)
++	if (enh_desc || (priv->hw->desc == &ndesc_ops &&
++			 priv->descriptor_mode == STMMAC_CHAIN_MODE))
+ 		is_jumbo = stmmac_is_jumbo_frm(priv, skb->len, enh_desc);
+ 
+ 	csum_insertion = skb->ip_summed == CHECKSUM_PARTIAL;

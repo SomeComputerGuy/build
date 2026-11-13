@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 12 Nov 2026 19:33:43 +0000
+Subject: [PATCH 3/6] net: stmmac: norm_desc: Receive frames that span several
+ descriptors
+
+ndesc_init_rx_desc() limits the buffer size it programs to 2047 bytes
+without the rest of the driver knowing, and ndesc_get_rx_status() drops
+every frame that does not fit in one descriptor.
+
+The RX buffer size of normal descriptors is now at most 2032 bytes, so
+program it unchanged: the descriptor and dma_buf_sz agree, which
+stmmac_rx() needs to put a frame together from several buffers.
+
+Then return rx_not_ls for the descriptors of a frame before the last
+one, as dwmac4 and XGMAC do, instead of dropping the frame; only the
+last descriptor carries the status and the frame length. stmmac_rx_zc()
+still drops such frames, as it does since commit 834ec9530832
+("net: stmmac: drop split frames on AF_XDP zero-copy RX").
+
+Such frames can now end with a buffer that holds no frame data: a type 1
+RX checksum engine appends two bytes that are counted in the descriptor
+but not in the length get_rx_frame_len() returns. If the last buffer
+holds only one of them, "plen - len" in stmmac_rx_buf1_len() wraps and
+a whole buffer of stale data would be added to the frame. Return 0 then,
+and trim the frame to its length, so that the checksum byte at the end
+of the buffer before is dropped as well. dwmac-sun8i has a type 2 engine;
+the type 1 case is not tested.
+
+[backport to 7.3.3: replaces the local drop-multi-descriptor-frame-tails hunk instead of
+ the v7.4 834ec9530832 code; same resulting code]
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../net/ethernet/stmicro/stmmac/norm_desc.c   | 18 ++++--------------
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c | 19 +++++++++++++++++--
+ 2 files changed, 21 insertions(+), 16 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c b/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
+index 2cc273b..de30dfd 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
++++ b/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
+@@ -68,16 +68,9 @@ static int ndesc_get_rx_status(struct stmmac_extra_stats *x,
+ 	if (unlikely(rdes0 & RDES0_OWN))
+ 		return dma_own;
+ 
+-	/* Frames spanning more than one descriptor are not supported with
+-	 * normal descriptors: drop every descriptor of such a frame. Checking
+-	 * only the last descriptor bit would hand the tail of the frame to
+-	 * stmmac_rx() as if it were a complete frame.
+-	 */
+-	if (unlikely(!(rdes0 & RDES0_LAST_DESCRIPTOR) ||
+-		     !(rdes0 & RDES0_FIRST_DESCRIPTOR))) {
+-		x->rx_length++;
+-		return discard_frame;
+-	}
++	/* The status is only valid in the last descriptor of a frame */
++	if (!(rdes0 & RDES0_LAST_DESCRIPTOR))
++		return rx_not_ls;
+ 
+ 	if (unlikely(rdes0 & RDES0_ERROR_SUMMARY)) {
+ 		if (unlikely(rdes0 & RDES0_DESCRIPTOR_ERROR))
+@@ -117,12 +110,9 @@ static int ndesc_get_rx_status(struct stmmac_extra_stats *x,
+ static void ndesc_init_rx_desc(struct dma_desc *p, int disable_rx_ic,
+ 			       u8 descriptor_mode, int end, int bfsize)
+ {
+-	int bfsize1;
+-
+ 	p->des0 |= cpu_to_le32(RDES0_OWN);
+ 
+-	bfsize1 = min(bfsize, BUF_SIZE_2KiB - 1);
+-	p->des1 |= cpu_to_le32(bfsize1 & RDES1_BUFFER1_SIZE_MASK);
++	p->des1 |= cpu_to_le32(bfsize & RDES1_BUFFER1_SIZE_MASK);
+ 
+ 	if (descriptor_mode == STMMAC_CHAIN_MODE)
+ 		ndesc_rx_set_on_chain(p, end);
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index ec2b17c..6acfb67 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -5206,6 +5206,12 @@ static unsigned int stmmac_rx_buf1_len(struct stmmac_priv *priv,
+ 
+ 	plen = stmmac_get_rx_frame_len(priv, p, coe);
+ 
++	/* A type 1 checksum engine appends two bytes that the frame length
++	 * leaves out: the last buffer may only hold some of them.
++	 */
++	if (plen <= len)
++		return 0;
++
+ 	/* Last descriptor and not split header: buffer1 holds the remaining
+ 	 * bytes of the frame, up to dma_buf_sz
+ 	 */
+@@ -5856,9 +5862,18 @@ read_again:
+ 		buf2_len = stmmac_rx_buf2_len(priv, p, status, len);
+ 		len += buf2_len;
+ 
+-		/* ACS is disabled; strip manually. */
+-		if (likely(!(status & rx_not_ls)))
++		if (likely(!(status & rx_not_ls))) {
++			/* No frame data in the last buffer: the one before may
++			 * end inside the bytes a type 1 checksum engine
++			 * appends. Trim the frame to its length.
++			 */
++			if (unlikely(!buf1_len && !buf2_len))
++				len = min_t(unsigned int, len,
++					    stmmac_get_rx_frame_len(priv, p, coe));
++
++			/* ACS is disabled; strip manually. */
+ 			len -= ETH_FCS_LEN;
++		}
+ 
+ 		if (!skb) {
+ 			unsigned int pre_len, sync_len;
