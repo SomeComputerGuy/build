@@ -121,7 +121,7 @@ index 9419d61..aa7ee16 100644
  		.alg = "ecdsa-nist-p192",
  		.test = alg_test_sig,
 diff --git a/crypto/testmgr.h b/crypto/testmgr.h
-index 0ee15a8..cda209a 100644
+index 0ee15a8..dbf2853 100644
 --- a/crypto/testmgr.h
 +++ b/crypto/testmgr.h
 @@ -4306,6 +4306,213 @@ static const struct kpp_testvec ecdh_p384_tv_template[] = {
@@ -129,7 +129,7 @@ index 0ee15a8..cda209a 100644
  };
  
 +/*
-+ * NIST P521 test vectors from RFC5903
++ * NIST P521 test vectors: the first from RFC 5903 section 8.3
 + */
 +static const struct kpp_testvec ecdh_p521_tv_template[] = {
 +	{
