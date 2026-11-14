@@ -1,0 +1,66 @@
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Subject: [PATCH] sunxi: binman: add OP-TEE to the FIT
+
+When TEE= names an OP-TEE image at build time, put it in the FIT next
+to TF-A and U-Boot, like the Rockchip FIT does. tee.bin (OP-TEE's v1
+header format) gives one image, loaded where its header says. TF-A
+(SPD=opteed) enters it at its own compile-time BL32_BASE, which must
+be the same address.
+
+The configurations use fit,firmware/fit,loadables in that case only,
+so builds without TEE= produce the same FIT as before.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ arch/arm/dts/sunxi-u-boot.dtsi | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+diff --git a/arch/arm/dts/sunxi-u-boot.dtsi b/arch/arm/dts/sunxi-u-boot.dtsi
+--- a/arch/arm/dts/sunxi-u-boot.dtsi
++++ b/arch/arm/dts/sunxi-u-boot.dtsi
+@@ -95,6 +95,24 @@
+ 				};
+ #endif
+ 
++#if defined(CONFIG_HAS_TEE_IN_BUILD_ENV) && CONFIG_SUNXI_BL31_BASE
++				/* OP-TEE (tee.bin), loaded where its header says */
++				@tee-SEQ {
++					fit,operation = "split-elf";
++					description = "OP-TEE";
++					type = "tee";
++					arch = ARCH;
++					os = "tee";
++					compression = "none";
++					fit,load;
++					fit,entry;
++					fit,data;
++
++					tee-os {
++					};
++				};
++#endif
++
+ 				@fdt-SEQ {
+ 					description = "NAME";
+ 					type = "flat_dt";
+@@ -107,6 +125,10 @@
+ 
+ 				@config-SEQ {
+ 					description = "NAME";
++#if defined(CONFIG_HAS_TEE_IN_BUILD_ENV) && CONFIG_SUNXI_BL31_BASE
++					fit,firmware = "atf", "scp", "uboot";
++					fit,loadables;
++#else
+ #if CONFIG_SUNXI_BL31_BASE
+ 					firmware = "atf";
+ #else
+@@ -117,6 +139,7 @@
+ #else
+ 					loadables = "uboot";
+ #endif
++#endif
+ 					fdt = "fdt-SEQ";
+ 				};
+ 			};
+-- 
+2.51.0

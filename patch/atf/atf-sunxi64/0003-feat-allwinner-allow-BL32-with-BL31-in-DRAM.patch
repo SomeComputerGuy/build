@@ -1,0 +1,65 @@
+From ee594cab45ee795571b0aadc4baecc33262ed01b Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 14 Nov 2026 04:06:55 +0000
+Subject: [PATCH 1/2] feat(allwinner): allow BL32 with BL31 in DRAM
+
+On the H616 and the A133, BL31 runs from the start of DRAM, which is
+also the default BL32 load address. Building with SPD=opteed then puts
+both images at 0x40000000. Make BL32_BASE settable on the command line,
+and stop the build if it is not set while BL31 is in DRAM.
+
+Change-Id: I52df35dd7322cf08fbfaf2ad557e54b463fdf24f
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ docs/plat/allwinner.rst                      | 6 ++++--
+ plat/allwinner/common/allwinner-common.mk    | 5 +++++
+ plat/allwinner/common/include/platform_def.h | 3 +++
+ 3 files changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/docs/plat/allwinner.rst b/docs/plat/allwinner.rst
+index 8e967dcde..88d218b6f 100644
+--- a/docs/plat/allwinner.rst
++++ b/docs/plat/allwinner.rst
+@@ -140,5 +140,7 @@ Trusted OS dispatcher
+ One can boot Trusted OS(OP-TEE OS, bl32 image) along side bl31 image on Allwinner A64.
+ 
+ In order to include the 'opteed' dispatcher in the image, pass 'SPD=opteed' on the command line
+-while compiling the bl31 image and make sure the loader (SPL) loads the Trusted OS binary to
+-the beginning of DRAM (0x40000000).
++while compiling the bl31 image. On SoCs where BL31 runs from SRAM, make sure the loader (SPL)
++loads the Trusted OS binary to the beginning of DRAM (0x40000000). On SoCs where BL31 itself
++runs from the beginning of DRAM (H616, A133), also pass 'BL32_BASE=<address>' with the load
++address of the Trusted OS.
+diff --git a/plat/allwinner/common/allwinner-common.mk b/plat/allwinner/common/allwinner-common.mk
+index 88541a044..664e785f2 100644
+--- a/plat/allwinner/common/allwinner-common.mk
++++ b/plat/allwinner/common/allwinner-common.mk
+@@ -100,6 +100,11 @@ SUNXI_AMEND_DTB		:=	1
+ $(eval $(call add_define,SUNXI_BL31_IN_DRAM))
+ endif
+ 
++# Load address of BL32 (e.g. OP-TEE), when a Secure Payload Dispatcher is used.
++ifdef BL32_BASE
++$(eval $(call add_define,BL32_BASE))
++endif
++
+ SUNXI_AMEND_DTB		?=	0
+ $(eval $(call assert_boolean,SUNXI_AMEND_DTB))
+ $(eval $(call add_define,SUNXI_AMEND_DTB))
+diff --git a/plat/allwinner/common/include/platform_def.h b/plat/allwinner/common/include/platform_def.h
+index c9d075ac8..ca518476a 100644
+--- a/plat/allwinner/common/include/platform_def.h
++++ b/plat/allwinner/common/include/platform_def.h
+@@ -77,6 +77,9 @@
+ 
+ #ifndef SPD_none
+ #ifndef BL32_BASE
++#ifdef SUNXI_BL31_IN_DRAM
++#error "BL31 is at the start of DRAM: set BL32_BASE on the command line"
++#endif
+ #define BL32_BASE			SUNXI_DRAM_BASE
+ #endif
+ #endif
+-- 
+2.55.0
+

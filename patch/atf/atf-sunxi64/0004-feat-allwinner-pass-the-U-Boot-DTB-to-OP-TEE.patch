@@ -1,0 +1,40 @@
+From 944a42bbedce1f4fec1b048aeea3434147cb5db4 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 14 Nov 2026 04:06:57 +0000
+Subject: [PATCH 2/2] feat(allwinner): pass the U-Boot DTB to OP-TEE
+
+OP-TEE can add its firmware node and reserved memory to the device tree
+of the non-secure world when it gets a DTB. Pass the DTB found after
+BL33 (U-Boot's) to BL32 with SPD=opteed, so these nodes reach U-Boot
+and from there the kernel.
+
+BL31 reads this DTB through a cached mapping before BL32 runs and edits
+it again afterwards (sunxi_prepare_dtb()), so BL32 must also map it
+cached, or clean its writes to memory before returning (OP-TEE:
+CFG_EXT_DT_CACHED=y).
+
+Change-Id: Id75063e93af7928ceadb6562c652d1865d9aa3ce
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ plat/allwinner/common/sunxi_bl31_setup.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/plat/allwinner/common/sunxi_bl31_setup.c b/plat/allwinner/common/sunxi_bl31_setup.c
+index 263083bb1..63876b119 100644
+--- a/plat/allwinner/common/sunxi_bl31_setup.c
++++ b/plat/allwinner/common/sunxi_bl31_setup.c
+@@ -149,6 +149,11 @@ void bl31_platform_setup(void)
+ 		NOTICE("BL31: No DTB found.\n");
+ 	}
+ 
++#ifdef SPD_opteed
++	/* OP-TEE adds its node and reserved memory to U-Boot's DTB. */
++	bl32_image_ep_info.args.arg3 = (uintptr_t)fdt;
++#endif
++
+ 	/* Configure the interrupt controller */
+ 	gicv2_driver_init(&sunxi_gic_data);
+ 	gicv2_distif_init();
+-- 
+2.55.0
+
