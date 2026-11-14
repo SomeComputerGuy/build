@@ -24,7 +24,8 @@ Three faults of the DE33 CDC colour pipeline:
   matrices need (D = 512 on Cb and Cr): with D = 512, K = 448 and a
   coefficient of +1 or -1 on each channel of either CSC, every input
   from 64 to 447 gives the signed result, none is clipped or wrapped.
-  K is rounded, so the offset is written to within half a code value.
+  K is rounded, so the offset (for a row without coefficients, the
+  offset clipped to 0..1023) is written to within half a code value.
   Coefficients are written as their 20-bit field.
 
 - The 3D LUT interpolates trilinearly (captures with random node values
