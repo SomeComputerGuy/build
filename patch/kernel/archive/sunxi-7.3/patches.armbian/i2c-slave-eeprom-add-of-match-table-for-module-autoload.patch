@@ -1,56 +1,89 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
-Date: Fri, 6 Nov 2026 11:00:00 +0000
+Date: Tue, 10 Nov 2026 05:06:50 +0000
 Subject: i2c: slave-eeprom: add an OF match table for module autoload
 
 A backend instantiated from the device tree (compatible "slave-24c02",
-reg = <(I2C_OWN_SLAVE_ADDRESS | 0x64)>) gets an i2c client, but the
+reg = <(0x64 | I2C_OWN_SLAVE_ADDRESS)>) gets an i2c client, but the
 uevent of a client with an of_node carries an of: modalias
 (of:N...Cslave-24c02). The module only declares i2c: aliases, so udev
-never loads it and the client stays unbound: no slave-eeprom file and
-no target registered, with nothing in the log. Only the sysfs
-new_device path (i2c: modalias) or a manual modprobe worked.
+never loads it and the client stays unbound: there is no slave-eeprom
+file and no target is registered, with nothing in the log. Only the
+sysfs new_device path (i2c: modalias) or a manual modprobe works.
 
 Declare the same names as an OF table and export it, so the module
-autoloads for DT and overlay clients. Matching and probe are
-unchanged: the client name is the compatible without a vendor prefix,
-so i2c_client_get_device_id() still finds the size and flags.
+autoloads for DT and overlay clients. Nodes that bind today keep binding
+with the same size and flags.
+
+With an OF table the driver also matches a node that lists one of these
+names as a fallback compatible. Such a client is named after its first
+compatible and has no i2c id, so give the OF entries the same data as
+the i2c ids and read it with i2c_get_match_data().
 
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- drivers/i2c/i2c-slave-eeprom.c | 20 ++++++++++++++++++++
- 1 file changed, 20 insertions(+)
+ drivers/i2c/i2c-slave-eeprom.c | 41 +++++++++++++++++++++++++++++++----
+ 1 file changed, 37 insertions(+), 4 deletions(-)
 
 --- a/drivers/i2c/i2c-slave-eeprom.c
 +++ b/drivers/i2c/i2c-slave-eeprom.c
-@@ -20,6 +20,7 @@
- #include <linux/firmware.h>
- #include <linux/i2c.h>
- #include <linux/init.h>
-+#include <linux/mod_devicetable.h>
- #include <linux/module.h>
- #include <linux/of.h>
- #include <linux/slab.h>
-@@ -203,9 +204,29 @@
+@@ -142,11 +142,11 @@
+ 
+ static int i2c_slave_eeprom_probe(struct i2c_client *client)
+ {
+-	const struct i2c_device_id *id = i2c_client_get_device_id(client);
++	unsigned long data = (unsigned long)i2c_get_match_data(client);
+ 	struct eeprom_data *eeprom;
+ 	int ret;
+-	unsigned int size = FIELD_GET(I2C_SLAVE_BYTELEN, id->driver_data) + 1;
+-	unsigned int flag_addr16 = FIELD_GET(I2C_SLAVE_FLAG_ADDR16, id->driver_data);
++	unsigned int size = FIELD_GET(I2C_SLAVE_BYTELEN, data) + 1;
++	unsigned int flag_addr16 = FIELD_GET(I2C_SLAVE_FLAG_ADDR16, data);
+ 
+ 	eeprom = devm_kzalloc(&client->dev, sizeof(struct eeprom_data) + size, GFP_KERNEL);
+ 	if (!eeprom)
+@@ -154,7 +154,7 @@
+ 
+ 	eeprom->num_address_bytes = flag_addr16 ? 2 : 1;
+ 	eeprom->address_mask = size - 1;
+-	eeprom->read_only = FIELD_GET(I2C_SLAVE_FLAG_RO, id->driver_data);
++	eeprom->read_only = FIELD_GET(I2C_SLAVE_FLAG_RO, data);
+ 	spin_lock_init(&eeprom->buffer_lock);
+ 	i2c_set_clientdata(client, eeprom);
+ 
+@@ -203,9 +203,42 @@
  };
  MODULE_DEVICE_TABLE(i2c, i2c_slave_eeprom_id);
  
 +/*
-+ * Firmware instantiates a backend with the I2C id as compatible and
-+ * I2C_OWN_SLAVE_ADDRESS in reg (i2c-controller.yaml in dtschema).
-+ * Such a client announces an of: modalias, so without this table the
-+ * module never autoloads for it.
++ * A backend instantiated from the device tree, with the I2C id as
++ * compatible and I2C_OWN_SLAVE_ADDRESS in reg, announces an of: modalias.
++ * List the same names here so that the module autoloads for it. They carry
++ * the same data as the I2C ids: a node that matches through a fallback
++ * compatible has no I2C id, because the client is named after the first
++ * compatible.
 + */
++#define I2C_SLAVE_OF_DATA(_len, _flags) \
++	((void *)(unsigned long)I2C_SLAVE_DEVICE_MAGIC(_len, _flags))
++
 +static const struct of_device_id i2c_slave_eeprom_of_match[] = {
-+	{ .compatible = "slave-24c02" },
-+	{ .compatible = "slave-24c02ro" },
-+	{ .compatible = "slave-24c32" },
-+	{ .compatible = "slave-24c32ro" },
-+	{ .compatible = "slave-24c64" },
-+	{ .compatible = "slave-24c64ro" },
-+	{ .compatible = "slave-24c512" },
-+	{ .compatible = "slave-24c512ro" },
++	{ .compatible = "slave-24c02",
++	  .data = I2C_SLAVE_OF_DATA(2048 / 8, 0) },
++	{ .compatible = "slave-24c02ro",
++	  .data = I2C_SLAVE_OF_DATA(2048 / 8, I2C_SLAVE_FLAG_RO) },
++	{ .compatible = "slave-24c32",
++	  .data = I2C_SLAVE_OF_DATA(32768 / 8, I2C_SLAVE_FLAG_ADDR16) },
++	{ .compatible = "slave-24c32ro",
++	  .data = I2C_SLAVE_OF_DATA(32768 / 8, I2C_SLAVE_FLAG_ADDR16 | I2C_SLAVE_FLAG_RO) },
++	{ .compatible = "slave-24c64",
++	  .data = I2C_SLAVE_OF_DATA(65536 / 8, I2C_SLAVE_FLAG_ADDR16) },
++	{ .compatible = "slave-24c64ro",
++	  .data = I2C_SLAVE_OF_DATA(65536 / 8, I2C_SLAVE_FLAG_ADDR16 | I2C_SLAVE_FLAG_RO) },
++	{ .compatible = "slave-24c512",
++	  .data = I2C_SLAVE_OF_DATA(524288 / 8, I2C_SLAVE_FLAG_ADDR16) },
++	{ .compatible = "slave-24c512ro",
++	  .data = I2C_SLAVE_OF_DATA(524288 / 8, I2C_SLAVE_FLAG_ADDR16 | I2C_SLAVE_FLAG_RO) },
 +	{ }
 +};
 +MODULE_DEVICE_TABLE(of, i2c_slave_eeprom_of_match);
@@ -64,3 +97,4 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	.remove = i2c_slave_eeprom_remove,
 -- 
 2.43.0
+
