@@ -81,7 +81,7 @@ index 20a7260..bf9ce5b 100644
  
  enum dma_irq_status {
 diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
-index d3314ea..dc96b40 100644
+index c7dab99..54de7ff 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
 @@ -321,6 +321,14 @@ static const struct emac_variant emac_variant_h6 = {
@@ -139,7 +139,7 @@ index d3314ea..dc96b40 100644
  	 * VLAN tag) are dropped as length errors.
  	 */
 diff --git a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c b/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
-index 562177f..ee6b7d6 100644
+index 1dd663f..83d137e 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
 @@ -30,6 +30,7 @@ static int ndesc_get_tx_status(struct stmmac_extra_stats *x,
