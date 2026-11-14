@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 14 Nov 2026 01:00:00 +0000
+Subject: [PATCH] net: stmmac: norm_desc: discard error frames without the
+ error summary bit
+
+ndesc_get_rx_status() discards CRC, late collision, overflow and
+descriptor errors only when RDES0 bit 15 (error summary) is set. The
+H616 manual lists bit 15 as reserved. In store-and-forward mode the MAC
+drops such frames itself; in threshold mode they reach the ring.
+
+Test the error bits themselves too (no change where the summary bit
+works).
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/net/ethernet/stmicro/stmmac/norm_desc.c | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c b/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
+index 562177f..1dd663f 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
++++ b/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
+@@ -72,7 +72,12 @@ static int ndesc_get_rx_status(struct stmmac_extra_stats *x,
+ 	if (!(rdes0 & RDES0_LAST_DESCRIPTOR))
+ 		return rx_not_ls;
+ 
+-	if (unlikely(rdes0 & RDES0_ERROR_SUMMARY)) {
++	/* Do not rely on the error summary alone: the H616 manual lists bit
++	 * 15 as reserved, and in RX threshold mode error frames reach the ring.
++	 */
++	if (unlikely(rdes0 & (RDES0_ERROR_SUMMARY | RDES0_CRC_ERROR |
++			      RDES0_COLLISION | RDES0_OVERFLOW_ERROR |
++			      RDES0_DESCRIPTOR_ERROR))) {
+ 		if (unlikely(rdes0 & RDES0_DESCRIPTOR_ERROR))
+ 			x->rx_desc++;
+ 		if (unlikely(rdes0 & RDES0_SA_FILTER_FAIL))
+-- 
+Armbian
+
