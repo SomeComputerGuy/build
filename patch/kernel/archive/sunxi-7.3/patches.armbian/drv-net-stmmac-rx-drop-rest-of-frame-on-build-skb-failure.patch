@@ -1,4 +1,4 @@
-From f10b69226150111b9db2eceff39cc41907814fe7 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 03:59:55 +0000
 Subject: [PATCH] net: stmmac: drop the rest of the frame when napi_build_skb() fails
@@ -16,13 +16,14 @@ counted once in rx_dropped and once against the NAPI budget.
 
 Fixes: ec222003bd94 ("net: stmmac: Prepare to add Split Header support")
 Cc: stable@vger.kernel.org
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 [ 7.3: the poll here does not yet keep the frame state when it stops at
   a descriptor the DMA still owns (upstream commit 26219e9402c2 "net:
   stmmac: take ownership of saved RX state at poll entry"), so this
   version also saves the state while a frame is in progress, and counts
   the dropped frame where 7.4 uses the "next" label. ]
-Link: https://lore.kernel.org/r/20261113-stmmac-rx-skb-fail-v1-1-fcaae89f2d2c@gmail.com
+Link: https://patch.msgid.link/20261113-stmmac-rx-skb-fail-v1-1-fcaae89f2d2c@gmail.com
 ---
  drivers/net/ethernet/stmicro/stmmac/stmmac_main.c | 11 ++++++++---
  1 file changed, 8 insertions(+), 3 deletions(-)
