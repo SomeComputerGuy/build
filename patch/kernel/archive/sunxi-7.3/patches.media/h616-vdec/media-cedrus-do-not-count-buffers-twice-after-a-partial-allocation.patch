@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 14 Nov 2026 20:30:00 +0000
+Subject: [PATCH] media: cedrus: do not count buffers twice after a partial
+ allocation
+
+When vb2 allocates fewer buffers than asked, it calls queue_setup again
+with the number it got. Those buffers are already allocated and no
+longer in si_mem_available(), so the memory check counted them twice
+and failed VIDIOC_REQBUFS/VIDIOC_CREATE_BUFS, freeing every buffer,
+instead of accepting the smaller pool.
+
+Remember the buffer counts of the last queue_setup per queue and skip
+the check on that second call.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -249,6 +249,9 @@
+ 	bool				is_jpeg_enc;
+ 	/* Encoder CAPTURE sizeimage from userspace, 0 for the default. */
+ 	unsigned int			coded_size;
++	/* Buffer counts of the last queue_setup, [1] = OUTPUT queue. */
++	unsigned int			qs_have[2];
++	unsigned int			qs_want[2];
+ 
+ 	struct v4l2_ctrl_handler	hdl;
+ 	struct v4l2_ctrl		**ctrls;
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -1027,6 +1027,31 @@
+ 	return -ENOMEM;
+ }
+ 
++/*
++ * After allocating fewer buffers than asked, vb2 calls queue_setup again
++ * with the buffers it got. They are already allocated, so they must not be
++ * counted against the available memory again.
++ */
++static int cedrus_queue_setup_fit(struct cedrus_ctx *ctx, struct vb2_queue *vq,
++				  unsigned int count, unsigned int size)
++{
++	unsigned int i = V4L2_TYPE_IS_OUTPUT(vq->type);
++	unsigned int have = vb2_get_num_buffers(vq);
++	int ret = 0;
++
++	if (have <= ctx->qs_have[i] || have >= ctx->qs_want[i])
++		ret = cedrus_buffers_fit(ctx, vq, count, size);
++	else
++		count = 0;
++
++	if (!ret) {
++		ctx->qs_have[i] = have;
++		ctx->qs_want[i] = have + count;
++	}
++
++	return ret;
++}
++
+ static int cedrus_queue_setup(struct vb2_queue *vq, unsigned int *nbufs,
+ 			      unsigned int *nplanes, unsigned int sizes[],
+ 			      struct device *alloc_devs[])
+@@ -1047,7 +1072,7 @@
+ 		*nplanes = 1;
+ 	}
+ 
+-	return cedrus_buffers_fit(ctx, vq, *nbufs, sizes[0]);
++	return cedrus_queue_setup_fit(ctx, vq, *nbufs, sizes[0]);
+ }
+ 
+ static void cedrus_queue_cleanup(struct vb2_queue *vq, u32 state)
+-- 
+2.43.0
