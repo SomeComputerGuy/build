@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Sat, 14 Nov 2026 00:49:58 +0000
-Subject: [PATCH] drm/sun4i: Fix the H616 DE33 CDC offsets, coefficient range and interpolation
+Subject: [PATCH] drm/sun4i: cdc: Fix signed maths, D/K fields and LUT interpolation
 
 Three faults of the DE33 CDC colour pipeline:
 
@@ -15,12 +15,14 @@ Three faults of the DE33 CDC colour pipeline:
 - The D and K fields are unsigned 10-bit (D subtracted from the input,
   K added to the output; the vendor register layout has 10-bit fields,
   and the hardware reads back 0x3c0 for 0xffffffc0 and adds 960). A
-  negative offset was written as a two's complement K. Write the same
-  map with D and K in range instead: K = k - m * d + m * D for a D close
-  to d that keeps K in range (searched over the vertices of that
-  polytope, their centroid, points between them and the segment from d);
-  reject the map when none is found. Coefficients are written as their
-  20-bit field.
+  negative offset was written as a two's complement K. Write the map
+  with D and K in range instead: K = k - m * d + m * D for a D close to
+  d that keeps K in range (searched over the vertices of that polytope,
+  their centroid, points between them and the segment from d); reject
+  the map when none is found. This is the same map only if the CDC
+  keeps in - D signed for inputs below D, as the vendor YCbCr input
+  matrices need (D = 512 on Cb and Cr); that is not yet measured.
+  Coefficients are written as their 20-bit field.
 
 - The 3D LUT interpolates trilinearly (captures with random node values
   match a trilinear model exactly and differ from a tetrahedral one by
@@ -29,8 +31,8 @@ Three faults of the DE33 CDC colour pipeline:
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- drivers/gpu/drm/sun4i/sun50i_cdc.c | 247 ++++++++++++++++++++++++++---
- 1 file changed, 229 insertions(+), 18 deletions(-)
+ drivers/gpu/drm/sun4i/sun50i_cdc.c | 248 ++++++++++++++++++++++++++---
+ 1 file changed, 230 insertions(+), 18 deletions(-)
 
 diff --git a/drivers/gpu/drm/sun4i/sun50i_cdc.c b/drivers/gpu/drm/sun4i/sun50i_cdc.c
 index e72c2891b..cb21f1e49 100644
@@ -107,7 +109,7 @@ index e72c2891b..cb21f1e49 100644
  
  	return 0;
  }
-@@ -187,22 +195,225 @@ static void sun50i_cdc_from_ctm(struct sun50i_cdc_csc *csc,
+@@ -187,22 +195,226 @@ static void sun50i_cdc_from_ctm(struct sun50i_cdc_csc *csc,
  	}
  }
  
@@ -238,6 +240,7 @@ index e72c2891b..cb21f1e49 100644
 + * where no vertex rounds into it) and the segment from d to the best of
 + * these. Every candidate is checked exactly. A row without coefficients
 + * outputs its offset clipped to 0..1023, so that offset is clipped first.
++ * D > d is the same map only if the CSC keeps in - D signed below D.
 + */
 +static int sun50i_cdc_split(struct sun50i_cdc_csc *csc)
 +{
@@ -338,7 +341,7 @@ index e72c2891b..cb21f1e49 100644
  }
  
  static int sun50i_cdc_get_cfg(struct sun8i_layer *layer,
-@@ -328,13 +539,13 @@ static void sun50i_cdc_write_csc(struct sun8i_layer *layer,
+@@ -328,13 +540,13 @@ static void sun50i_cdc_write_csc(struct sun8i_layer *layer,
  
  	for (r = 0; r < 3; r++) {
  		sun50i_cdc_write(layer, in ? SUN50I_CDC_IN_D(r) : SUN50I_CDC_OUT_D(r),
@@ -356,7 +359,7 @@ index e72c2891b..cb21f1e49 100644
  	}
  }
  
-@@ -428,7 +639,7 @@ static struct drm_colorop *sun50i_cdc_add_op(struct drm_plane *plane,
+@@ -428,7 +640,7 @@ static struct drm_colorop *sun50i_cdc_add_op(struct drm_plane *plane,
  		ret = drm_plane_colorop_3dlut_init(plane->dev, op, plane,
  						   &sun50i_cdc_colorop_funcs,
  						   SUN50I_CDC_LUT_DIM,
