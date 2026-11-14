@@ -24,17 +24,22 @@ test_rx_discard, test_rx_unnec (frames passed up as
 CHECKSUM_UNNECESSARY), test_rx_unnec_err (... with bit 0 or 7 set),
 test_rx_err_d0 (RDES0 of the last such frame); knob
 test_rx_err_csum_none (bit 0 -> CHECKSUM_NONE, off by default).
+RX error summary check (review F5/F7): test_rx_err (RDES0 bits 1, 3,
+4, 6, 11 or 14), test_rx_err_es / test_rx_err_noes (... with bit 15
+set / clear), test_rx_noes_discard, test_rx_es_noerr (bit 15 alone),
+test_rx_len4 / test_rx_len4_alone (bit 4 RX_LENGTH_ERR), RDES0 of the
+last frame of each kind (test_rx_noes_d0, test_rx_es_d0).
 
 Assisted-by: Claude
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- drivers/net/ethernet/stmicro/stmmac/chain_mode.c  |   7 +-
- drivers/net/ethernet/stmicro/stmmac/common.h      |   1 +
- drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c |  33 ++++
- drivers/net/ethernet/stmicro/stmmac/norm_desc.c   |   3 +-
- drivers/net/ethernet/stmicro/stmmac/stmmac.h      |   5 +
- drivers/net/ethernet/stmicro/stmmac/stmmac_main.c | 187 +++++++++++++++++++++-
- 6 files changed, 229 insertions(+), 7 deletions(-)
+ .../net/ethernet/stmicro/stmmac/chain_mode.c  |   7 +-
+ drivers/net/ethernet/stmicro/stmmac/common.h  |   1 +
+ .../net/ethernet/stmicro/stmmac/dwmac-sun8i.c |  33 +++
+ .../net/ethernet/stmicro/stmmac/norm_desc.c   |   3 +-
+ drivers/net/ethernet/stmicro/stmmac/stmmac.h  |   5 +
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c | 228 +++++++++++++++++-
+ 6 files changed, 270 insertions(+), 7 deletions(-)
 
 diff --git a/drivers/net/ethernet/stmicro/stmmac/chain_mode.c b/drivers/net/ethernet/stmicro/stmmac/chain_mode.c
 index 42bf7a5..33cc03d 100644
@@ -81,10 +86,10 @@ index 20a7260..bf9ce5b 100644
  
  enum dma_irq_status {
 diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
-index c7dab99..54de7ff 100644
+index f785dc0..947f5f8 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
-@@ -321,6 +321,14 @@ static const struct emac_variant emac_variant_h6 = {
+@@ -323,6 +323,14 @@ static const struct emac_variant emac_variant_h6 = {
  #define SYSCON_ETCS_EXT_GMII	0x1
  #define SYSCON_ETCS_INT_GMII	0x2
  
@@ -99,7 +104,7 @@ index c7dab99..54de7ff 100644
  static int sun8i_dwmac_reset(void __iomem *ioaddr)
  {
  	u32 v;
-@@ -538,6 +546,28 @@ static int sun8i_dwmac_dma_interrupt(struct stmmac_priv *priv,
+@@ -540,6 +548,28 @@ static int sun8i_dwmac_dma_interrupt(struct stmmac_priv *priv,
  	 * Other TX_CTL1 writers run only at open/close.
  	 */
  	if (v & EMAC_TX_UNDERFLOW_INT) {
@@ -128,7 +133,7 @@ index c7dab99..54de7ff 100644
  		writel(readl(ioaddr + EMAC_TX_CTL1) | EMAC_TX_DMA_START,
  		       ioaddr + EMAC_TX_CTL1);
  		ret |= handle_tx;
-@@ -722,6 +752,9 @@ static void sun8i_dwmac_core_init(struct mac_device_info *hw,
+@@ -726,6 +756,9 @@ static void sun8i_dwmac_core_init(struct mac_device_info *hw,
  	void __iomem *ioaddr = hw->pcsr;
  	u32 v;
  
@@ -183,10 +188,10 @@ index 8ad6b57..33fec94 100644
  	unsigned int dma_buf_sz;
  	/* largest frame of the MTU, with two VLAN tags and the FCS */
 diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-index 68e01bf..01c714f 100644
+index 68e01bf..4687269 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-@@ -106,6 +106,135 @@ MODULE_PARM_DESC(pause, "Flow Control Pause Time (units of 512 bit times)");
+@@ -106,6 +106,176 @@ MODULE_PARM_DESC(pause, "Flow Control Pause Time (units of 512 bit times)");
  #define TC_DEFAULT 64
  static int tc = TC_DEFAULT;
  module_param(tc, int, 0644);
@@ -240,6 +245,28 @@ index 68e01bf..01c714f 100644
 +module_param(test_rx_err_d0, uint, 0444);
 +static bool test_rx_err_csum_none;
 +module_param(test_rx_err_csum_none, bool, 0644);
++/* H616 RDES0 error bits (UM 6.3.6.1): 1 CRC, 3 PHY, 4 length, 6 late
++ * collision, 11 overflow, 14 no buffer; bit 15 is "reserved" there
++ */
++#define TEST_RX_ERR_BITS (BIT(1) | BIT(3) | BIT(4) | BIT(6) | BIT(11) | BIT(14))
++static unsigned long test_rx_err;		/* any of those bits */
++module_param(test_rx_err, ulong, 0444);
++static unsigned long test_rx_err_es;		/* ... with bit 15 set */
++module_param(test_rx_err_es, ulong, 0444);
++static unsigned long test_rx_err_noes;		/* ... with bit 15 clear */
++module_param(test_rx_err_noes, ulong, 0444);
++static unsigned long test_rx_es_noerr;		/* bit 15 without those bits */
++module_param(test_rx_es_noerr, ulong, 0444);
++static unsigned long test_rx_len4;		/* bit 4 RX_LENGTH_ERR */
++module_param(test_rx_len4, ulong, 0444);
++static unsigned long test_rx_len4_alone;	/* bit 4, no other error bit */
++module_param(test_rx_len4_alone, ulong, 0444);
++static unsigned long test_rx_noes_discard;	/* err_noes frames discarded */
++module_param(test_rx_noes_discard, ulong, 0444);
++static u32 test_rx_noes_d0;			/* RDES0 of the last err_noes */
++module_param(test_rx_noes_d0, uint, 0444);
++static u32 test_rx_es_d0;			/* RDES0 of the last err_es */
++module_param(test_rx_es_d0, uint, 0444);
 +
 +/* last descriptor of a frame: count its RDES0 bits, returns RDES0 */
 +static u32 stmmac_test_rx_desc(struct dma_desc *p, int *status)
@@ -257,6 +284,25 @@ index 68e01bf..01c714f 100644
 +		test_rx_es++;
 +	if (d0 & (BIT(0) | BIT(7)))
 +		test_rx_err_d0 = d0;
++	if (d0 & TEST_RX_ERR_BITS) {
++		test_rx_err++;
++		if (d0 & BIT(15)) {
++			test_rx_err_es++;
++			test_rx_es_d0 = d0;
++		} else {
++			test_rx_err_noes++;
++			test_rx_noes_d0 = d0;
++			if (*status == discard_frame)
++				test_rx_noes_discard++;
++		}
++	} else if (d0 & BIT(15)) {
++		test_rx_es_noerr++;
++	}
++	if (d0 & BIT(4)) {
++		test_rx_len4++;
++		if (!(d0 & (TEST_RX_ERR_BITS & ~BIT(4))))
++			test_rx_len4_alone++;
++	}
 +	if (*status == discard_frame)
 +		test_rx_discard++;
 +	else if (test_rx_err_csum_none && (d0 & BIT(0)))
@@ -322,7 +368,7 @@ index 68e01bf..01c714f 100644
  MODULE_PARM_DESC(tc, "DMA threshold control value");
  
  /* This is unused */
-@@ -2810,6 +2939,29 @@ static void stmmac_bump_dma_threshold(struct stmmac_priv *priv, u32 chan)
+@@ -2810,6 +2980,29 @@ static void stmmac_bump_dma_threshold(struct stmmac_priv *priv, u32 chan)
  	}
  }
  
@@ -352,7 +398,7 @@ index 68e01bf..01c714f 100644
  /**
   * stmmac_tx_clean - to manage the transmission completion
   * @priv: driver private structure
-@@ -2828,10 +2980,13 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
+@@ -2828,10 +3021,13 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
  	unsigned int bytes_compl = 0, pkts_compl = 0;
  	unsigned int entry, xmits = 0, count = 0;
  	u32 tx_packets = 0, tx_errors = 0;
@@ -366,7 +412,7 @@ index 68e01bf..01c714f 100644
  
  	entry = tx_q->dirty_tx;
  
-@@ -2867,6 +3022,8 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
+@@ -2867,6 +3063,8 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
  		 */
  		dma_rmb();
  
@@ -375,7 +421,7 @@ index 68e01bf..01c714f 100644
  		/* Just consider the last segment and ...*/
  		if (likely(!(status & tx_not_ls))) {
  			/* ... verify the status error condition */
-@@ -2936,7 +3093,16 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
+@@ -2936,7 +3134,16 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
  			if (likely(skb)) {
  				pkts_compl++;
  				bytes_compl += skb->len;
@@ -393,7 +439,7 @@ index 68e01bf..01c714f 100644
  				tx_q->tx_skbuff[entry] = NULL;
  			}
  		}
-@@ -2998,6 +3164,9 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
+@@ -2998,6 +3205,9 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
  
  	__netif_tx_unlock_bh(netdev_get_tx_queue(priv->dev, queue));
  
@@ -403,7 +449,7 @@ index 68e01bf..01c714f 100644
  	/* Combine decisions from TX clean and XSK TX */
  	return max(count, xmits);
  }
-@@ -4163,6 +4332,9 @@ static int __stmmac_open(struct net_device *dev,
+@@ -4163,6 +4373,9 @@ static int __stmmac_open(struct net_device *dev,
  			dma_conf->tx_queue[i].tbs = priv->dma_conf.tx_queue[i].tbs;
  	memcpy(&priv->dma_conf, dma_conf, sizeof(*dma_conf));
  
@@ -413,7 +459,7 @@ index 68e01bf..01c714f 100644
  	/* The PHY is suspended when the interface is reopened without
  	 * disconnecting the PHY, e.g. on MTU change. IEEE 802.3 allows PHYs
  	 * to stop their receive clock while powered down, but the DMA
-@@ -4855,7 +5027,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
+@@ -4855,7 +5068,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
  	 */
  	if (priv->descriptor_mode == STMMAC_CHAIN_MODE &&
  	    priv->hw->desc == &ndesc_ops && nfrags &&
@@ -422,7 +468,7 @@ index 68e01bf..01c714f 100644
  		if (skb_linearize(skb))
  			goto max_sdu_err;
  		nfrags = 0;
-@@ -5791,6 +5963,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+@@ -5791,6 +6004,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
  	bool fcs_stripped = false;
  	int xdp_status = 0;
  	int bufsz;
@@ -430,7 +476,7 @@ index 68e01bf..01c714f 100644
  
  	dma_dir = page_pool_get_dma_dir(rx_q->page_pool);
  	bufsz = DIV_ROUND_UP(priv->dma_conf.dma_buf_sz, PAGE_SIZE) * PAGE_SIZE;
-@@ -5839,6 +6012,8 @@ read_again:
+@@ -5839,6 +6053,8 @@ read_again:
  		/* check if managed by the DMA otherwise go ahead */
  		if (unlikely(status & dma_own))
  			break;
@@ -439,7 +485,7 @@ index 68e01bf..01c714f 100644
  
  		next_entry = STMMAC_NEXT_ENTRY(rx_q->cur_rx,
  					       priv->dma_conf.dma_rx_size);
-@@ -6041,10 +6216,14 @@ drain_data:
+@@ -6041,10 +6257,14 @@ drain_data:
  		skb->protocol = eth_type_trans(skb, priv->dev);
  
  		if (unlikely(!coe) || !stmmac_has_ip_ethertype(skb) ||
@@ -458,3 +504,4 @@ index 68e01bf..01c714f 100644
  			skb_set_hash(skb, hash, hash_type);
 -- 
 Armbian
+
