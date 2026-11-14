@@ -1,16 +1,17 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
-Date: Fri, 13 Nov 2026 23:00:00 +0000
-Subject: [PATCH] net: stmmac: dwmac-sun8i: RX threshold mode above half the
- RX FIFO
+Date: Sat, 14 Nov 2026 01:00:00 +0000
+Subject: [PATCH] net: stmmac: dwmac-sun8i: RX threshold mode for frames near
+ the RX FIFO size
 
 In store-and-forward mode the RX DMA starts only when the whole frame is
-in the 16 KiB RX FIFO. With frames near 16 KiB the next frame, arriving
-back to back, finds a full FIFO unless the DMA drains at once, and the
-RX FIFO overflows (TCP at 16 KiB frames: 53 of 76321 frames lost).
+in the 16 KiB RX FIFO. A 16372-byte frame leaves 12 bytes for the next
+frame arriving back to back, and the RX FIFO overflows whenever the DMA
+does not drain at once (TCP at that size: 53 of 76321 frames lost;
+9018-byte frames: none).
 
-Receive in threshold mode (RX_TH 32, as the vendor driver does at every
-MTU) when the largest frame of the MTU is more than half the RX FIFO.
+Receive in threshold mode (RX_TH 64, the reset value) when the largest
+frame of the MTU leaves less than 4 KiB of the RX FIFO free.
 stmmac_dma_conf gains max_frame for this.
 
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
@@ -21,7 +22,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  3 files changed, 11 insertions(+)
 
 diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
-index 6a438dd..d3314ea 100644
+index 6a438dd..c7dab99 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
 @@ -585,6 +585,14 @@ static void sun8i_dwmac_dma_operation_mode_rx(struct stmmac_priv *priv,
@@ -29,12 +30,12 @@ index 6a438dd..d3314ea 100644
  	u32 v;
  
 +	/* In store-and-forward mode the RX DMA starts once the whole frame
-+	 * is in the FIFO. A frame larger than half of the FIFO leaves no room
-+	 * for the next one arriving back to back: receive in threshold mode,
-+	 * as the vendor driver does at every MTU (RX_TH 32).
++	 * is in the FIFO. With less than 4 KiB left, a frame arriving back to
++	 * back overflows the FIFO unless the DMA drains it at once: receive
++	 * frames that large in threshold mode (RX_TH 64, the reset value).
 +	 */
-+	if (mode == SF_DMA_MODE && priv->dma_conf.max_frame > fifosz / 2)
-+		mode = 32;
++	if (mode == SF_DMA_MODE && priv->dma_conf.max_frame > fifosz - 4096)
++		mode = 64;
 +
  	v = readl(ioaddr + EMAC_RX_CTL1);
  	if (mode == SF_DMA_MODE) {
