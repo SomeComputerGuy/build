@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 12:00:00 +0000
-Subject: crypto: ecc - Take P-521 private keys of 66 bytes and generate them in range
+Subject: crypto: ecc - Fix P-521 private keys, key generation and ECDH
 
 ecc_gen_privkey() takes ndigits * 8 = 72 random bytes for P-521, a
 576-bit number, which is almost never below the 521-bit order: key
@@ -20,7 +20,7 @@ bit length too.
 ecc_point_mult() makes the scalar k + n or k + 2n so that the ladder can
 start from a fixed top bit. For P-521, k + n never carries out of the
 nine digits, so it always took k + 2n with bit 522 as the top bit, which
-is set only for k above about 2^261: smaller keys (ECDH accepts keys
+is set only for k above about 2^260: smaller keys (ECDH accepts keys
 from 2) gave (k + 2^522) * P. Pick whichever of k + n and k + 2n has bit
 521 set and start there. Mainline only calls it with k = n on P-521.
 
