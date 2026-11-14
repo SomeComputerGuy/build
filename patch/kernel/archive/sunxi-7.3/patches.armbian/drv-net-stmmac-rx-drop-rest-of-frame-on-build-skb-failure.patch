@@ -1,30 +1,37 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From f10b69226150111b9db2eceff39cc41907814fe7 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
-Date: Fri, 13 Nov 2026 04:10:00 +0000
+Date: Fri, 13 Nov 2026 03:59:55 +0000
 Subject: [PATCH] net: stmmac: drop the rest of the frame when napi_build_skb() fails
 
 If napi_build_skb() fails on the first buffer of a frame that spans
 several descriptors, stmmac_rx() drops that buffer but goes on with the
 next descriptor of the same frame as if a new frame started there. The
-rest of the frame is then passed up the stack as a frame of its own.
+rest of the frame is then passed up the stack as a frame of its own. A
+frame spans several descriptors when it does not fit in the RX buffers
+of one descriptor.
 
 Mark the frame as errored instead, so that its remaining descriptors are
 discarded like those of a frame with a receive error. The frame is
 counted once in rx_dropped and once against the NAPI budget.
 
-7.3 backport: the poll also keeps the frame state when it stops at a
-descriptor the DMA still owns, so the rest of a dropped frame is still
-discarded in the next poll. Upstream does this since
-commit 26219e9402c2 ("net: stmmac: take ownership of saved RX state at poll entry").
-
 Fixes: ec222003bd94 ("net: stmmac: Prepare to add Split Header support")
-Assisted-by: Claude
+Cc: stable@vger.kernel.org
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+[ 7.3: the poll here does not yet keep the frame state when it stops at
+  a descriptor the DMA still owns (upstream commit 26219e9402c2 "net:
+  stmmac: take ownership of saved RX state at poll entry"), so this
+  version also saves the state while a frame is in progress, and counts
+  the dropped frame where 7.4 uses the "next" label. ]
+Link: https://lore.kernel.org/r/20261113-stmmac-rx-skb-fail-v1-1-fcaae89f2d2c@gmail.com
 ---
+ drivers/net/ethernet/stmicro/stmmac/stmmac_main.c | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
 diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 111111111111..222222222222 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-@@ -5912,6 +5912,7 @@
+@@ -5745,6 +5745,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
  	unsigned int count = 0, error = 0, len = 0;
  	int status = 0, coe = priv->hw->rx_csum;
  	unsigned int next_entry = rx_q->cur_rx;
@@ -32,7 +39,7 @@ diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/eth
  	enum dma_data_direction dma_dir;
  	unsigned int desc_size;
  	struct sk_buff *skb = NULL;
-@@ -5979,6 +5980,8 @@
+@@ -5812,6 +5813,8 @@ read_again:
  
  		prefetch(np);
  
@@ -40,8 +47,8 @@ diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/eth
 +
  		if (priv->extend_desc)
  			stmmac_rx_extended_status(priv, &priv->xstats, rx_q->dma_erx + entry);
- 		if (unlikely(status == discard_frame)) {
-@@ -6098,7 +6101,7 @@
+ 
+@@ -5923,7 +5926,7 @@ read_again:
  							 buf->page);
  				buf->page = NULL;
  				rx_dropped++;
@@ -50,7 +57,7 @@ diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/eth
  				goto drain_data;
  			}
  
-@@ -6129,8 +6132,10 @@
+@@ -5954,8 +5957,10 @@ read_again:
  drain_data:
  		if (likely(status & rx_not_ls))
  			goto read_again;
@@ -62,7 +69,7 @@ diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/eth
  
  		/* Got entire packet into SKB. Finish it. */
  
-@@ -6172,7 +6177,7 @@
+@@ -5997,7 +6002,7 @@ drain_data:
  		count++;
  	}
  
@@ -72,4 +79,5 @@ diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/eth
  		rx_q->state.skb = skb;
  		rx_q->state.error = error;
 -- 
-2.43.0
+Armbian
+

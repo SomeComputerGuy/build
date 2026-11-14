@@ -27,8 +27,7 @@ and trim the frame to its length, so that the checksum byte at the end
 of the buffer before is dropped as well. dwmac-sun8i has a type 2 engine;
 the type 1 case is not tested.
 
-[backport to 7.3.3: replaces the local drop-multi-descriptor-frame-tails hunk instead of
- the v7.4 834ec9530832 code; same resulting code]
+[7.3: applies on top of the backport of 834ec9530832]
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
@@ -40,19 +39,13 @@ diff --git a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c b/drivers/net/ether
 index 2cc273b..de30dfd 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/norm_desc.c
-@@ -68,16 +68,9 @@ static int ndesc_get_rx_status(struct stmmac_extra_stats *x,
+@@ -68,10 +68,9 @@ static int ndesc_get_rx_status(struct stmmac_extra_stats *x,
  	if (unlikely(rdes0 & RDES0_OWN))
  		return dma_own;
  
--	/* Frames spanning more than one descriptor are not supported with
--	 * normal descriptors: drop every descriptor of such a frame. Checking
--	 * only the last descriptor bit would hand the tail of the frame to
--	 * stmmac_rx() as if it were a complete frame.
--	 */
--	if (unlikely(!(rdes0 & RDES0_LAST_DESCRIPTOR) ||
--		     !(rdes0 & RDES0_FIRST_DESCRIPTOR))) {
+-	if (unlikely(!(rdes0 & RDES0_LAST_DESCRIPTOR))) {
 -		x->rx_length++;
--		return discard_frame;
+-		return discard_frame | rx_not_ls;
 -	}
 +	/* The status is only valid in the last descriptor of a frame */
 +	if (!(rdes0 & RDES0_LAST_DESCRIPTOR))
@@ -60,7 +53,7 @@ index 2cc273b..de30dfd 100644
  
  	if (unlikely(rdes0 & RDES0_ERROR_SUMMARY)) {
  		if (unlikely(rdes0 & RDES0_DESCRIPTOR_ERROR))
-@@ -117,12 +110,9 @@ static int ndesc_get_rx_status(struct stmmac_extra_stats *x,
+@@ -111,12 +110,9 @@ static int ndesc_get_rx_status(struct stmmac_extra_stats *x,
  static void ndesc_init_rx_desc(struct dma_desc *p, int disable_rx_ic,
  			       u8 descriptor_mode, int end, int bfsize)
  {
