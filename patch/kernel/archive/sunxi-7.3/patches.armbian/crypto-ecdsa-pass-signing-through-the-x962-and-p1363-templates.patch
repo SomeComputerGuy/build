@@ -23,7 +23,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  4 files changed, 116 insertions(+)
 
 diff --git a/crypto/ecc.c b/crypto/ecc.c
-index d4d05d8..54ca43c 100644
+index 9e21372..9744083 100644
 --- a/crypto/ecc.c
 +++ b/crypto/ecc.c
 @@ -90,6 +90,16 @@ void ecc_digits_from_bytes(const u8 *in, unsigned int nbytes,

@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Erwin Pawliczek <pawliczekerwin@gmail.com>
+Date: Sun, 25 Oct 2026 22:44:29 -0500
+Subject: crypto: ecc - Randomize the initial Z in ecc_make_pub_key()
+
+ecc_make_pub_key() calls ecc_point_mult() without an initial Z, so the
+final Z, and therefore the input to vli_mod_inv(), is a deterministic
+function of the private key. vli_mod_inv() is not constant time, so
+key generation leaks information about the private key through its
+running time.
+
+crypto_ecdh_shared_secret() already passes a random initial Z, which
+blinds the inversion input. Do the same in ecc_make_pub_key().
+
+Key generation is used in the kernel by Bluetooth SMP and TPM2 HMAC
+sessions, which generate ephemeral P-256 keys.
+
+crypto_kpp_generate_public_key(), KVM guest on an i7-1165G7 (median
+over 4 boots of the best of 9 runs of 300 calls):
+
+    P-256:   744.9 us ->  753.2 us (+1.1%; within noise)
+    P-384:  1674.2 us -> 1651.6 us (-1.4%; within noise)
+
+Suggested-by: Ignat Korchagin <ignat@linux.win>
+Signed-off-by: Erwin Pawliczek <pawliczekerwin@gmail.com>
+Reviewed-by: Ignat Korchagin <ignat@linux.win>
+Signed-off-by: Herbert Xu <herbert@gondor.apana.org.au>
+(cherry picked from commit cd65eaf17841ac76f93a0c0806215cbd0e1cd980)
+---
+ crypto/ecc.c | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/crypto/ecc.c b/crypto/ecc.c
+index c7366eb..6696bf0 100644
+--- a/crypto/ecc.c
++++ b/crypto/ecc.c
+@@ -1614,20 +1614,26 @@ int ecc_make_pub_key(unsigned int curve_id, unsigned int ndigits,
+ {
+ 	int ret = 0;
+ 	struct ecc_point *pk;
++	u64 rand_z[ECC_MAX_DIGITS];
++	unsigned int nbytes;
+ 	const struct ecc_curve *curve = ecc_get_curve(curve_id);
+ 
+-	if (!private_key) {
++	if (!private_key || ndigits > ARRAY_SIZE(rand_z)) {
+ 		ret = -EINVAL;
+ 		goto out;
+ 	}
+ 
++	nbytes = ndigits << ECC_DIGITS_TO_BYTES_SHIFT;
++
++	get_random_bytes(rand_z, nbytes);
++
+ 	pk = ecc_alloc_point(ndigits);
+ 	if (!pk) {
+ 		ret = -ENOMEM;
+ 		goto out;
+ 	}
+ 
+-	ecc_point_mult(pk, &curve->g, private_key, NULL, curve, ndigits);
++	ecc_point_mult(pk, &curve->g, private_key, rand_z, curve, ndigits);
+ 
+ 	/* SP800-56A rev 3 5.6.2.1.3 key check */
+ 	if (ecc_is_pubkey_valid_full(curve, pk)) {
+@@ -1641,6 +1647,7 @@ int ecc_make_pub_key(unsigned int curve_id, unsigned int ndigits,
+ err_free_point:
+ 	ecc_free_point(pk);
+ out:
++	memzero_explicit(rand_z, sizeof(rand_z));
+ 	return ret;
+ }
+ EXPORT_SYMBOL(ecc_make_pub_key);

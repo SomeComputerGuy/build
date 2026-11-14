@@ -11,27 +11,27 @@ FIPS 186-5 A.2.2 asks.
 ecc_is_key_valid() wants the key to be ndigits * 8 bytes long; for P-521
 also take the curve size, 66 bytes.
 
-crypto_ecdh_shared_secret() starts the ladder from a random Z of
-ndigits * 8 bytes. For P-521 that is up to 576 bits, but
-vli_mmod_fast_521() only reduces products of numbers below 2^521: with
-the extra bits the shared secret comes out wrong. Keep Z to the curve's
-bit length too.
+crypto_ecdh_shared_secret() and ecc_make_pub_key() start the ladder
+from a random Z of ndigits * 8 bytes. For P-521 that is up to 576 bits,
+but vli_mmod_fast_521() only reduces products of numbers below 2^521:
+with the extra bits the result comes out wrong. Get Z from one helper
+that keeps it to the curve's bit length.
 
 ecc_point_mult() makes the scalar k + n or k + 2n so that the ladder can
 start from a fixed top bit. For P-521, k + n never carries out of the
 nine digits, so it always took k + 2n with bit 522 as the top bit, which
-is set only for k above about 2^260: smaller keys (ECDH accepts keys
+is set only for k above about 2^259.5: smaller keys (ECDH accepts keys
 from 2) gave (k + 2^522) * P. Pick whichever of k + n and k + 2n has bit
 521 set and start there. Mainline only calls it with k = n on P-521.
 
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- crypto/ecc.c | 20 +++++++++++++++-----
- 1 file changed, 15 insertions(+), 5 deletions(-)
+ crypto/ecc.c | 37 ++++++++++++++++++++++++-------------
+ 1 file changed, 24 insertions(+), 13 deletions(-)
 
 diff --git a/crypto/ecc.c b/crypto/ecc.c
-index c7366eb..67dcea3 100644
+index 6696bf0..9e21372 100644
 --- a/crypto/ecc.c
 +++ b/crypto/ecc.c
 @@ -1365,11 +1365,14 @@ static void ecc_point_mult(struct ecc_point *result,
@@ -44,7 +44,7 @@ index c7366eb..67dcea3 100644
 -	else
 +	if (curve->nbits == 521) {	/* NIST P521 */
 +		/* k + n or k + 2n, whichever has bit 521 as its top bit */
-+		carry = vli_test_bit(sk[0], curve->nbits);
++		carry = !!vli_test_bit(sk[0], curve->nbits);
 +		num_bits = curve->nbits + 1;
 +	} else {
  		num_bits = sizeof(u64) * ndigits * 8 + 1;
@@ -73,13 +73,57 @@ index c7366eb..67dcea3 100644
  
  	/* Step 4: make sure the private key is in the valid range. */
  	if (__ecc_is_key_valid(curve, private_key, ndigits))
-@@ -1723,6 +1730,9 @@ int crypto_ecdh_shared_secret(unsigned int curve_id, unsigned int ndigits,
- 	nbytes = ndigits << ECC_DIGITS_TO_BYTES_SHIFT;
+@@ -1609,13 +1616,22 @@ int ecc_gen_privkey(unsigned int curve_id, unsigned int ndigits,
+ }
+ EXPORT_SYMBOL(ecc_gen_privkey);
  
- 	get_random_bytes(rand_z, nbytes);
++/* Random initial Z for ecc_point_mult(), below 2^nbits */
++static void ecc_rand_z(const struct ecc_curve *curve, u64 *z,
++		       unsigned int ndigits)
++{
++	get_random_bytes(z, ndigits << ECC_DIGITS_TO_BYTES_SHIFT);
 +	/* P-521: the fast reduction only takes products of 521-bit numbers */
 +	if (curve->nbits % 64)
-+		rand_z[ndigits - 1] &= GENMASK_ULL(curve->nbits % 64 - 1, 0);
++		z[ndigits - 1] &= GENMASK_ULL(curve->nbits % 64 - 1, 0);
++}
++
+ int ecc_make_pub_key(unsigned int curve_id, unsigned int ndigits,
+ 		     const u64 *private_key, u64 *public_key)
+ {
+ 	int ret = 0;
+ 	struct ecc_point *pk;
+ 	u64 rand_z[ECC_MAX_DIGITS];
+-	unsigned int nbytes;
+ 	const struct ecc_curve *curve = ecc_get_curve(curve_id);
+ 
+ 	if (!private_key || ndigits > ARRAY_SIZE(rand_z)) {
+@@ -1623,9 +1639,7 @@ int ecc_make_pub_key(unsigned int curve_id, unsigned int ndigits,
+ 		goto out;
+ 	}
+ 
+-	nbytes = ndigits << ECC_DIGITS_TO_BYTES_SHIFT;
+-
+-	get_random_bytes(rand_z, nbytes);
++	ecc_rand_z(curve, rand_z, ndigits);
+ 
+ 	pk = ecc_alloc_point(ndigits);
+ 	if (!pk) {
+@@ -1719,7 +1733,6 @@ int crypto_ecdh_shared_secret(unsigned int curve_id, unsigned int ndigits,
+ 	int ret = 0;
+ 	struct ecc_point *product, *pk;
+ 	u64 rand_z[ECC_MAX_DIGITS];
+-	unsigned int nbytes;
+ 	const struct ecc_curve *curve = ecc_get_curve(curve_id);
+ 
+ 	if (!private_key || !public_key || ndigits > ARRAY_SIZE(rand_z)) {
+@@ -1727,9 +1740,7 @@ int crypto_ecdh_shared_secret(unsigned int curve_id, unsigned int ndigits,
+ 		goto out;
+ 	}
+ 
+-	nbytes = ndigits << ECC_DIGITS_TO_BYTES_SHIFT;
+-
+-	get_random_bytes(rand_z, nbytes);
++	ecc_rand_z(curve, rand_z, ndigits);
  
  	pk = ecc_alloc_point(ndigits);
  	if (!pk) {
