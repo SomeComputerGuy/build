@@ -1,0 +1,48 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 14 Nov 2026 11:10:00 +0000
+Subject: [PATCH 2/4] drm/bridge: dw-hdmi: Attach the color format property
+
+When a bridge in front of dw-hdmi takes part in the bus format
+selection, dw-hdmi offers RGB, YUV 4:4:4, YUV 4:2:2 and YUV 4:2:0 output
+formats, but the connector it creates has no way for userspace to pick
+one: the first entry that the chain accepts is always used. The DRM
+core has a "color format" connector property for that, and the bridge
+chain already skips bus formats that do not match the requested one.
+
+Attach it, with YUV 4:2:0 only where the connector allows it, when
+the output format is negotiated. When dw-hdmi is the first or only
+bridge its output is fixed, so the property is not attached there.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+index 5f26c81..d3a9ddc 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+@@ -2748,6 +2748,24 @@ static int dw_hdmi_connector_create(struct dw_hdmi *hdmi)
+ 
+ 	drm_connector_attach_max_bpc_property(connector, 8, 16);
+ 
++	/*
++	 * The output format is only negotiated when a bridge in front of
++	 * this one takes part in the bus format selection; otherwise the
++	 * output is fixed to RGB and a color format request has no effect.
++	 */
++	if (!list_is_singular(&hdmi->bridge.encoder->bridge_chain) &&
++	    !list_is_first(&hdmi->bridge.chain_node,
++			   &hdmi->bridge.encoder->bridge_chain)) {
++		unsigned long formats = BIT(DRM_OUTPUT_COLOR_FORMAT_RGB444) |
++					BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR444) |
++					BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR422);
++
++		if (connector->ycbcr_420_allowed)
++			formats |= BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR420);
++
++		drm_connector_attach_color_format_property(connector, formats);
++	}
++
+ 	if (hdmi->version >= 0x200a && hdmi->plat_data->use_drm_infoframe) {
+ 		drm_connector_attach_hdr_output_metadata_property(connector);
+ 

@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 14 Nov 2026 11:10:00 +0000
+Subject: [PATCH 3/4] drm/bridge: dw-hdmi: Attach the Broadcast RGB property
+
+dw-hdmi always sends RGB in the quantization range that CTA-861 makes
+the default for the mode: limited for every CTA mode on an HDMI sink,
+full otherwise. Sinks that ignore the AVI InfoFrame quantization range
+then crush or wash out the picture, and userspace has no way to
+override it, unlike on other HDMI drivers.
+
+Attach the "Broadcast RGB" property and take the range from it, with
+Automatic keeping the current behaviour. The range is applied by the
+CSC and signalled in the AVI InfoFrame only on a mode set, so force
+one when the property changes.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+index d3a9ddc..cf7df73 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+@@ -2401,9 +2401,19 @@ static int dw_hdmi_setup(struct dw_hdmi *hdmi,
+ 	if (hdmi->hdmi_data.enc_out_bus_format == MEDIA_BUS_FMT_FIXED)
+ 		hdmi->hdmi_data.enc_out_bus_format = MEDIA_BUS_FMT_RGB888_1X24;
+ 
+-	hdmi->hdmi_data.rgb_limited_range = hdmi->sink_is_hdmi &&
+-		drm_default_rgb_quant_range(mode) ==
+-		HDMI_QUANTIZATION_RANGE_LIMITED;
++	switch (connector->state->hdmi.broadcast_rgb) {
++	case DRM_HDMI_BROADCAST_RGB_FULL:
++		hdmi->hdmi_data.rgb_limited_range = false;
++		break;
++	case DRM_HDMI_BROADCAST_RGB_LIMITED:
++		hdmi->hdmi_data.rgb_limited_range = true;
++		break;
++	default:
++		hdmi->hdmi_data.rgb_limited_range = hdmi->sink_is_hdmi &&
++			drm_default_rgb_quant_range(mode) ==
++			HDMI_QUANTIZATION_RANGE_LIMITED;
++		break;
++	}
+ 
+ 	hdmi->hdmi_data.pix_repet_factor = 0;
+ 	hdmi->hdmi_data.hdcp_enable = 0;
+@@ -2679,7 +2689,8 @@ static int dw_hdmi_connector_atomic_check(struct drm_connector *connector,
+ 	 * the display engine may convert to a different YCbCr encoding.
+ 	 */
+ 	if (!drm_connector_atomic_hdr_metadata_equal(old_state, new_state) ||
+-	    old_state->colorspace != new_state->colorspace) {
++	    old_state->colorspace != new_state->colorspace ||
++	    old_state->hdmi.broadcast_rgb != new_state->hdmi.broadcast_rgb) {
+ 		crtc_state = drm_atomic_get_crtc_state(state, crtc);
+ 		if (IS_ERR(crtc_state))
+ 			return PTR_ERR(crtc_state);
+@@ -2747,6 +2758,7 @@ static int dw_hdmi_connector_create(struct dw_hdmi *hdmi)
+ 	drm_atomic_helper_connector_reset(connector);
+ 
+ 	drm_connector_attach_max_bpc_property(connector, 8, 16);
++	drm_connector_attach_broadcast_rgb_property(connector);
+ 
+ 	/*
+ 	 * The output format is only negotiated when a bridge in front of

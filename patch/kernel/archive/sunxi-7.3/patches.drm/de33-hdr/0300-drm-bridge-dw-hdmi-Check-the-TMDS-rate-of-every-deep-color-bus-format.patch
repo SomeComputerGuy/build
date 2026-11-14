@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 14 Nov 2026 11:10:00 +0000
+Subject: [PATCH 1/4] drm/bridge: dw-hdmi: Check the TMDS rate of every deep color bus format
+
+Where the platform states its maximum TMDS character rate, the deep
+color RGB and YUV 4:2:2 formats preferred ahead of RGB888 are only
+listed if their rate fits, but the deep color RGB, YUV 4:4:4 and
+YUV 4:2:2 formats listed after RGB888 are not checked at all. With
+automatic format selection RGB888 always wins before them, but once a
+connector can request a color format the first matching entry is
+used, e.g. 10-bit RGB at 3840x2160@60, a 742.5 MHz TMDS rate on a
+600 MHz link.
+
+List RGB and YUV 4:4:4 only at depths whose TMDS rate fits, and
+YUV 4:2:2, which runs at the pixel rate at any depth, only where the
+8-bit rate fits. Platforms without a stated limit are unchanged.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+index 55d5ae7..5f26c81 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+@@ -2845,6 +2845,7 @@ static u32 *dw_hdmi_bridge_atomic_get_output_bus_fmts(struct drm_bridge *bridge,
+ 	bool is_hdmi2_sink = info->hdmi.scdc.supported ||
+ 			     (info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR420));
+ 	bool rgb12_first = false, rgb10_first = false, yuv422_first = false;
++	bool fits16 = true, fits12 = true, fits10 = true, fits8 = true;
+ 	u32 *output_fmts;
+ 	unsigned int i = 0;
+ 
+@@ -2871,6 +2872,20 @@ static u32 *dw_hdmi_bridge_atomic_get_output_bus_fmts(struct drm_bridge *bridge,
+ 	 * which carries up to 12 bits at the pixel rate and keeps twice the
+ 	 * chroma resolution of YUV 4:2:0.
+ 	 */
++	/*
++	 * Where the platform states its TMDS limit, list RGB and YUV 4:4:4
++	 * only at depths whose TMDS rate fits, and YUV 4:2:2 (which runs at
++	 * the pixel rate at any depth) only where the 8-bit rate fits, so
++	 * that a color format request cannot pick a format the link cannot
++	 * carry.
++	 */
++	if (hdmi->plat_data->deep_color_max_tmds_clock) {
++		fits16 = dw_hdmi_deep_color_fits(hdmi, info, mode, 16);
++		fits12 = dw_hdmi_deep_color_fits(hdmi, info, mode, 12);
++		fits10 = dw_hdmi_deep_color_fits(hdmi, info, mode, 10);
++		fits8 = dw_hdmi_deep_color_fits(hdmi, info, mode, 8);
++	}
++
+ 	if (hdmi->plat_data->deep_color_max_tmds_clock &&
+ 	    !(conn->ycbcr_420_allowed && drm_mode_is_420_only(info, mode))) {
+ 		rgb12_first = max_bpc >= 12 && info->bpc >= 12 &&
+@@ -2930,7 +2945,7 @@ static u32 *dw_hdmi_bridge_atomic_get_output_bus_fmts(struct drm_bridge *bridge,
+ 	/* Default 8bit RGB fallback */
+ 	output_fmts[i++] = MEDIA_BUS_FMT_RGB888_1X24;
+ 
+-	if (max_bpc >= 16 && info->bpc == 16) {
++	if (max_bpc >= 16 && info->bpc == 16 && fits16) {
+ 		if (info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR444))
+ 			output_fmts[i++] = MEDIA_BUS_FMT_YUV16_1X48;
+ 
+@@ -2938,32 +2953,37 @@ static u32 *dw_hdmi_bridge_atomic_get_output_bus_fmts(struct drm_bridge *bridge,
+ 	}
+ 
+ 	if (max_bpc >= 12 && info->bpc >= 12) {
+-		if (info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR422))
++		if ((info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR422)) &&
++		    fits8)
+ 			output_fmts[i++] = MEDIA_BUS_FMT_UYVY12_1X24;
+ 
+-		if (info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR444))
++		if ((info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR444)) &&
++		    fits12)
+ 			output_fmts[i++] = MEDIA_BUS_FMT_YUV12_1X36;
+ 
+-		if (!rgb12_first)
++		if (!rgb12_first && fits12)
+ 			output_fmts[i++] = MEDIA_BUS_FMT_RGB121212_1X36;
+ 	}
+ 
+ 	if (max_bpc >= 10 && info->bpc >= 10) {
+ 		if ((info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR422)) &&
+-		    !yuv422_first)
++		    !yuv422_first && fits8)
+ 			output_fmts[i++] = MEDIA_BUS_FMT_UYVY10_1X20;
+ 
+-		if (info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR444))
++		if ((info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR444)) &&
++		    fits10)
+ 			output_fmts[i++] = MEDIA_BUS_FMT_YUV10_1X30;
+ 
+-		if (!rgb10_first)
++		if (!rgb10_first && fits10)
+ 			output_fmts[i++] = MEDIA_BUS_FMT_RGB101010_1X30;
+ 	}
+ 
+-	if (info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR422))
++	if ((info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR422)) &&
++	    fits8)
+ 		output_fmts[i++] = MEDIA_BUS_FMT_UYVY8_1X16;
+ 
+-	if (info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR444))
++	if ((info->color_formats & BIT(DRM_OUTPUT_COLOR_FORMAT_YCBCR444)) &&
++	    fits8)
+ 		output_fmts[i++] = MEDIA_BUS_FMT_YUV8_1X24;
+ 
+ 	*num_output_fmts = i;

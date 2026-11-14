@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 14 Nov 2026 11:10:00 +0000
+Subject: [PATCH 4/4] drm/bridge: dw-hdmi: Attach the content type property
+
+The AVI InfoFrame of dw-hdmi never carries an IT content type, so a
+sink cannot switch to a mode suited to graphics, photos, cinema or
+games on the source's request. Attach the "content type" property and
+fill the IT content and content type fields from it, forcing a mode
+set when it changes as the InfoFrame is only written then.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+index cf7df73..8546100 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+@@ -1897,6 +1897,8 @@ static void hdmi_config_AVI(struct dw_hdmi *hdmi,
+ 	else
+ 		frame.colorspace = HDMI_COLORSPACE_RGB;
+ 
++	drm_hdmi_avi_infoframe_content_type(&frame, connector->state);
++
+ 	/* Set up colorimetry */
+ 	if (connector->colorspace_property &&
+ 	    connector->state->colorspace != DRM_MODE_COLORIMETRY_DEFAULT) {
+@@ -2690,7 +2692,8 @@ static int dw_hdmi_connector_atomic_check(struct drm_connector *connector,
+ 	 */
+ 	if (!drm_connector_atomic_hdr_metadata_equal(old_state, new_state) ||
+ 	    old_state->colorspace != new_state->colorspace ||
+-	    old_state->hdmi.broadcast_rgb != new_state->hdmi.broadcast_rgb) {
++	    old_state->hdmi.broadcast_rgb != new_state->hdmi.broadcast_rgb ||
++	    old_state->content_type != new_state->content_type) {
+ 		crtc_state = drm_atomic_get_crtc_state(state, crtc);
+ 		if (IS_ERR(crtc_state))
+ 			return PTR_ERR(crtc_state);
+@@ -2759,6 +2762,7 @@ static int dw_hdmi_connector_create(struct dw_hdmi *hdmi)
+ 
+ 	drm_connector_attach_max_bpc_property(connector, 8, 16);
+ 	drm_connector_attach_broadcast_rgb_property(connector);
++	drm_connector_attach_content_type_property(connector);
+ 
+ 	/*
+ 	 * The output format is only negotiated when a bridge in front of
