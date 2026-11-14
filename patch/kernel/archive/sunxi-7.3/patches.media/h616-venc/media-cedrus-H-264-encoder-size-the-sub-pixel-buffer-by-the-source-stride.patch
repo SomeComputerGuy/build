@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Sat, 14 Nov 2026 01:00:00 +0000
-Subject: media: cedrus: H.264 encoder: size the sub-pixel buffer by the source stride
+Subject: media: cedrus: H.264 encoder: size the sub-pixel buffer by the stride
 
 PARA1 13:10 carries the source stride in macroblocks divided by 48, as
 the vendor library writes it, and the engine lays out the sub-pixel
@@ -11,11 +11,42 @@ of 48 macroblocks made the engine read past the end of the buffer: on
 the H616, 1280 wide with the field at 6 gives an IOMMU read fault at
 the first page after the sub-pixel buffer and an encode timeout.
 
-Size the buffer from the larger of the width and the stride.
+Size the buffer from the larger of the width and the stride, and limit
+the stride to what the engine's stride-derived fields hold (the 10-bit
+dynamic motion estimation thresholds: 319 macroblocks) instead of 32
+times the width, which wrapped them.
 
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc.c
+@@ -493,6 +493,14 @@
+  */
+ #define CEDRUS_ENC_RAW_TAIL_LINES		16
+ 
++/*
++ * The widest source stride the engine's fields hold: the H.264 encoder's
++ * dynamic motion estimation threshold 32 * stride / 10 (0xb4c) has 10 bits,
++ * so 319 macroblocks; the PARA1 stride / 48 (4 bits) and the ISP stride
++ * (11 bits) hold more.
++ */
++#define CEDRUS_ENC_MAX_BYTESPERLINE		(319 * 16)
++
+ void cedrus_enc_prepare_raw_format(struct v4l2_pix_format *pix_fmt,
+ 				   const struct v4l2_frmsize_stepwise *frmsize)
+ {
+@@ -505,8 +513,7 @@
+ 
+ 	v4l2_apply_frmsize_constraints(&width, &height, frmsize);
+ 
+-	/* The maximum is to avoid overflows. */
+-	if (bytesperline < width || bytesperline > 32 * width)
++	if (bytesperline < width || bytesperline > CEDRUS_ENC_MAX_BYTESPERLINE)
+ 		bytesperline = width;
+ 
+ 	bytesperline = ALIGN(bytesperline, 16);
 diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_enc_h264.c
