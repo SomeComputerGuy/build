@@ -1,4 +1,4 @@
-From f490f8b4b32697b8e435d5c6c3a73389bf256bac Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 05:09:11 +0000
 Subject: [PATCH] net: stmmac: dwmac-sun8i: Fix the RX_TH threshold encoding
@@ -12,8 +12,11 @@ when the snps,force_thresh_dma_mode property is set. No Allwinner device
 tree sets it, so no in-tree board is affected.
 
 Fixes: 9f93ac8d4085 ("net-next: stmmac: Add dwmac-sun8i")
+Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
-Link: https://lore.kernel.org/r/20261112-sun8i-emac-jumbo-v2-1-aca0cf23cf17@gmail.com
+Reviewed-by: Nicolai Buchwitz <nb@tipi-net.de>
+Reviewed-by: Chen-Yu Tsai <wens@kernel.org>
+Link: https://patch.msgid.link/20261112-sun8i-emac-jumbo-v2-1-aca0cf23cf17@gmail.com
 ---
  drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c | 5 +++--
  1 file changed, 3 insertions(+), 2 deletions(-)
