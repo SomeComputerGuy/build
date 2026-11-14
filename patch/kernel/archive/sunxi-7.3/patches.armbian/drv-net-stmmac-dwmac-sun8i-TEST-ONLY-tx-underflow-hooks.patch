@@ -190,7 +190,7 @@ index 8ad6b57..33fec94 100644
  	unsigned int dma_buf_sz;
  	/* largest frame of the MTU, with two VLAN tags and the FCS */
 diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-index 735904e..1f17a03 100644
+index 16d6ccf..2cc5c2c 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 @@ -106,6 +106,181 @@ MODULE_PARM_DESC(pause, "Flow Control Pause Time (units of 512 bit times)");
@@ -321,7 +321,7 @@ index 735904e..1f17a03 100644
 +static struct {
 +	unsigned int n, first;
 +	u32 d0[TEST_SEGS], d1[TEST_SEGS];
-+	dma_addr_t buf[TEST_SEGS];
++	u32 buf[TEST_SEGS];
 +} test_fr;
 +
 +/* every cleaned descriptor, before its buffer is unmapped */
@@ -367,8 +367,8 @@ index 735904e..1f17a03 100644
 +		return;
 +	test_uf_log--;
 +	for (i = 0; i < test_fr.n; i++)
-+		s += scnprintf(s, b + sizeof(b) - s, " %08x/%08x/%pad", test_fr.d0[i],
-+			       test_fr.d1[i], &test_fr.buf[i]);
++		s += scnprintf(s, b + sizeof(b) - s, " %08x/%08x/%08x", test_fr.d0[i],
++			       test_fr.d1[i], test_fr.buf[i]);
 +	pr_info("stmmac-test: txerr len %u first %u last %u segs %u retried %d d0/d1/buf:%s\n",
 +		skb ? skb->len : 0, test_fr.first, entry, test_fr.n, retried, b);
 +}
@@ -396,8 +396,8 @@ index 735904e..1f17a03 100644
 +	return DIV_ROUND_UP(len, stmmac_test_ndesc_bmax) + MAX_SKB_FRAGS + 1;
  }
  
- /* Give back the @n descriptors from @first that stmmac_xmit() filled for a
-@@ -2881,6 +3056,29 @@ static void stmmac_bump_dma_threshold(struct stmmac_priv *priv, u32 chan)
+ /* Normal descriptors in chain mode: give back the @n descriptors from @first
+@@ -2882,6 +3057,29 @@ static void stmmac_bump_dma_threshold(struct stmmac_priv *priv, u32 chan)
  	}
  }
  
@@ -427,7 +427,7 @@ index 735904e..1f17a03 100644
  /**
   * stmmac_tx_clean - to manage the transmission completion
   * @priv: driver private structure
-@@ -2899,10 +3097,13 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
+@@ -2900,10 +3098,13 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
  	unsigned int bytes_compl = 0, pkts_compl = 0;
  	unsigned int entry, xmits = 0, count = 0;
  	u32 tx_packets = 0, tx_errors = 0;
@@ -441,7 +441,7 @@ index 735904e..1f17a03 100644
  
  	entry = tx_q->dirty_tx;
  
-@@ -2938,6 +3139,8 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
+@@ -2939,6 +3140,8 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
  		 */
  		dma_rmb();
  
@@ -450,7 +450,7 @@ index 735904e..1f17a03 100644
  		/* Just consider the last segment and ...*/
  		if (likely(!(status & tx_not_ls))) {
  			/* ... verify the status error condition */
-@@ -3007,7 +3210,16 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
+@@ -3008,7 +3211,16 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
  			if (likely(skb)) {
  				pkts_compl++;
  				bytes_compl += skb->len;
@@ -468,7 +468,7 @@ index 735904e..1f17a03 100644
  				tx_q->tx_skbuff[entry] = NULL;
  			}
  		}
-@@ -3070,6 +3282,9 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
+@@ -3071,6 +3283,9 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
  
  	__netif_tx_unlock_bh(netdev_get_tx_queue(priv->dev, queue));
  
@@ -478,7 +478,7 @@ index 735904e..1f17a03 100644
  	/* Combine decisions from TX clean and XSK TX */
  	return max(count, xmits);
  }
-@@ -4235,6 +4450,9 @@ static int __stmmac_open(struct net_device *dev,
+@@ -4236,6 +4451,9 @@ static int __stmmac_open(struct net_device *dev,
  			dma_conf->tx_queue[i].tbs = priv->dma_conf.tx_queue[i].tbs;
  	memcpy(&priv->dma_conf, dma_conf, sizeof(*dma_conf));
  
@@ -488,7 +488,7 @@ index 735904e..1f17a03 100644
  	/* The PHY is suspended when the interface is reopened without
  	 * disconnecting the PHY, e.g. on MTU change. IEEE 802.3 allows PHYs
  	 * to stop their receive clock while powered down, but the DMA
-@@ -5012,7 +5230,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
+@@ -5013,7 +5231,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
  		unsigned int bmax = frag_size, off = 0, len;
  
  		if (stmmac_tx_split_bufs(priv))
@@ -497,7 +497,7 @@ index 735904e..1f17a03 100644
  
  		dma_addr = skb_frag_dma_map(priv->device, frag, 0, frag_size,
  					    DMA_TO_DEVICE);
-@@ -5873,6 +6091,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+@@ -5874,6 +6092,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
  	bool fcs_stripped = false;
  	int xdp_status = 0;
  	int bufsz;
@@ -505,7 +505,7 @@ index 735904e..1f17a03 100644
  
  	dma_dir = page_pool_get_dma_dir(rx_q->page_pool);
  	bufsz = DIV_ROUND_UP(priv->dma_conf.dma_buf_sz, PAGE_SIZE) * PAGE_SIZE;
-@@ -5921,7 +6140,6 @@ read_again:
+@@ -5922,7 +6141,6 @@ read_again:
  		/* check if managed by the DMA otherwise go ahead */
  		if (unlikely(status & dma_own))
  			break;
@@ -513,7 +513,7 @@ index 735904e..1f17a03 100644
  		next_entry = STMMAC_NEXT_ENTRY(rx_q->cur_rx,
  					       priv->dma_conf.dma_rx_size);
  		if (unlikely(next_entry == rx_q->dirty_rx))
-@@ -5929,6 +6147,9 @@ read_again:
+@@ -5930,6 +6148,9 @@ read_again:
  
  		rx_q->cur_rx = next_entry;
  
@@ -523,7 +523,7 @@ index 735904e..1f17a03 100644
  		np = stmmac_get_rx_desc(priv, rx_q, next_entry);
  
  		prefetch(np);
-@@ -6123,10 +6344,14 @@ drain_data:
+@@ -6124,10 +6345,14 @@ drain_data:
  		skb->protocol = eth_type_trans(skb, priv->dev);
  
  		if (unlikely(!coe) || !stmmac_has_ip_ethertype(skb) ||
