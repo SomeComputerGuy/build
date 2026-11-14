@@ -19,9 +19,12 @@ Three faults of the DE33 CDC colour pipeline:
   with D and K in range instead: K = k - m * d + m * D for a D close to
   d that keeps K in range (searched over the vertices of that polytope,
   their centroid, points between them and the segment from d); reject
-  the map when none is found. This is the same map only if the CDC
+  the map when none is found. This is the same map because the CDC
   keeps in - D signed for inputs below D, as the vendor YCbCr input
-  matrices need (D = 512 on Cb and Cr); that is not yet measured.
+  matrices need (D = 512 on Cb and Cr): with D = 512, K = 448 and a
+  coefficient of +1 or -1 on each channel of either CSC, every input
+  from 64 to 447 gives the signed result, none is clipped or wrapped.
+  K is rounded, so the offset is written to within half a code value.
   Coefficients are written as their 20-bit field.
 
 - The 3D LUT interpolates trilinearly (captures with random node values
@@ -240,7 +243,7 @@ index e72c2891b..cb21f1e49 100644
 + * where no vertex rounds into it) and the segment from d to the best of
 + * these. Every candidate is checked exactly. A row without coefficients
 + * outputs its offset clipped to 0..1023, so that offset is clipped first.
-+ * D > d is the same map only if the CSC keeps in - D signed below D.
++ * D > d is the same map: the CSC keeps in - D signed below D.
 + */
 +static int sun50i_cdc_split(struct sun50i_cdc_csc *csc)
 +{
