@@ -19,15 +19,17 @@ size needs, as jumbo_frm() does for the linear part; the descriptor with
 the end of the fragment unmaps it. jumbo_frm() marks its last
 descriptor as the last segment only when no fragments follow. Count the
 descriptors a frame needs before taking it, stop the queue while the
-largest frame of the MTU might not fit and wake it only when it does. If
-a mapping fails, give the descriptors of the frame back.
+largest frame of the MTU might not fit and wake it only when it does.
+If a mapping fails, give the descriptors of the frame back; this is done
+for normal descriptors in chain mode only, where a frame can now take
+many descriptors.
 
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  .../net/ethernet/stmicro/stmmac/chain_mode.c  |   5 +-
- .../net/ethernet/stmicro/stmmac/stmmac_main.c | 138 ++++++++++++++----
- 2 files changed, 113 insertions(+), 30 deletions(-)
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c | 141 ++++++++++++++----
+ 2 files changed, 115 insertions(+), 31 deletions(-)
 
 diff --git a/drivers/net/ethernet/stmicro/stmmac/chain_mode.c b/drivers/net/ethernet/stmicro/stmmac/chain_mode.c
 index 42bf7a5..65d8c60 100644
@@ -47,10 +49,10 @@ index 42bf7a5..65d8c60 100644
  		}
  	}
 diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-index 68e01bf..735904e 100644
+index 68e01bf..16d6ccf 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-@@ -2002,6 +2002,77 @@ static void stmmac_set_tx_dma_last_segment(struct stmmac_tx_queue *tx_q,
+@@ -2002,6 +2002,78 @@ static void stmmac_set_tx_dma_last_segment(struct stmmac_tx_queue *tx_q,
  	tx_q->tx_skbuff_dma[entry].last_segment = true;
  }
  
@@ -93,8 +95,9 @@ index 68e01bf..735904e 100644
 +	return DIV_ROUND_UP(len, BUF_SIZE_NDESC) + MAX_SKB_FRAGS + 1;
 +}
 +
-+/* Give back the @n descriptors from @first that stmmac_xmit() filled for a
-+ * frame it then failed to map, as if it had never been queued.
++/* Normal descriptors in chain mode: give back the @n descriptors from @first
++ * that stmmac_xmit() filled for a frame it then failed to map, as if it had
++ * never been queued. Entries of XDP_TX frames keep their page pool address.
 + */
 +static void stmmac_tx_unwind(struct stmmac_priv *priv,
 +			     struct stmmac_tx_queue *tx_q, unsigned int first,
@@ -105,7 +108,7 @@ index 68e01bf..735904e 100644
 +	while (n--) {
 +		struct stmmac_tx_info *t = &tx_q->tx_skbuff_dma[entry];
 +
-+		if (t->buf) {
++		if (t->buf && t->buf_type != STMMAC_TXBUF_T_XDP_TX) {
 +			if (t->map_as_page)
 +				dma_unmap_page(priv->device, t->buf, t->len,
 +					       DMA_TO_DEVICE);
@@ -128,7 +131,7 @@ index 68e01bf..735904e 100644
  /**
   * __init_dma_tx_desc_rings - init the TX descriptor ring (per queue)
   * @priv: driver private structure
-@@ -2952,7 +3023,8 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
+@@ -2952,7 +3024,8 @@ static int stmmac_tx_clean(struct stmmac_priv *priv, int budget, u32 queue,
  
  	if (unlikely(netif_tx_queue_stopped(netdev_get_tx_queue(priv->dev,
  								queue))) &&
@@ -138,7 +141,7 @@ index 68e01bf..735904e 100644
  
  		netif_dbg(priv, tx_done, priv->dev,
  			  "%s: restart transmit\n", __func__);
-@@ -4849,20 +4921,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
+@@ -4849,20 +4922,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
  		}
  	}
  
@@ -160,7 +163,7 @@ index 68e01bf..735904e 100644
  		if (!netif_tx_queue_stopped(netdev_get_tx_queue(dev, queue))) {
  			netif_tx_stop_queue(netdev_get_tx_queue(priv->dev,
  								queue));
-@@ -4949,26 +5008,46 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
+@@ -4949,26 +5009,46 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
  	for (i = 0; i < nfrags; i++) {
  		const skb_frag_t *frag = &skb_shinfo(skb)->frags[i];
  		unsigned int frag_size = skb_frag_size(frag);
@@ -178,14 +181,15 @@ index 68e01bf..735904e 100644
  		dma_addr = skb_frag_dma_map(priv->device, frag, 0, frag_size,
  					    DMA_TO_DEVICE);
  		if (dma_mapping_error(priv->device, dma_addr))
- 			goto dma_map_err; /* should reuse desc w/o issues */
+-			goto dma_map_err; /* should reuse desc w/o issues */
++			goto dma_map_err;
++
++		do {
++			len = min(frag_size - off, bmax);
  
 -		stmmac_set_tx_skb_dma_entry(tx_q, entry, dma_addr, frag_size,
 -					    true);
 -		stmmac_set_desc_addr(priv, desc, dma_addr);
-+		do {
-+			len = min(frag_size - off, bmax);
-+
 +			entry = STMMAC_NEXT_ENTRY(entry,
 +						  priv->dma_conf.dma_tx_size);
 +			WARN_ON(tx_q->tx_skbuff[entry]);
@@ -219,7 +223,7 @@ index 68e01bf..735904e 100644
  	}
  
  	stmmac_set_tx_dma_last_segment(tx_q, entry);
-@@ -5022,7 +5101,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
+@@ -5022,7 +5102,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
  		print_pkt(skb->data, skb->len);
  	}
  
@@ -228,7 +232,7 @@ index 68e01bf..735904e 100644
  		netif_dbg(priv, hw, priv->dev, "%s: stop transmitted packets\n",
  			  __func__);
  		netif_tx_stop_queue(netdev_get_tx_queue(priv->dev, queue));
-@@ -5051,6 +5130,9 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
+@@ -5051,6 +5131,9 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
  
  dma_map_err:
  	netdev_err(priv->dev, "Tx DMA map failed\n");
