@@ -1,0 +1,126 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 14 Nov 2026 18:00:00 +0000
+Subject: [PATCH] vt: allocate the screen buffers with kvzalloc()
+
+The screen buffer of a console grows with the display: on a 1920x1080
+framebuffer with a 4x8 font it is 480x135 cells, 129600 bytes, an
+order-5 allocation. vc_do_resize() asks for it with kzalloc(GFP_USER),
+so a resize fails as soon as memory is fragmented. On an Orange Pi
+Zero2 (1 GiB) under memory load, plugging in an HDMI monitor ended in
+
+  irq/295-6000000: page allocation failure: order:5, mode:0x140dc0(GFP_USER|__GFP_ZERO|__GFP_COMP)
+   ...
+   vc_do_resize+0x94/0x438
+   __vc_resize+0x28/0x40
+   fbcon_startup+0x140/0x280
+   do_take_over_console+0x8c/0x218
+   ...
+   drm_fb_helper_hotplug_event+0xd8/0xe8
+
+with 13 MiB free but no free block of order 5 or more, and the console
+kept its old size.
+
+Nothing needs the screen buffer to be physically contiguous: the vt
+code, the console drivers and vcs access it through the CPU only. Use
+kvzalloc() for it in vc_allocate() and vc_do_resize(), kvmemdup() for
+the alternate screen copy of the same size, and kvfree() wherever
+either is freed. con_init() keeps its GFP_NOWAIT kzalloc(): kvfree()
+handles that buffer too. The unicode screen buffer of the same console
+is already vzalloc()ed and freed in the same places, so the new frees
+run in contexts that already call vfree().
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/tty/vt/vt.c | 20 ++++++++++----------
+ 1 file changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/tty/vt/vt.c b/drivers/tty/vt/vt.c
+index 49a140b..607c127 100644
+--- a/drivers/tty/vt/vt.c
++++ b/drivers/tty/vt/vt.c
+@@ -1118,7 +1118,7 @@ int vc_allocate(unsigned int currcons)	/* return 0 on success */
+ 	    vc->vc_screenbuf_size > KMALLOC_MAX_SIZE || !vc->vc_screenbuf_size)
+ 		goto err_free;
+ 	err = -ENOMEM;
+-	vc->vc_screenbuf = kzalloc(vc->vc_screenbuf_size, GFP_KERNEL);
++	vc->vc_screenbuf = kvzalloc(vc->vc_screenbuf_size, GFP_KERNEL);
+ 	if (!vc->vc_screenbuf)
+ 		goto err_free;
+ 
+@@ -1210,14 +1210,14 @@ static int vc_do_resize(struct tty_struct *tty, struct vc_data *vc,
+ 
+ 	if (new_screen_size > KMALLOC_MAX_SIZE || !new_screen_size)
+ 		return -EINVAL;
+-	newscreen = kzalloc(new_screen_size, GFP_USER);
++	newscreen = kvzalloc(new_screen_size, GFP_USER);
+ 	if (!newscreen)
+ 		return -ENOMEM;
+ 
+ 	if (vc->vc_uni_lines) {
+ 		new_uniscr = vc_uniscr_alloc(new_cols, new_rows);
+ 		if (!new_uniscr) {
+-			kfree(newscreen);
++			kvfree(newscreen);
+ 			return -ENOMEM;
+ 		}
+ 	}
+@@ -1230,7 +1230,7 @@ static int vc_do_resize(struct tty_struct *tty, struct vc_data *vc,
+ 
+ 	err = resize_screen(vc, new_cols, new_rows, from_user);
+ 	if (err) {
+-		kfree(newscreen);
++		kvfree(newscreen);
+ 		vc_uniscr_free(new_uniscr);
+ 		return err;
+ 	}
+@@ -1288,7 +1288,7 @@ static int vc_do_resize(struct tty_struct *tty, struct vc_data *vc,
+ 	vc->vc_screenbuf = newscreen;
+ 	vc->vc_screenbuf_size = new_screen_size;
+ 	set_origin(vc);
+-	kfree(oldscreen);
++	kvfree(oldscreen);
+ 
+ 	/* do part of a reset_terminal() */
+ 	vc->vc_top = 0;
+@@ -1369,10 +1369,10 @@ struct vc_data *vc_deallocate(unsigned int currcons)
+ 		con_free_unimap(vc);
+ 		put_pid(vc->vt_pid);
+ 		vc_uniscr_set(vc, NULL);
+-		kfree(vc->vc_screenbuf);
++		kvfree(vc->vc_screenbuf);
+ 		vc_cons[currcons].d = NULL;
+ 		if (vc->vc_saved_screen != NULL) {
+-			kfree(vc->vc_saved_screen);
++			kvfree(vc->vc_saved_screen);
+ 			vc->vc_saved_screen = NULL;
+ 		}
+ 		vc_uniscr_free(vc->vc_saved_uni_lines);
+@@ -1918,7 +1918,7 @@ static void enter_alt_screen(struct vc_data *vc)
+ 
+ 	if (vc->vc_saved_screen != NULL)
+ 		return; /* Already inside an alt-screen */
+-	vc->vc_saved_screen = kmemdup((u16 *)vc->vc_origin, size, GFP_KERNEL);
++	vc->vc_saved_screen = kvmemdup((u16 *)vc->vc_origin, size, GFP_KERNEL);
+ 	if (vc->vc_saved_screen == NULL)
+ 		return;
+ 	vc->vc_saved_uni_lines = vc->vc_uni_lines;
+@@ -1968,7 +1968,7 @@ static void leave_alt_screen(struct vc_data *vc)
+ 	/* Update the entire screen */
+ 	if (con_should_update(vc))
+ 		do_update_region(vc, vc->vc_origin, vc->vc_screenbuf_size / 2);
+-	kfree(vc->vc_saved_screen);
++	kvfree(vc->vc_saved_screen);
+ 	vc->vc_saved_screen = NULL;
+ }
+ 
+@@ -2286,7 +2286,7 @@ static void reset_terminal(struct vc_data *vc, int do_clear)
+ 	vc->vc_decim		= 0;
+ 
+ 	if (vc->vc_saved_screen != NULL) {
+-		kfree(vc->vc_saved_screen);
++		kvfree(vc->vc_saved_screen);
+ 		vc->vc_saved_screen = NULL;
+ 		vc_uniscr_free(vc->vc_saved_uni_lines);
+ 		vc->vc_saved_uni_lines = NULL;
