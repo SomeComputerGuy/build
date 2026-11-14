@@ -40,11 +40,11 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c |  33 +++
  drivers/net/ethernet/stmicro/stmmac/norm_desc.c   |   3 +-
  drivers/net/ethernet/stmicro/stmmac/stmmac.h      |   5 +
- drivers/net/ethernet/stmicro/stmmac/stmmac_main.c | 235 +++++++++++++++++++++-
- 6 files changed, 276 insertions(+), 8 deletions(-)
+ drivers/net/ethernet/stmicro/stmmac/stmmac_main.c | 241 +++++++++++++++++++++-
+ 6 files changed, 279 insertions(+), 11 deletions(-)
 
 diff --git a/drivers/net/ethernet/stmicro/stmmac/chain_mode.c b/drivers/net/ethernet/stmicro/stmmac/chain_mode.c
-index 42bf7a5..33cc03d 100644
+index 65d8c60..c7605cd 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/chain_mode.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/chain_mode.c
 @@ -14,6 +14,9 @@
@@ -66,7 +66,7 @@ index 42bf7a5..33cc03d 100644
  
  	buf_len = min_t(unsigned int, nopaged_len, bmax);
  	len = nopaged_len - buf_len;
-@@ -90,7 +93,7 @@ static bool is_jumbo_frm(unsigned int len, bool enh_desc)
+@@ -91,7 +94,7 @@ static bool is_jumbo_frm(unsigned int len, bool enh_desc)
  	bool ret = false;
  
  	if ((enh_desc && (len > BUF_SIZE_8KiB)) ||
@@ -88,10 +88,10 @@ index 20a7260..bf9ce5b 100644
  
  enum dma_irq_status {
 diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
-index f785dc0..947f5f8 100644
+index e34fcbd..61aa439 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
-@@ -323,6 +323,14 @@ static const struct emac_variant emac_variant_h6 = {
+@@ -326,6 +326,14 @@ static const struct emac_variant emac_variant_h6 = {
  #define SYSCON_ETCS_EXT_GMII	0x1
  #define SYSCON_ETCS_INT_GMII	0x2
  
@@ -106,7 +106,7 @@ index f785dc0..947f5f8 100644
  static int sun8i_dwmac_reset(void __iomem *ioaddr)
  {
  	u32 v;
-@@ -540,6 +548,28 @@ static int sun8i_dwmac_dma_interrupt(struct stmmac_priv *priv,
+@@ -543,6 +551,28 @@ static int sun8i_dwmac_dma_interrupt(struct stmmac_priv *priv,
  	 * Other TX_CTL1 writers run only at open/close.
  	 */
  	if (v & EMAC_TX_UNDERFLOW_INT) {
@@ -135,7 +135,7 @@ index f785dc0..947f5f8 100644
  		writel(readl(ioaddr + EMAC_TX_CTL1) | EMAC_TX_DMA_START,
  		       ioaddr + EMAC_TX_CTL1);
  		ret |= handle_tx;
-@@ -726,6 +756,9 @@ static void sun8i_dwmac_core_init(struct mac_device_info *hw,
+@@ -729,6 +759,9 @@ static void sun8i_dwmac_core_init(struct mac_device_info *hw,
  	void __iomem *ioaddr = hw->pcsr;
  	u32 v;
  
@@ -190,7 +190,7 @@ index 8ad6b57..33fec94 100644
  	unsigned int dma_buf_sz;
  	/* largest frame of the MTU, with two VLAN tags and the FCS */
 diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
-index 68e01bf..a055351 100644
+index dc08817..86e26a8 100644
 --- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 +++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
 @@ -106,6 +106,181 @@ MODULE_PARM_DESC(pause, "Flow Control Pause Time (units of 512 bit times)");
@@ -466,16 +466,38 @@ index 68e01bf..a055351 100644
  	/* The PHY is suspended when the interface is reopened without
  	 * disconnecting the PHY, e.g. on MTU change. IEEE 802.3 allows PHYs
  	 * to stop their receive clock while powered down, but the DMA
-@@ -4855,7 +5073,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
- 	 */
- 	if (priv->descriptor_mode == STMMAC_CHAIN_MODE &&
- 	    priv->hw->desc == &ndesc_ops && nfrags &&
--	    skb->len > BUF_SIZE_NDESC) {
-+	    skb->len > stmmac_test_ndesc_bmax) {
- 		if (skb_linearize(skb))
- 			goto max_sdu_err;
- 		nfrags = 0;
-@@ -5791,6 +6009,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+@@ -4833,10 +5051,10 @@ static unsigned int stmmac_tx_descs(struct stmmac_priv *priv,
+ 	if (!stmmac_tx_split_bufs(priv))
+ 		return skb_shinfo(skb)->nr_frags + 1;
+ 
+-	n = max(DIV_ROUND_UP(skb_headlen(skb), BUF_SIZE_NDESC), 1U);
++	n = max(DIV_ROUND_UP(skb_headlen(skb), stmmac_test_ndesc_bmax), 1U);
+ 	for (i = 0; i < skb_shinfo(skb)->nr_frags; i++)
+ 		n += DIV_ROUND_UP(skb_frag_size(&skb_shinfo(skb)->frags[i]),
+-				  BUF_SIZE_NDESC);
++				  stmmac_test_ndesc_bmax);
+ 
+ 	return n;
+ }
+@@ -4851,7 +5069,7 @@ static unsigned int stmmac_tx_max_descs(struct stmmac_priv *priv)
+ 	if (!stmmac_tx_split_bufs(priv))
+ 		return MAX_SKB_FRAGS + 1;
+ 
+-	return DIV_ROUND_UP(len, BUF_SIZE_NDESC) + MAX_SKB_FRAGS + 1;
++	return DIV_ROUND_UP(len, stmmac_test_ndesc_bmax) + MAX_SKB_FRAGS + 1;
+ }
+ 
+ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
+@@ -4979,7 +5197,7 @@ static netdev_tx_t stmmac_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		unsigned int bmax = frag_size, off = 0, len;
+ 
+ 		if (stmmac_tx_split_bufs(priv))
+-			bmax = BUF_SIZE_NDESC;
++			bmax = stmmac_test_ndesc_bmax;
+ 
+ 		dma_addr = skb_frag_dma_map(priv->device, frag, 0, frag_size,
+ 					    DMA_TO_DEVICE);
+@@ -5837,6 +6055,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
  	bool fcs_stripped = false;
  	int xdp_status = 0;
  	int bufsz;
@@ -483,7 +505,7 @@ index 68e01bf..a055351 100644
  
  	dma_dir = page_pool_get_dma_dir(rx_q->page_pool);
  	bufsz = DIV_ROUND_UP(priv->dma_conf.dma_buf_sz, PAGE_SIZE) * PAGE_SIZE;
-@@ -5839,7 +6058,6 @@ read_again:
+@@ -5885,7 +6104,6 @@ read_again:
  		/* check if managed by the DMA otherwise go ahead */
  		if (unlikely(status & dma_own))
  			break;
@@ -491,7 +513,7 @@ index 68e01bf..a055351 100644
  		next_entry = STMMAC_NEXT_ENTRY(rx_q->cur_rx,
  					       priv->dma_conf.dma_rx_size);
  		if (unlikely(next_entry == rx_q->dirty_rx))
-@@ -5847,6 +6065,9 @@ read_again:
+@@ -5893,6 +6111,9 @@ read_again:
  
  		rx_q->cur_rx = next_entry;
  
@@ -501,7 +523,7 @@ index 68e01bf..a055351 100644
  		np = stmmac_get_rx_desc(priv, rx_q, next_entry);
  
  		prefetch(np);
-@@ -6041,10 +6262,14 @@ drain_data:
+@@ -6087,10 +6308,14 @@ drain_data:
  		skb->protocol = eth_type_trans(skb, priv->dev);
  
  		if (unlikely(!coe) || !stmmac_has_ip_ethertype(skb) ||
