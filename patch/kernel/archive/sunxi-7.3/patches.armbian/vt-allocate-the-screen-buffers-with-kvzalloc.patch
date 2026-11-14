@@ -3,11 +3,12 @@ From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Sat, 14 Nov 2026 18:00:00 +0000
 Subject: [PATCH] vt: allocate the screen buffers with kvzalloc()
 
-The screen buffer of a console grows with the display: on a 1920x1080
-framebuffer with a 4x8 font it is 480x135 cells, 129600 bytes, an
-order-5 allocation. vc_do_resize() asks for it with kzalloc(GFP_USER),
-so a resize fails as soon as memory is fragmented. On an Orange Pi
-Zero2 (1 GiB) under memory load, plugging in an HDMI monitor ended in
+The screen buffer of a console grows with the display: a 480x135
+console (e.g. 3840x2160 with the 8x16 font) needs 129600 bytes, an
+order-5 allocation. vc_allocate() and vc_do_resize() ask for it with
+kzalloc(), which can fail when memory is low or fragmented. On an
+Orange Pi Zero2 (1 GiB) under memory load, plugging in an HDMI monitor
+gave
 
   irq/295-6000000: page allocation failure: order:5, mode:0x140dc0(GFP_USER|__GFP_ZERO|__GFP_COMP)
    ...
@@ -18,17 +19,18 @@ Zero2 (1 GiB) under memory load, plugging in an HDMI monitor ended in
    ...
    drm_fb_helper_hotplug_event+0xd8/0xe8
 
-with 13 MiB free but no free block of order 5 or more, and the console
-kept its old size.
+with 13 MiB free, 9 MiB of it in CMA. A later resize from fbcon_init()
+succeeded there, but any vc_resize() can fail the same way.
 
 Nothing needs the screen buffer to be physically contiguous: the vt
-code, the console drivers and vcs access it through the CPU only. Use
-kvzalloc() for it in vc_allocate() and vc_do_resize(), kvmemdup() for
-the alternate screen copy of the same size, and kvfree() wherever
-either is freed. con_init() keeps its GFP_NOWAIT kzalloc(): kvfree()
-handles that buffer too. The unicode screen buffer of the same console
-is already vzalloc()ed and freed in the same places, so the new frees
-run in contexts that already call vfree().
+code, the console drivers and vcs access it through the CPU only. Do
+what commit 9a98e7a80f95 ("vt: don't use kmalloc() for the unicode
+screen buffer") did for the unicode buffer: use kvzalloc() in
+vc_allocate() and vc_do_resize(), kvmemdup() for the alternate screen
+copy of the same size, and kvfree() wherever either is freed.
+con_init() keeps its GFP_NOWAIT kzalloc(): kvfree() handles that buffer
+too. The unicode buffer is already vfree()d in the same places, so the
+new frees run in contexts that already call vfree().
 
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
