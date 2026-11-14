@@ -1,0 +1,370 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 14 Nov 2026 00:49:58 +0000
+Subject: [PATCH] drm/sun4i: Fix the H616 DE33 CDC offsets, coefficient range and interpolation
+
+Three faults of the DE33 CDC colour pipeline:
+
+- Negative values were handled as unsigned: the coefficient upper limit
+  is an unsigned long, so every negative coefficient (all YCbCr
+  matrices) failed the range check, and the rounding helper added an
+  unsigned constant, so every negative product became a huge value.
+  Any input matrix with a negative entry and every YCbCr plane with an
+  active pipeline were rejected with -EINVAL.
+
+- The D and K fields are unsigned 10-bit (D subtracted from the input,
+  K added to the output; the vendor register layout has 10-bit fields,
+  and the hardware reads back 0x3c0 for 0xffffffc0 and adds 960). A
+  negative offset was written as a two's complement K. Write the same
+  map with D and K in range instead: K = k - m * d + m * D for a D close
+  to d that keeps K in range (searched over the vertices of that
+  polytope, their centroid, points between them and the segment from d);
+  reject the map when none is found. Coefficients are written as their
+  20-bit field.
+
+- The 3D LUT interpolates trilinearly (captures with random node values
+  match a trilinear model exactly and differ from a tetrahedral one by
+  up to half the range): report trilinear.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/sun4i/sun50i_cdc.c | 247 ++++++++++++++++++++++++++---
+ 1 file changed, 229 insertions(+), 18 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun50i_cdc.c b/drivers/gpu/drm/sun4i/sun50i_cdc.c
+index e72c2891b..cb21f1e49 100644
+--- a/drivers/gpu/drm/sun4i/sun50i_cdc.c
++++ b/drivers/gpu/drm/sun4i/sun50i_cdc.c
+@@ -28,8 +28,9 @@
+ #define SUN50I_CDC_CTL			0x00
+ #define SUN50I_CDC_CTL_EN		BIT(0)
+ /*
+- * CSC: out = C * (in - D) + K, C in Q2.17, D and K in 10-bit code values.
+- * D is a magnitude that is subtracted, as in the DE33 channel CSC.
++ * CSC: out = C * (in - D) + K, C in Q2.17 (20 bits), D and K unsigned
++ * 10-bit code values: D is subtracted from the input, K added to the
++ * output. A negative offset is no K value: see sun50i_cdc_split().
+  */
+ #define SUN50I_CDC_IN_D(i)		(0x14 + 4 * (i))
+ #define SUN50I_CDC_IN_C(r, c)		(0x20 + 0x10 * (r) + 4 * (c))
+@@ -39,8 +40,9 @@
+ 
+ /*
+  * 3D LUT: 17 nodes per axis at input codes 0, 64, ..., 1024, entries
+- * R << 20 | G << 10 | B. The nodes are split in eight banks by the parity
+- * of their R (bit 0), G (bit 1) and B (bit 2) index, R fastest in a bank.
++ * R << 20 | G << 10 | B, trilinear interpolation. The nodes are split in
++ * eight banks by the parity of their R (bit 0), G (bit 1) and B (bit 2)
++ * index, R fastest in a bank.
+  */
+ #define SUN50I_CDC_LUT_DIM		17
+ #define SUN50I_CDC_LUT_SIZE		(17 * 17 * 17)
+@@ -50,8 +52,9 @@ static const u16 sun50i_cdc_lut_bank[8] = {
+ };
+ 
+ #define SUN50I_CDC_FRAC			17
+-#define SUN50I_CDC_COEF_MAX		(BIT(19) - 1)
++#define SUN50I_CDC_COEF_MAX		((s64)BIT(19) - 1)
+ #define SUN50I_CDC_COEF_MIN		(-(s64)BIT(19))
++#define SUN50I_CDC_COEF_MASK		GENMASK(19, 0)
+ #define SUN50I_CDC_CONST_MAX		1023
+ 
+ struct sun50i_cdc {
+@@ -64,11 +67,16 @@ struct sun50i_cdc {
+ 	u32			lut_hw[SUN50I_CDC_LUT_SIZE];
+ };
+ 
+-/* m and k in Q17 (k in 10-bit code values), d subtracted first */
++/*
++ * out = m * (in - d) + k, m and k in Q17 (k in 10-bit code values);
++ * reg_d and reg_k: the register values of the same map.
++ */
+ struct sun50i_cdc_csc {
+ 	s64	m[3][3];
+ 	s64	k[3];
+ 	u32	d[3];
++	u32	reg_d[3];
++	u32	reg_k[3];
+ };
+ 
+ struct sun50i_cdc_cfg {
+@@ -116,7 +124,7 @@ static s64 sun50i_cdc_q17(u64 s31_32)
+ 
+ static s64 sun50i_cdc_round(s64 q34)
+ {
+-	return (q34 + BIT_ULL(SUN50I_CDC_FRAC - 1)) >> SUN50I_CDC_FRAC;
++	return (q34 + (1LL << (SUN50I_CDC_FRAC - 1))) >> SUN50I_CDC_FRAC;
+ }
+ 
+ /* a = b * a (3x3 part only) */
+@@ -164,7 +172,7 @@ static int sun50i_cdc_invert(const s64 m[3][3], s64 inv[3][3])
+ 
+ 	for (r = 0; r < 3; r++)
+ 		for (c = 0; c < 3; c++)
+-			inv[r][c] = div64_s64(adj[r][c] * BIT(SUN50I_CDC_FRAC), det);
++			inv[r][c] = div64_s64(adj[r][c] * (1LL << SUN50I_CDC_FRAC), det);
+ 
+ 	return 0;
+ }
+@@ -187,22 +195,225 @@ static void sun50i_cdc_from_ctm(struct sun50i_cdc_csc *csc,
+ 	}
+ }
+ 
+-static int sun50i_cdc_csc_valid(const struct sun50i_cdc_csc *csc)
++/* D = @dc: K = o + m * D must fit (o: the map's offset, Q17) */
++static bool sun50i_cdc_try_split(struct sun50i_cdc_csc *csc, const s64 o[3],
++				 const s64 dc[3])
+ {
+ 	int r, c;
+ 
++	for (c = 0; c < 3; c++)
++		if (dc[c] < 0 || dc[c] > SUN50I_CDC_CONST_MAX)
++			return false;
++
+ 	for (r = 0; r < 3; r++) {
+-		s64 k = sun50i_cdc_round(csc->k[r]);
++		s64 k = sun50i_cdc_round(o[r] + csc->m[r][0] * dc[0] +
++					 csc->m[r][1] * dc[1] +
++					 csc->m[r][2] * dc[2]);
++
++		if (k < 0 || k > SUN50I_CDC_CONST_MAX)
++			return false;
++		csc->reg_k[r] = k;
++	}
++	for (c = 0; c < 3; c++)
++		csc->reg_d[c] = dc[c];
++
++	return true;
++}
++
++static s64 sun50i_cdc_det3(const s64 a[3][3])
++{
++	return a[0][0] * (a[1][1] * a[2][2] - a[1][2] * a[2][1]) -
++	       a[0][1] * (a[1][0] * a[2][2] - a[1][2] * a[2][0]) +
++	       a[0][2] * (a[1][0] * a[2][1] - a[1][1] * a[2][0]);
++}
++
++struct sun50i_cdc_search {
++	struct sun50i_cdc_csc	*csc;
++	const s64		*o;
++	s64			d0[3];
++	s64			best[3];
++	s64			best_dist;
++};
++
++/* @dc fits and is closer to d than the best so far */
++static bool sun50i_cdc_consider(struct sun50i_cdc_search *s, const s64 dc[3])
++{
++	s64 dist = abs(dc[0] - s->d0[0]) + abs(dc[1] - s->d0[1]) +
++		   abs(dc[2] - s->d0[2]);
++
++	if (dist >= s->best_dist || !sun50i_cdc_try_split(s->csc, s->o, dc))
++		return false;
++
++	memcpy(s->best, dc, sizeof(s->best));
++	s->best_dist = dist;
++	return true;
++}
++
++/* the first fitting point of the segment from d to @to (1/64 steps) */
++static void sun50i_cdc_segment(struct sun50i_cdc_search *s, const s64 to[3])
++{
++	s64 lo = 0, hi = 64, dc[3];
++	int c;
++
++	while (hi - lo > 1) {
++		s64 t = (lo + hi) / 2;
++
++		for (c = 0; c < 3; c++)
++			dc[c] = s->d0[c] + div64_s64((to[c] - s->d0[c]) * t, 64);
++		if (sun50i_cdc_try_split(s->csc, s->o, dc))
++			hi = t;
++		else
++			lo = t;
++	}
++	for (c = 0; c < 3; c++)
++		dc[c] = s->d0[c] + div64_s64((to[c] - s->d0[c]) * hi, 64);
++	sun50i_cdc_consider(s, dc);
++}
++
++/*
++ * Vertex of the half-spaces @i, @j, @l (a . D <= b, a in Q12, b in Q12 code
++ * values) into @x (Q2 code values), if it is inside all twelve with one
++ * code value margin.
++ */
++static bool sun50i_cdc_vertex(const s64 a[12][3], const s64 b[12],
++			      unsigned int i, unsigned int j, unsigned int l,
++			      s64 x[3])
++{
++	const unsigned int row[3] = { i, j, l };
++	s64 t[3][3], det;
++	int r, c;
++
++	for (r = 0; r < 3; r++)
++		memcpy(t[r], a[row[r]], sizeof(t[r]));
++	det = sun50i_cdc_det3(t);
++	if (!det)
++		return false;
++
++	/* Cramer */
++	for (c = 0; c < 3; c++) {
++		for (r = 0; r < 3; r++) {
++			memcpy(t[r], a[row[r]], sizeof(t[r]));
++			t[r][c] = b[row[r]];
++		}
++		x[c] = div64_s64(sun50i_cdc_det3(t) * 4, det);
++		/* outside the box: also keeps the products below in s64 */
++		if (x[c] < -4 || x[c] > (SUN50I_CDC_CONST_MAX + 1) * 4)
++			return false;
++	}
++
++	for (r = 0; r < 12; r++)
++		if (a[r][0] * x[0] + a[r][1] * x[1] + a[r][2] * x[2] >
++		    (b[r] + (1 << 12)) * 4)
++			return false;
+ 
+-		if (k < -SUN50I_CDC_CONST_MAX || k > SUN50I_CDC_CONST_MAX)
++	return true;
++}
++
++/*
++ * The registers hold out = m * (in - D) + K with D and K in 0..1023, so
++ * the map m * (in - d) + k is written with any D for which
++ * K = k - m * d + m * D is in 0..1023. Try D = d, else search the
++ * polytope { 0 <= D <= 1023, 0 <= o + m * D <= 1023 } for the point
++ * closest to d (the least change of the input range): its vertices, their
++ * centroid, points from each vertex towards the centroid (a thin polytope
++ * where no vertex rounds into it) and the segment from d to the best of
++ * these. Every candidate is checked exactly. A row without coefficients
++ * outputs its offset clipped to 0..1023, so that offset is clipped first.
++ */
++static int sun50i_cdc_split(struct sun50i_cdc_csc *csc)
++{
++	struct sun50i_cdc_search s = { .csc = csc, .best_dist = S64_MAX };
++	s64 o[3], dc[3], a[12][3], b[12], x[3], sum[3] = {}, cen[3], to[3];
++	unsigned int i, j, l, n = 0;
++	int r, c, f;
++
++	s.o = o;
++	for (r = 0; r < 3; r++) {
++		o[r] = csc->k[r];
++		for (c = 0; c < 3; c++)
++			o[r] -= csc->m[r][c] * csc->d[c];
++		if (!csc->m[r][0] && !csc->m[r][1] && !csc->m[r][2])
++			o[r] = clamp_t(s64, o[r], 0,
++				       (s64)SUN50I_CDC_CONST_MAX << SUN50I_CDC_FRAC);
++		/* no D fits a larger offset; keeps the solve below in s64 */
++		if (abs(o[r]) > 1LL << (14 + SUN50I_CDC_FRAC))
+ 			return -ERANGE;
++		s.d0[r] = csc->d[r];
++	}
++	if (sun50i_cdc_try_split(csc, o, s.d0))
++		return 0;
++
++	memset(a, 0, sizeof(a));
++	for (c = 0; c < 3; c++) {
++		a[c][c] = -(1 << 12);
++		b[c] = 0;
++		a[3 + c][c] = 1 << 12;
++		b[3 + c] = SUN50I_CDC_CONST_MAX << 12;
++	}
++	for (r = 0; r < 3; r++) {
++		for (c = 0; c < 3; c++) {
++			a[9 + r][c] = csc->m[r][c] >> 5;
++			a[6 + r][c] = -a[9 + r][c];
++		}
++		b[6 + r] = o[r] >> 5;
++		b[9 + r] = ((s64)SUN50I_CDC_CONST_MAX << 12) - b[6 + r];
++	}
++
++	for (i = 0; i < 12; i++)
++		for (j = i + 1; j < 12; j++)
++			for (l = j + 1; l < 12; l++) {
++				if (!sun50i_cdc_vertex(a, b, i, j, l, x))
++					continue;
++				for (c = 0; c < 3; c++) {
++					sum[c] += x[c];
++					dc[c] = (x[c] + 2) >> 2;
++				}
++				sun50i_cdc_consider(&s, dc);
++				n++;
++			}
++	if (!n)
++		return -ERANGE;
++
++	/* the centroid is inside: the most margin for the rounding of D */
++	for (c = 0; c < 3; c++)
++		cen[c] = div64_s64(sum[c], n);
++	for (c = 0; c < 3; c++)
++		dc[c] = (cen[c] + 2) >> 2;
++	sun50i_cdc_consider(&s, dc);
++
++	/* 1/8, 1/4, 1/2 of the way from each vertex to the centroid */
++	for (i = 0; i < 12; i++)
++		for (j = i + 1; j < 12; j++)
++			for (l = j + 1; l < 12; l++) {
++				if (!sun50i_cdc_vertex(a, b, i, j, l, x))
++					continue;
++				for (f = 1; f <= 4; f <<= 1) {
++					for (c = 0; c < 3; c++)
++						dc[c] = (x[c] + (cen[c] - x[c]) * f / 8 + 2) >> 2;
++					sun50i_cdc_consider(&s, dc);
++				}
++			}
++
++	if (s.best_dist == S64_MAX)
++		return -ERANGE;
++
++	memcpy(to, s.best, sizeof(to));
++	sun50i_cdc_segment(&s, to);
++
++	return sun50i_cdc_try_split(csc, o, s.best) ? 0 : -ERANGE;
++}
++
++static int sun50i_cdc_csc_valid(struct sun50i_cdc_csc *csc)
++{
++	int r, c;
++
++	for (r = 0; r < 3; r++)
+ 		for (c = 0; c < 3; c++)
+ 			if (csc->m[r][c] < SUN50I_CDC_COEF_MIN ||
+ 			    csc->m[r][c] > SUN50I_CDC_COEF_MAX)
+ 				return -ERANGE;
+-	}
+ 
+-	return 0;
++	return sun50i_cdc_split(csc);
+ }
+ 
+ static int sun50i_cdc_get_cfg(struct sun8i_layer *layer,
+@@ -328,13 +539,13 @@ static void sun50i_cdc_write_csc(struct sun8i_layer *layer,
+ 
+ 	for (r = 0; r < 3; r++) {
+ 		sun50i_cdc_write(layer, in ? SUN50I_CDC_IN_D(r) : SUN50I_CDC_OUT_D(r),
+-				 csc->d[r]);
++				 csc->reg_d[r]);
+ 		for (c = 0; c < 3; c++)
+ 			sun50i_cdc_write(layer, in ? SUN50I_CDC_IN_C(r, c) :
+-					 SUN50I_CDC_OUT_C(r, c), (u32)csc->m[r][c]);
++					 SUN50I_CDC_OUT_C(r, c),
++					 (u32)csc->m[r][c] & SUN50I_CDC_COEF_MASK);
+ 		sun50i_cdc_write(layer, in ? SUN50I_CDC_IN_C(r, 3) :
+-				 SUN50I_CDC_OUT_C(r, 3),
+-				 (u32)sun50i_cdc_round(csc->k[r]));
++				 SUN50I_CDC_OUT_C(r, 3), csc->reg_k[r]);
+ 	}
+ }
+ 
+@@ -428,7 +639,7 @@ static struct drm_colorop *sun50i_cdc_add_op(struct drm_plane *plane,
+ 		ret = drm_plane_colorop_3dlut_init(plane->dev, op, plane,
+ 						   &sun50i_cdc_colorop_funcs,
+ 						   SUN50I_CDC_LUT_DIM,
+-						   DRM_COLOROP_LUT3D_INTERPOLATION_TETRAHEDRAL,
++						   DRM_COLOROP_LUT3D_INTERPOLATION_TRILINEAR,
+ 						   DRM_COLOROP_FLAG_ALLOW_BYPASS);
+ 	else
+ 		ret = drm_plane_colorop_ctm_3x4_init(plane->dev, op, plane,
+-- 
+2.55.0
+

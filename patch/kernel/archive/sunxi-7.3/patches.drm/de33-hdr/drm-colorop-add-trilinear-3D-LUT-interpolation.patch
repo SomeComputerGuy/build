@@ -1,0 +1,91 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 14 Nov 2026 00:47:14 +0000
+Subject: [PATCH] drm/colorop: Add trilinear 3D LUT interpolation
+
+Some 3D LUT units interpolate trilinearly between the eight nodes of
+the cube that holds the input. Add that interpolation type and create
+the LUT3D_INTERPOLATION property of a 3D LUT colorop with only the type
+the driver passes, so that userspace cannot select one the hardware
+does not do. Existing users keep the single "Tetrahedral" value.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/drm_colorop.c | 16 ++++++++++++----
+ include/uapi/drm/drm_mode.h   |  8 ++++++++
+ 2 files changed, 20 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/drm_colorop.c b/drivers/gpu/drm/drm_colorop.c
+index 682fcc651..6cdab390b 100644
+--- a/drivers/gpu/drm/drm_colorop.c
++++ b/drivers/gpu/drm/drm_colorop.c
+@@ -88,6 +88,7 @@ static const struct drm_prop_enum_list drm_colorop_lut1d_interpolation_list[] =
+ 
+ static const struct drm_prop_enum_list drm_colorop_lut3d_interpolation_list[] = {
+ 	{ DRM_COLOROP_LUT3D_INTERPOLATION_TETRAHEDRAL, "Tetrahedral" },
++	{ DRM_COLOROP_LUT3D_INTERPOLATION_TRILINEAR, "Trilinear" },
+ };
+ 
+ /* Init Helpers */
+@@ -415,9 +416,17 @@ int drm_plane_colorop_3dlut_init(struct drm_device *dev, struct drm_colorop *col
+ 				 enum drm_colorop_lut3d_interpolation_type interpolation,
+ 				 uint32_t flags)
+ {
++	const struct drm_prop_enum_list *interp = NULL;
+ 	struct drm_property *prop;
++	unsigned int i;
+ 	int ret;
+ 
++	for (i = 0; i < ARRAY_SIZE(drm_colorop_lut3d_interpolation_list); i++)
++		if (drm_colorop_lut3d_interpolation_list[i].type == interpolation)
++			interp = &drm_colorop_lut3d_interpolation_list[i];
++	if (WARN_ON(!interp))
++		return -EINVAL;
++
+ 	ret = drm_plane_colorop_init(dev, colorop, plane, funcs, DRM_COLOROP_3D_LUT, flags);
+ 	if (ret)
+ 		return ret;
+@@ -432,10 +441,8 @@ int drm_plane_colorop_3dlut_init(struct drm_device *dev, struct drm_colorop *col
+ 	drm_object_attach_property(&colorop->base, colorop->size_property, lut_size);
+ 	colorop->size = lut_size;
+ 
+-	/* interpolation */
+-	prop = drm_property_create_enum(dev, 0, "LUT3D_INTERPOLATION",
+-					drm_colorop_lut3d_interpolation_list,
+-					ARRAY_SIZE(drm_colorop_lut3d_interpolation_list));
++	/* interpolation: the one the hardware does */
++	prop = drm_property_create_enum(dev, 0, "LUT3D_INTERPOLATION", interp, 1);
+ 	if (!prop)
+ 		return -ENOMEM;
+ 
+@@ -600,6 +607,7 @@ static const char * const colorop_type_name[] = {
+ 
+ static const char * const colorop_lu3d_interpolation_name[] = {
+ 	[DRM_COLOROP_LUT3D_INTERPOLATION_TETRAHEDRAL] = "Tetrahedral",
++	[DRM_COLOROP_LUT3D_INTERPOLATION_TRILINEAR] = "Trilinear",
+ };
+ 
+ static const char * const colorop_lut1d_interpolation_name[] = {
+diff --git a/include/uapi/drm/drm_mode.h b/include/uapi/drm/drm_mode.h
+index bd435effd..2a6e4d7bb 100644
+--- a/include/uapi/drm/drm_mode.h
++++ b/include/uapi/drm/drm_mode.h
+@@ -967,6 +967,14 @@ enum drm_colorop_lut3d_interpolation_type {
+ 	 * Tetrahedral 3DLUT interpolation
+ 	 */
+ 	DRM_COLOROP_LUT3D_INTERPOLATION_TETRAHEDRAL,
++
++	/**
++	 * @DRM_COLOROP_LUT3D_INTERPOLATION_TRILINEAR:
++	 *
++	 * Trilinear 3DLUT interpolation: linear along each axis between the
++	 * eight nodes of the cube that holds the input
++	 */
++	DRM_COLOROP_LUT3D_INTERPOLATION_TRILINEAR,
+ };
+ 
+ /**
+-- 
+2.55.0
+
