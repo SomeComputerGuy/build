@@ -10,21 +10,26 @@ HDMI clock only has an M divider and may pick any of its four parents.
 For 640x480 at 59.94 Hz (25.175 MHz), TCON TV0 sets pll-video0 to
 453 MHz and divides by 9 * 2 = 18 (25.167 MHz). 18 is out of reach of
 the HDMI divider, so the HDMI clock moves to pll-video2 (powering it up)
-and runs at 297 MHz / 12 = 24.75 MHz, 1.7 % off the pixel clock.
+and runs at 297 MHz / 12 = 24.75 MHz, 1.7 % off the pixel clock. It is
+the only mode of the attached TV where the two clocks differ.
 
-On an Orange Pi Zero2 with a TV attached this mode set corrupts memory
-within a second: oopses on valid kernel code ("Undefined instruction" on
-a NOP or a str), page allocator lists with flipped bits, hangs. It
-happens on every first switch to that mode, with the CPU at 480 MHz or
-1.5 GHz, and on the stock 7.3.3 kernel as well. 640x480 at 60 Hz and
-every other mode of the TV, where both clocks come out equal on
-pll-video0, run clean.
+On an Orange Pi Zero2 with a TV attached, switching to that mode
+corrupts memory within a second: oopses on valid kernel code, page
+allocator lists with flipped bits, hangs. It happens on the first switch
+every time, with the CPU at 480 MHz or 1.5 GHz, and on the stock 7.3.3
+kernel as well. 640x480 at 60 Hz and every other mode run clean. Why
+this mode set corrupts memory is not known: setting the same clock
+state by register writes on a running 640x480 at 60 Hz output
+(pll-video2 powered up, the HDMI mux switched to it, the rate mismatch,
+the TCON P divider, pll-video0 at 453 MHz, alone or all together) does
+not reproduce it.
 
 Give TCON TV0 the same divider set as the HDMI clock (M only, P cleared
-at probe) and keep the HDMI clock on its reset parent pll-video0, the
-PLL that TCON TV0 is assigned to. The HDMI clock can then always follow
-the pixel clock exactly: 640x480 at 59.94 Hz now gets pll-video0 at
-327 MHz / 13 = 25.154 MHz for both.
+at probe), put the HDMI clock on pll-video0 at probe and never let it
+change parent. The HDMI clock then always follows the pixel clock
+exactly, and nothing powers up pll-video2 any more: 640x480 at 59.94 Hz
+now gets pll-video0 at 327 MHz / 13 = 25.154 MHz for both. Rates of
+33.2 MHz and above are unchanged.
 
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
@@ -38,7 +43,7 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  					     "pll-video2", "pll-video2-4x" };
 +/*
 + * The HDMI controller clock must run at the TCON TV0 pixel clock. Keep it on
-+ * the TCON's PLL (pll-video0, the reset parent): a rate the M divider cannot
++ * the TCON's PLL (pll-video0, set at probe): a rate the M divider cannot
 + * reach from there must not move it to pll-video2 at a different rate.
 + */
  static SUNXI_CCU_M_WITH_MUX_GATE(hdmi_clk, "hdmi", hdmi_parents, 0xb00,
@@ -50,15 +55,16 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  
  static SUNXI_CCU_GATE(hdmi_slow_clk, "hdmi-slow", "osc24M", 0xb04, BIT(31), 0);
  
-@@ -627,6 +632,7 @@
+@@ -627,6 +632,8 @@
  };
  
  #define SUN50I_H616_HDMI_CEC_CLK_REG		0xb10
 +#define SUN50I_H616_TCON_TV0_CLK_REG		0xb80
++#define SUN50I_H616_HDMI_CLK_REG		0xb00
  static struct ccu_mux hdmi_cec_clk = {
  	.enable		= BIT(31) | BIT(30),
  
-@@ -677,14 +683,18 @@
+@@ -677,14 +684,18 @@
   * parent so that a mode set on one output can never re-rate the PLL that
   * drives the other.
   */
@@ -85,7 +91,7 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  static SUNXI_CCU_MP_WITH_MUX_GATE(tcon_tv1_clk, "tcon-tv1",
  				  tcon_tv_parents, 0xb84,
  				  0, 4,		/* M */
-@@ -1252,6 +1262,11 @@
+@@ -1252,6 +1263,16 @@
  	val |= BIT(24);
  	writel(val, reg + SUN50I_H616_HDMI_CEC_CLK_REG);
  
@@ -93,6 +99,11 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
 +	val = readl(reg + SUN50I_H616_TCON_TV0_CLK_REG);
 +	val &= ~GENMASK(9, 8);
 +	writel(val, reg + SUN50I_H616_TCON_TV0_CLK_REG);
++
++	/* The HDMI clock never changes parent (see above): put it on pll-video0 */
++	val = readl(reg + SUN50I_H616_HDMI_CLK_REG);
++	val &= ~GENMASK(25, 24);
++	writel(val, reg + SUN50I_H616_HDMI_CLK_REG);
 +
  	ret = devm_sunxi_ccu_probe(&pdev->dev, reg, &sun50i_h616_ccu_desc);
  	if (ret)
