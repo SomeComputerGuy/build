@@ -7,25 +7,28 @@ The H616 CCU driver turns its PLLs off and on with the PLL enable bit
 (bit 31), which powers the PLL down. The H616 user manual (3.3.3.6)
 advises against this: switching a PLL on and off disturbs the other
 PLLs and the stability of the system, and a PLL should be turned off
-with its output enable bit (bit 27) instead. The vendor kernel does the
-same: it sets the enable bit once at boot and gates every PLL with its
-output enable bit.
+with its output enable bit (bit 27) instead. The A100, D1 and A523 CCU
+drivers already work this way (see the comment in
+sun50i_a100_ccu_probe()). The vendor kernel follows the manual too: it
+gates every PLL with its output enable bit and never clears the enable
+bit (drivers/clk/sunxi/clk-sun50iw9.c: "we shouldn't set pll enable
+bit(bit31) dynamically").
 
-This is not only a recommendation. On an Orange Pi Zero2 with an HDMI
-display, a mode set to 640x480 at 59.94 Hz moves the HDMI clock from
-pll-video0 to pll-video2 while the TCON TV0 clock is gated, so
-pll-video0 loses its last user and is powered down while running at
-453 MHz. The CPU doing that write then executes wrong instructions:
-undefined instruction oopses on valid kernel code, returns through a
-wrong stack pointer, flipped pointers in the page allocator, hangs. It
-happens on the first such mode set, every time. The same power-down
-done from user space through /dev/mem, with pll-video0 at 453 MHz,
-kills the writing process with an undefined instruction on the first
-try, while clearing only the output enable bit at the same rate, 20
-times in a row, is clean.
+On an Orange Pi Zero2 with an HDMI display, a mode set to 640x480 at
+59.94 Hz moves the HDMI clock from pll-video0 to pll-video2 while the
+TCON TV0 clock is gated, so pll-video0 loses its last user and is
+powered down while running at 453 MHz. The CPU doing that write then
+mis-executes (undefined instruction oopses on valid code, wrong stack
+pointer, flipped pointers, hangs), on the first such mode set, every
+time. The same register writes done from user space through /dev/mem
+reproduce it: clearing the enable bit of pll-video0 at 453 MHz kills
+the writing process with an undefined instruction on the first try,
+while clearing only the output enable bit at 453 MHz, or the enable bit
+at 126 MHz, is clean 20 times in a row. What goes wrong inside the SoC
+is not known.
 
 Gate all PLLs with their output enable bit, and power them up once at
-probe, after the video PLL output dividers are set.
+probe, after their dividers are set.
 
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
@@ -153,18 +156,18 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
 +	 * with their enable bit (31): the user manual (3.3.3.6) warns that
 +	 * switching a PLL on and off disturbs the other PLLs and the
 +	 * stability of the system, and recommends turning a PLL off with its
-+	 * output enable bit instead. Powering a video PLL down at run time
-+	 * corrupts memory on the CPUs. So power all PLLs up here, once, and
-+	 * keep them powered.
++	 * output enable bit instead. Powering pll-video0 down at 453 MHz has
++	 * been seen to crash the CPU doing the write. So power all PLLs up
++	 * here, once their dividers are set, and keep them powered.
 +	 */
  	for (i = 0; i < ARRAY_SIZE(pll_regs); i++) {
  		val = readl(reg + pll_regs[i]);
  		val |= BIT(29) | BIT(27);
-@@ -1213,6 +1223,13 @@
- 		writel(val, reg + pll_video_regs[i]);
- 	}
+@@ -1235,6 +1245,13 @@
+ 	val |= BIT(0);
+ 	writel(val, reg + SUN50I_H616_PLL_AUDIO_REG);
  
-+	/* Power up the PLLs, now that the video PLL dividers are set */
++	/* Power up the PLLs, now that their dividers are set */
 +	for (i = 0; i < ARRAY_SIZE(pll_regs); i++) {
 +		val = readl(reg + pll_regs[i]);
 +		val |= BIT(31);
@@ -172,8 +175,8 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
 +	}
 +
  	/*
- 	 * Force OHCI 12M clock sources to 00 (12MHz divided from 48MHz)
- 	 *
+ 	 * Set the input-divider for the gpu1 clock to 3, to reach a safe 400 MHz.
+ 	 */
 -- 
 2.43.0
 
