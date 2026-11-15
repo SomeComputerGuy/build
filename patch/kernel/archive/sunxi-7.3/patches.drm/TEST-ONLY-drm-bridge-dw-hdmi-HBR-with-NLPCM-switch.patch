@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 15 Nov 2026 00:40:00 +0000
+Subject: [PATCH] TEST ONLY: drm/bridge: dw-hdmi: HBR with NLPCM switch
+
+Module parameter to set NLPCM together with HBR, as the Allwinner BSP
+does, to compare both settings on the board. Revert after the test.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-i2s-audio.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-i2s-audio.c
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-i2s-audio.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-i2s-audio.c
+@@ -20,6 +20,11 @@
+ 
+ #define DRIVER_NAME "dw-hdmi-i2s-audio"
+ 
++/* TEST ONLY: also set NLPCM in HBR mode, as the Allwinner BSP does. */
++static bool hbr_nlpcm;
++module_param(hbr_nlpcm, bool, 0644);
++MODULE_PARM_DESC(hbr_nlpcm, "TEST ONLY: set NLPCM together with HBR");
++
+ static inline void hdmi_write(struct dw_hdmi_i2s_audio_data *audio,
+ 			      u8 val, int offset)
+ {
+@@ -88,7 +93,8 @@
+ 		conf1 = HDMI_AUD_CONF1_WIDTH_21;
+ 		conf2 = 0;
+ 		if (hbr)
+-			conf2 = HDMI_AUD_CONF2_HBR;
++			conf2 = HDMI_AUD_CONF2_HBR |
++				(hbr_nlpcm ? HDMI_AUD_CONF2_NLPCM : 0);
+ 		else if (non_pcm)
+ 			conf2 = HDMI_AUD_CONF2_NLPCM;
+ 	} else {
+-- 
+2.53.0

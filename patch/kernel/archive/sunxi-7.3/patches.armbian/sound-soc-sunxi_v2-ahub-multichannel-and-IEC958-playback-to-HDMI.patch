@@ -1,0 +1,298 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 15 Nov 2026 00:40:00 +0000
+Subject: [PATCH] ASoC: sunxi_v2: ahub: multichannel and IEC958 playback to HDMI
+
+The conversion of IEC958 subframes for the HDMI controller follows Jernej
+Skrabec's H616 audio hub driver.
+
+I2S1 of the audio hub feeds the four I2S lanes of the HDMI controller,
+but the DAI allowed two channels on one lane and no IEC958 subframes, so
+neither multichannel PCM nor compressed passthrough could play.
+
+Allow eight playback channels and spread them over the HDMI lanes, two
+per lane. Accept IEC958_SUBFRAME_LE: move B, P, C, U and V into bits
+31..27 ahead of the 16-bit payload, as the controller expects, in place
+once the application has handed the frames over. Ask for appl_ptr
+syncs so that this also covers mmap. The other I2S controllers keep
+their two channel PCM limit.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/sound/soc/sunxi_v2/snd_sunxi_ahub.c b/sound/soc/sunxi_v2/snd_sunxi_ahub.c
+--- a/sound/soc/sunxi_v2/snd_sunxi_ahub.c
++++ b/sound/soc/sunxi_v2/snd_sunxi_ahub.c
+@@ -21,6 +21,7 @@
+ #include <linux/ioport.h>
+ #include <linux/regmap.h>
+ #include <linux/of_address.h>
++#include <sound/asoundef.h>
+ #include <sound/soc.h>
+ #include <sound/pcm_params.h>
+ #include <sound/dmaengine_pcm.h>
+@@ -31,6 +32,32 @@
+ #define HLOG           "AHUB"
+ #define DRV_NAME       "sunxi-snd-plat-ahub"
+ 
++/* I2S1 of the audio hub has no pins: it feeds the four I2S lanes of HDMI. */
++#define SUNXI_AHUB_HDMI_TDM            1
++#define SUNXI_AHUB_HDMI_LANES          4
++
++#define SUNXI_AHUB_FORMATS     (SNDRV_PCM_FMTBIT_S16_LE | \
++                                SNDRV_PCM_FMTBIT_S24_LE | \
++                                SNDRV_PCM_FMTBIT_S32_LE)
++
++/*
++ * The HDMI controller takes an IEC958 subframe as B, P, C, U and V in bits
++ * 31..27 followed by a 16-bit payload, while ALSA hands out canonical
++ * subframes (preamble in bits 3..0, payload in 27..12, V, U, C and P in
++ * 28..31).
++ */
++#define SUNXI_AHUB_HDMI_PREAMBLE_B     0x8
++#define SUNXI_AHUB_HDMI_PAYLOAD_MASK   GENMASK(27, 12)
++#define SUNXI_AHUB_HDMI_PCUV_MASK      (IEC958_SUBFRAME_PARITY | \
++                                        IEC958_SUBFRAME_CHANNEL_STATUS | \
++                                        IEC958_SUBFRAME_USER_DATA | \
++                                        IEC958_SUBFRAME_VALIDITY)
++
++static bool sunxi_ahub_is_hdmi(struct sunxi_ahub_info *ahub_info)
++{
++       return ahub_info->dts_info.tdm_num == SUNXI_AHUB_HDMI_TDM;
++}
++
+ static int sunxi_ahub_dai_startup(struct snd_pcm_substream *substream,
+                                  struct snd_soc_dai *dai)
+ {
+@@ -47,6 +74,25 @@
+        if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+                snd_soc_dai_set_dma_data(dai, substream,
+                                         &ahub_info->playback_dma_param);
++               if (sunxi_ahub_is_hdmi(ahub_info)) {
++                       /*
++                        * IEC958 subframes are rewritten once the application
++                        * has handed them over, so every appl_ptr update has
++                        * to reach the driver, mmap or not.
++                        */
++                       substream->runtime->hw.info |=
++                               SNDRV_PCM_INFO_SYNC_APPLPTR |
++                               SNDRV_PCM_INFO_NO_REWINDS;
++                       ahub_info->hdmi_appl = 0;
++               } else {
++                       /* Only the HDMI lanes are wired up for more. */
++                       snd_pcm_hw_constraint_minmax(substream->runtime,
++                                                    SNDRV_PCM_HW_PARAM_CHANNELS,
++                                                    1, 2);
++                       snd_pcm_hw_constraint_mask64(substream->runtime,
++                                                    SNDRV_PCM_HW_PARAM_FORMAT,
++                                                    SUNXI_AHUB_FORMATS);
++               }
+        } else {
+                snd_soc_dai_set_dma_data(dai, substream,
+                                         &ahub_info->capture_dma_param);
+@@ -490,6 +536,32 @@
+        return 0;
+ }
+ 
++/* Two channels per HDMI lane: lane n carries channels 2n and 2n + 1. */
++static void sunxi_ahub_set_hdmi_lanes(struct sunxi_ahub_info *ahub_info,
++                                     unsigned int channels)
++{
++       struct regmap *regmap = ahub_info->mem_info.regmap;
++       unsigned int tdm_num = ahub_info->dts_info.tdm_num;
++       unsigned int lanes = DIV_ROUND_UP(channels, 2);
++       unsigned int lane;
++
++       for (lane = 0; lane < lanes; lane++) {
++               unsigned int lane_channels = min(channels - 2 * lane, 2U);
++
++               regmap_write(regmap, SUNXI_AHUB_I2S_OUT_CHMAP0(tdm_num, lane),
++                            (2 * lane + 1) << 4 | 2 * lane);
++               regmap_update_bits(regmap,
++                                  SUNXI_AHUB_I2S_OUT_SLOT(tdm_num, lane),
++                                  0xf << I2S_OUT_SLOT_NUM,
++                                  (lane_channels - 1) << I2S_OUT_SLOT_NUM);
++               regmap_update_bits(regmap,
++                                  SUNXI_AHUB_I2S_OUT_SLOT(tdm_num, lane),
++                                  0xffff << I2S_OUT_SLOT_EN,
++                                  GENMASK(lane_channels - 1, 0) << I2S_OUT_SLOT_EN);
++       }
++       ahub_info->hdmi_lanes = lanes;
++}
++
+ static int sunxi_ahub_dai_hw_params(struct snd_pcm_substream *substream,
+                                    struct snd_pcm_hw_params *params,
+                                    struct snd_soc_dai *dai)
+@@ -578,6 +650,7 @@
+                                   0x7 << I2S_FMT0_SR, 0x5 << I2S_FMT0_SR);
+                break;
+        case SNDRV_PCM_FORMAT_S32_LE:
++       case SNDRV_PCM_FORMAT_IEC958_SUBFRAME_LE:
+                if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK) {
+                        regmap_update_bits(regmap, SUNXI_AHUB_APBIF_TX_CTL(apb_num),
+                                           0x7 << APBIF_TX_WS, 0x7 << APBIF_TX_WS);
+@@ -609,6 +682,11 @@
+                                   0xf << I2S_CHCFG_TX_CHANNUM,
+                                   (channels - 1) << I2S_CHCFG_TX_CHANNUM);
+ 
++               if (sunxi_ahub_is_hdmi(ahub_info)) {
++                       sunxi_ahub_set_hdmi_lanes(ahub_info, channels);
++                       return 0;
++               }
++
+                regmap_update_bits(regmap,
+                                   SUNXI_AHUB_I2S_OUT_SLOT(tdm_num, tx_pin),
+                                   0xf << I2S_OUT_SLOT_NUM,
+@@ -654,9 +732,14 @@
+                goto tx_route_disable;
+ 
+ tx_route_enable:
+-       regmap_update_bits(regmap, SUNXI_AHUB_I2S_CTL(tdm_num),
+-                          0x1 << (I2S_CTL_SDO0_EN + tx_pin),
+-                          0x1 << (I2S_CTL_SDO0_EN + tx_pin));
++       if (sunxi_ahub_is_hdmi(ahub_info))
++               regmap_update_bits(regmap, SUNXI_AHUB_I2S_CTL(tdm_num),
++                                  GENMASK(SUNXI_AHUB_HDMI_LANES - 1, 0) << I2S_CTL_SDO0_EN,
++                                  GENMASK(ahub_info->hdmi_lanes - 1, 0) << I2S_CTL_SDO0_EN);
++       else
++               regmap_update_bits(regmap, SUNXI_AHUB_I2S_CTL(tdm_num),
++                                  0x1 << (I2S_CTL_SDO0_EN + tx_pin),
++                                  0x1 << (I2S_CTL_SDO0_EN + tx_pin));
+        regmap_update_bits(regmap, SUNXI_AHUB_I2S_CTL(tdm_num),
+                           0x1 << I2S_CTL_TXEN, 0x1 << I2S_CTL_TXEN);
+        regmap_update_bits(regmap, SUNXI_AHUB_I2S_CTL(tdm_num),
+@@ -674,9 +757,14 @@
+                           0x1 << I2S_CTL_OUT_MUTE, 0x1 << I2S_CTL_OUT_MUTE);
+        regmap_update_bits(regmap, SUNXI_AHUB_I2S_CTL(tdm_num),
+                           0x1 << I2S_CTL_TXEN, 0x0 << I2S_CTL_TXEN);
+-       regmap_update_bits(regmap, SUNXI_AHUB_I2S_CTL(tdm_num),
+-                          0x1 << (I2S_CTL_SDO0_EN + tx_pin),
+-                          0x0 << (I2S_CTL_SDO0_EN + tx_pin));
++       if (sunxi_ahub_is_hdmi(ahub_info))
++               regmap_update_bits(regmap, SUNXI_AHUB_I2S_CTL(tdm_num),
++                                  GENMASK(SUNXI_AHUB_HDMI_LANES - 1, 0) << I2S_CTL_SDO0_EN,
++                                  0);
++       else
++               regmap_update_bits(regmap, SUNXI_AHUB_I2S_CTL(tdm_num),
++                                  0x1 << (I2S_CTL_SDO0_EN + tx_pin),
++                                  0x0 << (I2S_CTL_SDO0_EN + tx_pin));
+        /* stop apbif tx */
+        regmap_update_bits(regmap, SUNXI_AHUB_APBIF_TX_CTL(apb_num),
+                           0x1 << APBIF_TX_START, 0x0 << APBIF_TX_START);
+@@ -1011,12 +1099,12 @@
+        .playback = {
+                .stream_name    = "Playback",
+                .channels_min   = 1,
+-               .channels_max   = 2,
++               /* 8 on the HDMI lanes, the others are limited in startup */
++               .channels_max   = 8,
+                .rates          = SNDRV_PCM_RATE_8000_192000
+                                | SNDRV_PCM_RATE_KNOT,
+-               .formats        = SNDRV_PCM_FMTBIT_S16_LE
+-                               | SNDRV_PCM_FMTBIT_S24_LE
+-                               | SNDRV_PCM_FMTBIT_S32_LE,
++               .formats        = SUNXI_AHUB_FORMATS
++                               | SNDRV_PCM_FMTBIT_IEC958_SUBFRAME_LE,
+        },
+        .capture = {
+                .stream_name    = "Capture",
+@@ -1110,9 +1198,74 @@
+                       sunxi_loopback_debug_get, sunxi_loopback_debug_set),
+ };
+ 
++static void sunxi_ahub_hdmi_convert(struct snd_pcm_runtime *runtime,
++                                   snd_pcm_uframes_t offset,
++                                   snd_pcm_uframes_t frames)
++{
++       __le32 *ptr = (__le32 *)(runtime->dma_area +
++                                frames_to_bytes(runtime, offset));
++       __le32 *end = ptr + frames * runtime->channels;
++
++       for (; ptr < end; ptr++) {
++               u32 sample = le32_to_cpu(*ptr);
++               u32 hdmi = (sample & SUNXI_AHUB_HDMI_PAYLOAD_MASK) >> 1;
++
++               /* P, C, U and V move from bits 31..28 to 30..27 */
++               hdmi |= (sample & SUNXI_AHUB_HDMI_PCUV_MASK) >> 1;
++               /* ALSA's Z preamble marks the first frame of a block */
++               if ((sample & IEC958_SUBFRAME_PREAMBLE_MASK) ==
++                   SUNXI_AHUB_HDMI_PREAMBLE_B)
++                       hdmi |= BIT(31);
++
++               *ptr = cpu_to_le32(hdmi);
++       }
++}
++
++/*
++ * Rewrite the IEC958 subframes the application just handed over, in place:
++ * after they are written and before the DMA reads them.
++ */
++static int sunxi_ahub_pcm_ack(struct snd_soc_component *component,
++                             struct snd_pcm_substream *substream)
++{
++       struct sunxi_ahub_info *ahub_info = snd_soc_component_get_drvdata(component);
++       struct snd_pcm_runtime *runtime = substream->runtime;
++       snd_pcm_uframes_t appl, offset, frames;
++
++       if (substream->stream != SNDRV_PCM_STREAM_PLAYBACK ||
++           runtime->format != SNDRV_PCM_FORMAT_IEC958_SUBFRAME_LE ||
++           !sunxi_ahub_is_hdmi(ahub_info))
++               return 0;
++
++       appl = runtime->control->appl_ptr;
++       frames = appl - ahub_info->hdmi_appl;
++       if ((snd_pcm_sframes_t)frames < 0)
++               frames += runtime->boundary;
++
++       /* nothing new was written (reset or forward past the buffer) */
++       if (frames > runtime->buffer_size) {
++               ahub_info->hdmi_appl = appl;
++               return 0;
++       }
++
++       offset = ahub_info->hdmi_appl % runtime->buffer_size;
++       while (frames) {
++               snd_pcm_uframes_t chunk = min(frames,
++                                             runtime->buffer_size - offset);
++
++               sunxi_ahub_hdmi_convert(runtime, offset, chunk);
++               offset = (offset + chunk) % runtime->buffer_size;
++               frames -= chunk;
++       }
++       ahub_info->hdmi_appl = appl;
++
++       return 0;
++}
++
+ static struct snd_soc_component_driver sunxi_ahub_component = {
+        .name           = DRV_NAME,
+        .probe          = sunxi_ahub_probe,
++       .ack            = sunxi_ahub_pcm_ack,
+        .suspend        = sunxi_ahub_suspend,
+        .resume         = sunxi_ahub_resume,
+        .controls       = sunxi_ahub_controls,
+diff --git a/sound/soc/sunxi_v2/snd_sunxi_ahub.h b/sound/soc/sunxi_v2/snd_sunxi_ahub.h
+--- a/sound/soc/sunxi_v2/snd_sunxi_ahub.h
++++ b/sound/soc/sunxi_v2/snd_sunxi_ahub.h
+@@ -12,6 +12,8 @@
+ #ifndef __SND_SUNXI_AHUB_H
+ #define __SND_SUNXI_AHUB_H
+ 
++#include <sound/pcm.h>
++
+ #include "snd_sunxi_ahub_dam.h"
+ 
+ struct sunxi_ahub_pinctl_info {
+@@ -62,6 +64,10 @@
+        unsigned int mclk_freq;
+        unsigned int lrck_freq;
+        unsigned int bclk_freq;
++
++       /* HDMI playback: lanes in use, last appl_ptr converted to IEC958 */
++       unsigned int hdmi_lanes;
++       snd_pcm_uframes_t hdmi_appl;
+ };
+ 
+ int sunxi_loopback_debug_get(struct snd_kcontrol *kcontrol,
+-- 
+2.53.0
