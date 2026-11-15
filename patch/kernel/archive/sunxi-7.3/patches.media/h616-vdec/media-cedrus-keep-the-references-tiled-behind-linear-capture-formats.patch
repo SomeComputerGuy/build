@@ -19,6 +19,25 @@ references. The tiled, AFBC and P010 formats are unchanged.
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
+ drivers/staging/media/sunxi/cedrus/cedrus.c       |   1 +
+ drivers/staging/media/sunxi/cedrus/cedrus.h       | 110 ++++++++++++++++++----
+ drivers/staging/media/sunxi/cedrus/cedrus_avs.c   |  13 ++-
+ drivers/staging/media/sunxi/cedrus/cedrus_dec.c   |   9 +-
+ drivers/staging/media/sunxi/cedrus/cedrus_h264.c  |  19 ++--
+ drivers/staging/media/sunxi/cedrus/cedrus_h265.c  |  13 ++-
+ drivers/staging/media/sunxi/cedrus/cedrus_hw.c    |  60 ++++++++++--
+ drivers/staging/media/sunxi/cedrus/cedrus_hw.h    |   6 ++
+ drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c |  20 ++--
+ drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c |  20 ++--
+ drivers/staging/media/sunxi/cedrus/cedrus_regs.h  |   4 +
+ drivers/staging/media/sunxi/cedrus/cedrus_vc1.c   |  20 ++--
+ drivers/staging/media/sunxi/cedrus/cedrus_video.c |   7 +-
+ drivers/staging/media/sunxi/cedrus/cedrus_vp8.c   |  15 ++-
+ drivers/staging/media/sunxi/cedrus/cedrus_vp9.c   |  24 ++++-
+ 15 files changed, 275 insertions(+), 66 deletions(-)
+
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
+index 155f6e1..9e4291b 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
 @@ -1452,6 +1452,7 @@ static const struct cedrus_variant sun50i_h616_cedrus_variant = {
@@ -29,6 +48,8 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	/* The 0x12011 encoder: the vendor library's "h6" programming. */
  	.enc_flags	= CEDRUS_ENC_FLAG_ADDR_SHIFT_8 |
  			  CEDRUS_ENC_FLAG_ISP_SIZE_8PX |
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.h b/drivers/staging/media/sunxi/cedrus/cedrus.h
+index d007393..776fecd 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus.h
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
 @@ -355,6 +355,11 @@ struct cedrus_dec_ops {
@@ -242,6 +263,8 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  }
  
  static inline struct cedrus_buffer *
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_avs.c b/drivers/staging/media/sunxi/cedrus/cedrus_avs.c
+index 77d3614..1ead024 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_avs.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_avs.c
 @@ -128,8 +128,8 @@ static void cedrus_avs_write_ref(struct cedrus_ctx *ctx,
@@ -284,6 +307,8 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	.trigger	= cedrus_avs_trigger,
 +	.linear_out_secondary = true,
  };
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+index c7dd884..63a99f8 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
 @@ -257,7 +257,14 @@ void cedrus_device_run(void *priv)
@@ -302,6 +327,8 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  
  	error = ctx->current_codec->setup(ctx, &run);
  	if (error)
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+index 2dd7fed..8a495b0 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
 @@ -84,8 +84,8 @@ static void cedrus_fill_ref_pic(struct cedrus_ctx *ctx,
@@ -349,6 +376,8 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	.trigger	= cedrus_h264_trigger,
 +	.linear_out_secondary = true,
  };
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_h265.c b/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
+index 89f321f..dc29d2f 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
 @@ -839,9 +839,19 @@ static int cedrus_h265_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
@@ -380,6 +409,8 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	.stop		= cedrus_h265_stop,
  	.buf_cleanup	= cedrus_h265_buf_cleanup,
  	.trigger	= cedrus_h265_trigger,
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+index ae8864a..99e6c28 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
 @@ -171,14 +171,9 @@ void cedrus_dst_format_set(struct cedrus_dev *dev,
@@ -470,6 +501,8 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	dev->enc_flags = variant->enc_flags;
  
  	irq_dec = platform_get_irq(dev->pdev, 0);
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_hw.h b/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
+index 28298e3..89266c3 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
 @@ -20,6 +20,12 @@ int cedrus_engine_enable(struct cedrus_ctx *ctx);
@@ -485,6 +518,8 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  void cedrus_dst_secondary_format_set(struct cedrus_dev *dev,
  				     struct v4l2_pix_format *fmt);
  
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
+index 3ab353d..bb455d7 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
 @@ -204,18 +204,18 @@ static int cedrus_mpeg2_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
@@ -512,24 +547,28 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  
  	cedrus_write(dev, VE_DEC_MPEG_REC_LUMA, dst_luma_addr);
  	cedrus_write(dev, VE_DEC_MPEG_REC_CHROMA, dst_chroma_addr);
-@@ -256,6 +256,11 @@ static int cedrus_mpeg2_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+@@ -256,6 +256,13 @@ static int cedrus_mpeg2_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
  	reg = VE_DEC_MPEG_CTRL_IRQ_MASK | VE_DEC_MPEG_CTRL_MC_NO_WRITEBACK |
  	      VE_DEC_MPEG_CTRL_MC_CACHE_EN;
  
 +	if (cedrus_dst_is_tiled_behind(ctx)) {
 +		cedrus_mpeg_tiled_behind_set(ctx, &run->dst->vb2_buf);
++		/* with the secondary output on, this bit drops the reference */
++		reg &= ~VE_DEC_MPEG_CTRL_MC_NO_WRITEBACK;
 +		reg |= VE_DEC_MPEG_CTRL_ROTATE_SCALE_OUT_EN;
 +	}
 +
  	cedrus_write(dev, VE_DEC_MPEG_CTRL, reg);
  
  	return 0;
-@@ -288,4 +293,5 @@ struct cedrus_dec_ops cedrus_dec_ops_mpeg2 = {
+@@ -288,4 +295,5 @@ struct cedrus_dec_ops cedrus_dec_ops_mpeg2 = {
  	.setup		= cedrus_mpeg2_setup,
  	.start		= cedrus_mpeg2_start,
  	.trigger	= cedrus_mpeg2_trigger,
 +	.linear_out_secondary = true,
  };
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c
+index 0bdd71a..d0bc270 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c
 @@ -750,18 +750,18 @@ static int cedrus_mpeg4_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
@@ -557,24 +596,28 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  
  	/*
  	 * A B picture reads the macroblock information and not coded flags
-@@ -799,6 +799,11 @@ static int cedrus_mpeg4_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+@@ -799,6 +799,13 @@ static int cedrus_mpeg4_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
  	if (!h263 && (vol->flags & V4L2_MPEG4_VOL_FLAG_QUARTER_SAMPLE))
  		ctrl |= cedrus_mpeg4_qpel_ctrl(coding_type, quirks);
  
 +	if (cedrus_dst_is_tiled_behind(ctx)) {
 +		cedrus_mpeg_tiled_behind_set(ctx, dst_vb);
++		/* with the secondary output on, this bit drops the reference */
++		ctrl &= ~VE_DEC_MPEG_CTRL_MC_NO_WRITEBACK;
 +		ctrl |= VE_DEC_MPEG_CTRL_ROTATE_SCALE_OUT_EN;
 +	}
 +
  	cedrus_write(dev, VE_DEC_MPEG_CTRL, ctrl);
  
  	/* Bitstream. */
-@@ -993,4 +998,5 @@ struct cedrus_dec_ops cedrus_dec_ops_mpeg4 = {
+@@ -993,4 +1000,5 @@ struct cedrus_dec_ops cedrus_dec_ops_mpeg4 = {
  	.buf_cleanup	= cedrus_mpeg4_buf_cleanup,
  	.trigger	= cedrus_mpeg4_trigger,
  	.trigger_next	= cedrus_mpeg4_trigger_next,
 +	.linear_out_secondary = true,
  };
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+index 5731d34..3f6cdd3 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
 @@ -107,6 +107,7 @@
@@ -602,6 +645,8 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  #define VE_H264_OUTPUT_FRAME_IDX	0x24c
  #define VE_H264_EXTRA_BUFFER1		0x250
  #define VE_H264_EXTRA_BUFFER2		0x254
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+index 18346c3..8974cc3 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
 @@ -905,8 +905,8 @@ static int cedrus_vc1_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
@@ -659,6 +704,8 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	.trigger	= cedrus_vc1_trigger,
 +	.linear_out_secondary = true,
  };
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_video.c b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+index 31528d8..cee6c6b 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
 @@ -574,6 +574,8 @@ static int cedrus_try_fmt_vid_cap_p(struct cedrus_ctx *ctx,
@@ -689,6 +736,8 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  
  		vb2_set_plane_payload(vb, 0, payload);
  	}
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_vp8.c b/drivers/staging/media/sunxi/cedrus/cedrus_vp8.c
+index febfe8a..3102c78 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_vp8.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_vp8.c
 @@ -817,8 +817,8 @@ static int cedrus_vp8_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
@@ -725,6 +774,8 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	.trigger	= cedrus_vp8_trigger,
 +	.linear_out_secondary = true,
  };
+diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_vp9.c b/drivers/staging/media/sunxi/cedrus/cedrus_vp9.c
+index e2553ce..c0428f6 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_vp9.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_vp9.c
 @@ -821,7 +821,7 @@ static dma_addr_t cedrus_vp9_frame_addr(struct cedrus_ctx *ctx,
