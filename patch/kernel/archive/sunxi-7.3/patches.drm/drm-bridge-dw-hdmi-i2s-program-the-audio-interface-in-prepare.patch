@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 15 Nov 2026 08:00:00 +0000
+Subject: [PATCH] drm/bridge: dw-hdmi-i2s: program the audio interface in
+ prepare
+
+Whether a stream is non-linear PCM, and so needs NLPCM or HBR, comes
+from the channel status the application writes to the "IEC958 Playback
+Default" control. alsa-lib's hdmi and iec958 device definitions write
+it from a hook that runs after the driver's hw_params, so the controller
+was always set up for linear PCM and compressed streams were sent as
+audio. hdmi-codec reads the control again for prepare, so set the
+controller up there, as vc4 does.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi-i2s-audio.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi-i2s-audio.c
+@@ -35,9 +35,9 @@
+ 	return audio->read(hdmi, offset);
+ }
+ 
+-static int dw_hdmi_i2s_hw_params(struct device *dev, void *data,
+-				 struct hdmi_codec_daifmt *fmt,
+-				 struct hdmi_codec_params *hparms)
++static int dw_hdmi_i2s_prepare(struct device *dev, void *data,
++			       struct hdmi_codec_daifmt *fmt,
++			       struct hdmi_codec_params *hparms)
+ {
+ 	struct dw_hdmi_i2s_audio_data *audio = data;
+ 	struct dw_hdmi *hdmi = audio->hdmi;
+@@ -207,7 +207,7 @@
+ }
+ 
+ static const struct hdmi_codec_ops dw_hdmi_i2s_ops = {
+-	.hw_params	= dw_hdmi_i2s_hw_params,
++	.prepare	= dw_hdmi_i2s_prepare,
+ 	.audio_startup  = dw_hdmi_i2s_audio_startup,
+ 	.audio_shutdown	= dw_hdmi_i2s_audio_shutdown,
+ 	.get_eld	= dw_hdmi_i2s_get_eld,
+-- 
+2.53.0

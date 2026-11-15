@@ -1,0 +1,67 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 15 Nov 2026 08:00:00 +0000
+Subject: [PATCH] ASoC: hdmi-codec: allow odd PCM channel counts
+
+The channel allocation lookup only matches allocations for exactly as
+many channels as the stream has, and all of them are for 2, 4, 6 or 8
+channels. A 3, 5 or 7 channel stream therefore fails hw_params with
+"Not able to map channels to speakers", although the HDMI audio
+InfoFrame takes any channel count from 2 to 8.
+
+Match an odd count against the allocations for one channel more. The
+stream fills all but their last slot, so prefer an allocation that has
+no speaker there and otherwise leave that speaker silent.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/sound/soc/codecs/hdmi-codec.c
++++ b/sound/soc/codecs/hdmi-codec.c
+@@ -358,23 +358,34 @@
+ static int hdmi_codec_get_ch_alloc_table_idx(struct hdmi_codec_priv *hcp,
+ 					     unsigned char channels)
+ {
+-	int i;
++	int i, strict;
+ 	u8 spk_alloc;
+ 	unsigned long spk_mask;
+-	const struct hdmi_codec_cea_spk_alloc *cap = hdmi_codec_channel_alloc;
++	const struct hdmi_codec_cea_spk_alloc *cap;
+ 
+ 	spk_alloc = drm_eld_get_spk_alloc(hcp->eld);
+ 	spk_mask = hdmi_codec_spk_mask_from_alloc(spk_alloc);
+ 
+-	for (i = 0; i < ARRAY_SIZE(hdmi_codec_channel_alloc); i++, cap++) {
+-		/* If spk_alloc == 0, HDMI is unplugged return stereo config*/
+-		if (!spk_alloc && cap->ca_id == 0)
++	/*
++	 * An odd channel count fills all but the last slot of an allocation
++	 * for one channel more. Prefer an allocation without a speaker in that
++	 * slot, else leave that speaker silent.
++	 */
++	for (strict = channels % 2; strict >= 0; strict--) {
++		cap = hdmi_codec_channel_alloc;
++		for (i = 0; i < ARRAY_SIZE(hdmi_codec_channel_alloc); i++, cap++) {
++			/* If spk_alloc == 0, HDMI is unplugged return stereo config*/
++			if (!spk_alloc && cap->ca_id == 0)
++				return i;
++			if (cap->n_ch != round_up(channels, 2))
++				continue;
++			if (!(cap->mask == (spk_mask & cap->mask)))
++				continue;
++			if (strict &&
++			    hdmi_codec_8ch_chmaps[cap->ca_id].map[channels] != SNDRV_CHMAP_NA)
++				continue;
+ 			return i;
+-		if (cap->n_ch != channels)
+-			continue;
+-		if (!(cap->mask == (spk_mask & cap->mask)))
+-			continue;
+-		return i;
++		}
+ 	}
+ 
+ 	return -EINVAL;
+-- 
+2.53.0
