@@ -1,0 +1,29 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 15 Nov 2026 11:30:00 +0000
+Subject: drm/sun4i: mixer: Run the H616 display engine at 696 MHz
+
+The vendor BSP clocks the H616 display engine at 696 MHz (pll-de and
+de). At 600 MHz a 4096x2160 mode at 60 Hz (594 MHz pixel clock, 304
+pixels of horizontal blanking) has too little margin: while the video
+engine decodes a 4K stream, TCON TV0 reports FIFO underflows about
+twice a second and the TV shows bands of displaced lines. At 696 MHz
+there are no underflows under the same load.
+
+Use the vendor's rate.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+--- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
++++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
+@@ -1938,7 +1938,7 @@
+ 
+ static const struct sun8i_mixer_cfg sun50i_h616_mixer0_cfg = {
+ 	.de_type	= SUN8I_MIXER_DE33,
+-	.mod_rate	= 600000000,
++	.mod_rate	= 696000000,
+ 	.has_formatter	= 1,
+ };
+ 
