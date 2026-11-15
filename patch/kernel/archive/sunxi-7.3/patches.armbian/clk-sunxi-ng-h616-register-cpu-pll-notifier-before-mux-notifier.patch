@@ -1,0 +1,54 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Ilya Titov <ilya.titov@wirenboard.com>
+Date: Mon, 9 Nov 2026 12:09:14 +0300
+Subject: clk: sunxi-ng: h616: register CPU PLL notifier before mux notifier
+
+Currently the CPU mux notifier is registered first, so on
+POST_RATE_CHANGE the CPU is switched back to PLL_CPUX before the PLL
+notifier re-locks it. The CPU then runs from the PLL while it is still
+settling. The comment for ccu_pll_notifier_cb() says it must be
+registered first, and the other sunxi-ng drivers (A33, H3, R40, A64,
+A100) do it in that order.
+
+We see random hangs and oopses on T507 based boards when cpufreq
+switches frequency often. In the oopses and JTAG dumps we captured, CPU0
+was always in ccu_mux_notifier_cb() or ccu_pll_notifier_cb(). Other
+CPUs were usually stuck on dsb after tlbi, waiting for CPU0.
+
+Running a random walk over all OPPs with some load on other cores, two
+boards hung 20+ times in about 3 days. With the PLL notifier registered
+first there were no hangs in the same time.
+
+Fixes: 087b4083d3f9 ("clk: sunxi-ng: h616: Reparent CPU clock during frequency changes")
+Cc: stable@vger.kernel.org
+Signed-off-by: Ilya Titov <ilya.titov@wirenboard.com>
+Link: https://patch.msgid.link/20261109090914.46872-1-ilya.titov@wirenboard.com
+Signed-off-by: Chen-Yu Tsai <wens@kernel.org>
+
+diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
+index 332013b..2893751 100644
+--- a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
++++ b/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
+@@ -1256,13 +1256,16 @@ static int sun50i_h616_ccu_probe(struct platform_device *pdev)
+ 	if (ret)
+ 		return ret;
+ 
++	/*
++	 * Re-lock the CPU PLL after any rate changes. Must be registered
++	 * before the mux notifier, so CPU goes back to a locked PLL.
++	 */
++	ccu_pll_notifier_register(&sun50i_h616_pll_cpu_nb);
++
+ 	/* Reparent CPU during CPU PLL rate changes */
+ 	ccu_mux_notifier_register(pll_cpux_clk.common.hw.clk,
+ 				  &sun50i_h616_cpu_nb);
+ 
+-	/* Re-lock the CPU PLL after any rate changes */
+-	ccu_pll_notifier_register(&sun50i_h616_pll_cpu_nb);
+-
+ 	/* Reparent GPU during GPU PLL rate changes */
+ 	ccu_mux_notifier_register(pll_gpu_clk.common.hw.clk,
+ 				  &sun50i_h616_gpu_nb);
+-- 
+Armbian
+

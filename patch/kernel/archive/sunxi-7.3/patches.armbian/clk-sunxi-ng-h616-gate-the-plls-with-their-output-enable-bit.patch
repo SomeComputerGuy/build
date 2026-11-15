@@ -1,40 +1,21 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
-Date: Sat, 14 Nov 2026 18:30:00 +0000
+Date: Sat, 14 Nov 2026 19:10:14 +0000
 Subject: clk: sunxi-ng: h616: Gate the PLLs with their output enable bit
 
-The H616 CCU driver turns its PLLs off and on with the PLL enable bit
-(bit 31), which powers the PLL down. The H616 user manual (3.3.3.6)
-advises against this: switching a PLL on and off disturbs the other
-PLLs and the stability of the system, and a PLL should be turned off
-with its output enable bit (bit 27) instead. The A100, D1 and A523 CCU
-drivers already work this way (see the comment in
-sun50i_a100_ccu_probe()). The vendor kernel follows the manual too: it
-gates every PLL with its output enable bit and never clears the enable
-bit (drivers/clk/sunxi/clk-sun50iw9.c: "we shouldn't set pll enable
-bit(bit31) dynamically").
+Gate the H616 PLLs with the output enable bit (27) instead of the enable
+bit (31), which powers the PLL down, as the manual (3.3.3.6) recommends
+and the A100, D1 and A523 drivers do. Power them up once at probe.
 
-On an Orange Pi Zero2 with an HDMI display, a mode set to 640x480 at
-59.94 Hz moves the HDMI clock from pll-video0 to pll-video2 while the
-TCON TV0 clock is gated, so pll-video0 loses its last user and is
-powered down while running at 453 MHz. The system then mis-executes,
-often on the CPU doing that write (undefined instruction oopses on
-valid code, wrong stack pointer, flipped pointers, hangs), on the first
-such mode set, every time. The same register writes done from user space through /dev/mem
-reproduce it: clearing the enable bit of pll-video0 at 453 MHz kills
-the writing process with an undefined instruction on the first try,
-while clearing only the output enable bit at 453 MHz, or the enable bit
-at 126 MHz, is clean 20 times in a row. What goes wrong inside the SoC
-is not known.
+On an Orange Pi Zero2, powering pll-video0 down at 453 MHz crashes the
+CPU doing the write.
 
-Gate all PLLs with their output enable bit, and power them up once at
-probe, after their dividers are set. Unused PLLs now stay powered, as
-on the vendor kernel; the effect on idle power has not been measured.
-
+Fixes: 88dde5e23da1 ("clk: sunxi-ng: Add support for the Allwinner H616 CCU")
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
----
+
 diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
+index 91ad450..332013b 100644
 --- a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
 +++ b/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
 @@ -36,7 +36,7 @@
@@ -46,7 +27,7 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  	.lock		= BIT(28),
  	.mult		= _SUNXI_CCU_MULT_MIN(8, 8, 12),
  	.common		= {
-@@ -50,7 +50,7 @@
+@@ -50,7 +50,7 @@ static struct ccu_mult pll_cpux_clk = {
  /* Some PLLs are input * N / div1 / P. Model them as NKMP with no K */
  #define SUN50I_H616_PLL_DDR0_REG	0x010
  static struct ccu_nkmp pll_ddr0_clk = {
@@ -55,7 +36,7 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  	.lock		= BIT(28),
  	.n		= _SUNXI_CCU_MULT_MIN(8, 8, 12),
  	.m		= _SUNXI_CCU_DIV(1, 1), /* input divider */
-@@ -65,7 +65,7 @@
+@@ -65,7 +65,7 @@ static struct ccu_nkmp pll_ddr0_clk = {
  
  #define SUN50I_H616_PLL_DDR1_REG	0x018
  static struct ccu_nkmp pll_ddr1_clk = {
@@ -64,7 +45,7 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  	.lock		= BIT(28),
  	.n		= _SUNXI_CCU_MULT_MIN(8, 8, 12),
  	.m		= _SUNXI_CCU_DIV(1, 1), /* input divider */
-@@ -80,7 +80,7 @@
+@@ -80,7 +80,7 @@ static struct ccu_nkmp pll_ddr1_clk = {
  
  #define SUN50I_H616_PLL_PERIPH0_REG	0x020
  static struct ccu_nkmp pll_periph0_clk = {
@@ -73,7 +54,7 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  	.lock		= BIT(28),
  	.n		= _SUNXI_CCU_MULT_MIN(8, 8, 12),
  	.m		= _SUNXI_CCU_DIV(1, 1), /* input divider */
-@@ -97,7 +97,7 @@
+@@ -97,7 +97,7 @@ static struct ccu_nkmp pll_periph0_clk = {
  
  #define SUN50I_H616_PLL_PERIPH1_REG	0x028
  static struct ccu_nkmp pll_periph1_clk = {
@@ -82,7 +63,7 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  	.lock		= BIT(28),
  	.n		= _SUNXI_CCU_MULT_MIN(8, 8, 12),
  	.m		= _SUNXI_CCU_DIV(1, 1), /* input divider */
-@@ -114,7 +114,7 @@
+@@ -114,7 +114,7 @@ static struct ccu_nkmp pll_periph1_clk = {
  
  #define SUN50I_H616_PLL_GPU_REG		0x030
  static struct ccu_nkmp pll_gpu_clk = {
@@ -91,7 +72,7 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  	.lock		= BIT(28),
  	.n		= _SUNXI_CCU_MULT_MIN(8, 8, 12),
  	.m		= _SUNXI_CCU_DIV(1, 1), /* input divider */
-@@ -133,7 +133,7 @@
+@@ -133,7 +133,7 @@ static struct ccu_nkmp pll_gpu_clk = {
   */
  #define SUN50I_H616_PLL_VIDEO0_REG	0x040
  static struct ccu_nm pll_video0_clk = {
@@ -100,7 +81,7 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  	.lock		= BIT(28),
  	.n		= _SUNXI_CCU_MULT_MIN(8, 8, 12),
  	.m		= _SUNXI_CCU_DIV(1, 1), /* input divider */
-@@ -151,7 +151,7 @@
+@@ -151,7 +151,7 @@ static struct ccu_nm pll_video0_clk = {
  
  #define SUN50I_H616_PLL_VIDEO1_REG	0x048
  static struct ccu_nm pll_video1_clk = {
@@ -109,7 +90,7 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  	.lock		= BIT(28),
  	.n		= _SUNXI_CCU_MULT_MIN(8, 8, 12),
  	.m		= _SUNXI_CCU_DIV(1, 1), /* input divider */
-@@ -169,7 +169,7 @@
+@@ -169,7 +169,7 @@ static struct ccu_nm pll_video1_clk = {
  
  #define SUN50I_H616_PLL_VIDEO2_REG	0x050
  static struct ccu_nm pll_video2_clk = {
@@ -118,7 +99,7 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  	.lock		= BIT(28),
  	.n		= _SUNXI_CCU_MULT_MIN(8, 8, 12),
  	.m		= _SUNXI_CCU_DIV(1, 1), /* input divider */
-@@ -187,7 +187,7 @@
+@@ -187,7 +187,7 @@ static struct ccu_nm pll_video2_clk = {
  
  #define SUN50I_H616_PLL_VE_REG		0x058
  static struct ccu_nkmp pll_ve_clk = {
@@ -127,7 +108,7 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  	.lock		= BIT(28),
  	.n		= _SUNXI_CCU_MULT_MIN(8, 8, 12),
  	.m		= _SUNXI_CCU_DIV(1, 1), /* input divider */
-@@ -202,7 +202,7 @@
+@@ -202,7 +202,7 @@ static struct ccu_nkmp pll_ve_clk = {
  
  #define SUN50I_H616_PLL_DE_REG		0x060
  static struct ccu_nkmp pll_de_clk = {
@@ -136,7 +117,7 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  	.lock		= BIT(28),
  	.n		= _SUNXI_CCU_MULT_MIN(8, 8, 12),
  	.m		= _SUNXI_CCU_DIV(1, 1), /* input divider */
-@@ -229,7 +229,7 @@
+@@ -229,7 +229,7 @@ static struct ccu_sdm_setting pll_audio_sdm_table[] = {
  
  #define SUN50I_H616_PLL_AUDIO_REG	0x078
  static struct ccu_nm pll_audio_hs_clk = {
@@ -145,39 +126,19 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  	.lock		= BIT(28),
  	.n		= _SUNXI_CCU_MULT_MIN(8, 8, 12),
  	.m		= _SUNXI_CCU_DIV(16, 6),
-@@ -1195,7 +1195,17 @@
+@@ -1195,10 +1195,10 @@ static int sun50i_h616_ccu_probe(struct platform_device *pdev)
  	if (IS_ERR(reg))
  		return PTR_ERR(reg);
  
 -	/* Enable the lock bits and the output enable bits on all PLLs */
-+	/*
-+	 * Enable the lock bits and the output enable bits on all PLLs.
-+	 *
-+	 * The PLL clocks are gated with their output enable bit (27), not
-+	 * with their enable bit (31): the user manual (3.3.3.6) warns that
-+	 * switching a PLL on and off disturbs the other PLLs and the
-+	 * stability of the system, and recommends turning a PLL off with its
-+	 * output enable bit instead. Powering pll-video0 down at 453 MHz has
-+	 * been seen to crash the CPU doing the write. So power all PLLs up
-+	 * below, once their dividers are set, and keep them powered.
-+	 */
++	/* Power up and lock-enable all PLLs; bit 27 gates them (3.3.3.6) */
  	for (i = 0; i < ARRAY_SIZE(pll_regs); i++) {
  		val = readl(reg + pll_regs[i]);
- 		val |= BIT(29) | BIT(27);
-@@ -1235,6 +1245,13 @@
- 	val |= BIT(0);
- 	writel(val, reg + SUN50I_H616_PLL_AUDIO_REG);
+-		val |= BIT(29) | BIT(27);
++		val |= BIT(31) | BIT(29);
+ 		writel(val, reg + pll_regs[i]);
+ 	}
  
-+	/* Power up the PLLs, now that their dividers are set */
-+	for (i = 0; i < ARRAY_SIZE(pll_regs); i++) {
-+		val = readl(reg + pll_regs[i]);
-+		val |= BIT(31);
-+		writel(val, reg + pll_regs[i]);
-+	}
-+
- 	/*
- 	 * Set the input-divider for the gpu1 clock to 3, to reach a safe 400 MHz.
- 	 */
 -- 
-2.43.0
+Armbian
 

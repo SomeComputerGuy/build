@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 15 Nov 2026 12:55:04 +0000
+Subject: clk: sunxi-ng: h616: register GPU PLL notifier before mux notifier
+
+Register the GPU PLL notifier first, so the GPU goes back to the PLL
+only after it has re-locked. Commit 0ec5e7572ddc ("clk: sunxi-ng: h616:
+register CPU PLL notifier before mux notifier") did this for the CPU.
+
+Fixes: eb963d7948ce ("clk: sunxi-ng: h616: Reparent GPU clock during frequency changes")
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+
+diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
+index 2893751..5b30e1c 100644
+--- a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
++++ b/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
+@@ -1266,13 +1266,16 @@ static int sun50i_h616_ccu_probe(struct platform_device *pdev)
+ 	ccu_mux_notifier_register(pll_cpux_clk.common.hw.clk,
+ 				  &sun50i_h616_cpu_nb);
+ 
++	/*
++	 * Re-lock the GPU PLL after any rate changes. Must be registered
++	 * before the mux notifier, so GPU goes back to a locked PLL.
++	 */
++	ccu_pll_notifier_register(&sun50i_h616_pll_gpu_nb);
++
+ 	/* Reparent GPU during GPU PLL rate changes */
+ 	ccu_mux_notifier_register(pll_gpu_clk.common.hw.clk,
+ 				  &sun50i_h616_gpu_nb);
+ 
+-	/* Re-lock the GPU PLL after any rate changes */
+-	ccu_pll_notifier_register(&sun50i_h616_pll_gpu_nb);
+-
+ 	return 0;
+ }
+ 
+-- 
+Armbian
+
