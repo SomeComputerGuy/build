@@ -1,0 +1,27 @@
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Subject: [PATCH] sunxi: dram: h616: give the display engine MBUS port priority
+
+A 4096x2160 60 Hz scanout (594 MHz pixel clock, 304 pixels of
+horizontal blanking) leaves the DE little time to refill its line
+buffer. With the video engine decoding 4K HEVC at the same time, the
+TCON TV FIFO underflowed 39 to 58 times in 30 seconds and the screen
+showed displaced lines. With the priority bit of port 16 (DE) set: no
+underflow in 60 seconds each at 4096x2160 59.94/60 Hz and 3840x2160
+60 Hz under the same decode, DE clock 600 MHz.
+
+Set the priority bit of port 16, as already done for port 25.
+
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/arch/arm/mach-sunxi/dram_sun50i_h616.c b/arch/arm/mach-sunxi/dram_sun50i_h616.c
+--- a/arch/arm/mach-sunxi/dram_sun50i_h616.c
++++ b/arch/arm/mach-sunxi/dram_sun50i_h616.c
+@@ -79,7 +79,7 @@
+ 	MBUS_CONF(8, false,    HIGH, 0,  256,  128,   64);
+ 	MBUS_CONF(11, false,    HIGH, 0,  256,  128,  100);
+ 	MBUS_CONF(14, false,    HIGH, 0, 1024,  256,   64);
+-	MBUS_CONF(16, false, HIGHEST, 6, 8192, 2800, 2400);
++	MBUS_CONF(16,  true, HIGHEST, 6, 8192, 2800, 2400);
+ 	MBUS_CONF(21, false, HIGHEST, 6, 2048,  768,  512);
+ 	MBUS_CONF(22, false,    HIGH, 0,  256,  128,  100);
+ 	MBUS_CONF(25, true,  HIGHEST, 0,  100,   64,   32);
