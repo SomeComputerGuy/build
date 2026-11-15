@@ -1,0 +1,121 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 15 Nov 2026 09:00:00 +0000
+Subject: clk: sunxi-ng: h616: Keep the HDMI pixel clock within 0.5 %
+
+HDMI allows the pixel clock to be 0.5 % off the mode clock. pll-video0
+moves in 3 MHz steps and every clock on the HDMI path rounds down, so
+about one rate in six between 25 and 600 MHz misses that, e.g.
+2560x1440 at 120 Hz gets 495 MHz instead of 497.75 (-0.55 %), and 4K at
+59.94 Hz 591 MHz instead of 593.407 (-0.41 %). 640x480 at 59.94 Hz is
+worse: TCON TV0 takes pll-video0 at 453 MHz / 18, the HDMI clock
+(M divider only, up to 16) cannot follow and moves to pll-video2,
+297 MHz / 12 = 24.75 MHz (-1.7 %).
+
+Pick the closest rate on pll-video0, TCON TV0 and the HDMI clock, model
+TCON TV0 with its M divider only (N cleared at probe) like the HDMI
+clock, and keep the HDMI clock on pll-video0 (set at probe). Both clocks
+then come out equal, within 0.5 % of every mode clock from 18.1 to
+600 MHz: 593.407 -> 594 MHz, 497.75 -> 498, 148.352 -> 148.5,
+25.175 -> 327 / 13 = 25.154.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
+--- a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
++++ b/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
+@@ -130,6 +130,9 @@
+ /*
+  * For Video PLLs, the output divider is described as "used for testing"
+  * in the user manual. So it's not modelled and forced to 0.
++ *
++ * pll-video0 drives the HDMI pixel clock, which must be within 0.5 % of
++ * the mode clock: pick the closest rate, not the next one down.
+  */
+ #define SUN50I_H616_PLL_VIDEO0_REG	0x040
+ static struct ccu_nm pll_video0_clk = {
+@@ -142,7 +145,8 @@
+ 	.max_rate	= 2400000000UL,
+ 	.common		= {
+ 		.reg		= 0x040,
+-		.features	= CCU_FEATURE_FIXED_POSTDIV,
++		.features	= CCU_FEATURE_FIXED_POSTDIV |
++				  CCU_FEATURE_CLOSEST_RATE,
+ 		.hw.init	= CLK_HW_INIT("pll-video0", "osc24M",
+ 					      &ccu_nm_ops,
+ 					      CLK_SET_RATE_UNGATE),
+@@ -613,11 +617,19 @@
+ 
+ static const char * const hdmi_parents[] = { "pll-video0", "pll-video0-4x",
+ 					     "pll-video2", "pll-video2-4x" };
+-static SUNXI_CCU_M_WITH_MUX_GATE(hdmi_clk, "hdmi", hdmi_parents, 0xb00,
+-				 0, 4,		/* M */
+-				 24, 2,		/* mux */
+-				 BIT(31),	/* gate */
+-				 0);
++/*
++ * The HDMI controller clock must run at the TCON TV0 pixel clock. Keep it
++ * on the TCON's PLL (pll-video0, set at probe) and on the closest divider:
++ * a rate the M divider cannot reach from there must not move it to
++ * pll-video2 at a different rate.
++ */
++#define SUN50I_H616_HDMI_CLK_REG		0xb00
++static SUNXI_CCU_M_WITH_MUX_GATE_CLOSEST(hdmi_clk, "hdmi", hdmi_parents,
++					 SUN50I_H616_HDMI_CLK_REG,
++					 0, 4,		/* M */
++					 24, 2,		/* mux */
++					 BIT(31),	/* gate */
++					 CLK_SET_RATE_NO_REPARENT);
+ 
+ static SUNXI_CCU_GATE(hdmi_slow_clk, "hdmi-slow", "osc24M", 0xb04, BIT(31), 0);
+ 
+@@ -676,15 +688,20 @@
+  * pll-video0/1 parents. DT puts each output on its own PLL; keep that
+  * parent so that a mode set on one output can never re-rate the PLL that
+  * drives the other.
++ *
++ * The HDMI clock divides the same PLL with an M divider only, so TCON TV0
++ * uses its M divider only too (N is cleared at probe), and both pick the
++ * closest rate. The HDMI clock can then always follow the pixel clock.
+  */
+-static SUNXI_CCU_MP_WITH_MUX_GATE(tcon_tv0_clk, "tcon-tv0",
+-				  tcon_tv_parents, 0xb80,
+-				  0, 4,		/* M */
+-				  8, 2,		/* P */
+-				  24, 3,	/* mux */
+-				  BIT(31),	/* gate */
+-				  CLK_SET_RATE_PARENT |
+-				  CLK_SET_RATE_NO_REPARENT);
++#define SUN50I_H616_TCON_TV0_CLK_REG		0xb80
++static SUNXI_CCU_M_WITH_MUX_GATE_CLOSEST(tcon_tv0_clk, "tcon-tv0",
++					 tcon_tv_parents,
++					 SUN50I_H616_TCON_TV0_CLK_REG,
++					 0, 4,		/* M */
++					 24, 3,		/* mux */
++					 BIT(31),	/* gate */
++					 CLK_SET_RATE_PARENT |
++					 CLK_SET_RATE_NO_REPARENT);
+ static SUNXI_CCU_MP_WITH_MUX_GATE(tcon_tv1_clk, "tcon-tv1",
+ 				  tcon_tv_parents, 0xb84,
+ 				  0, 4,		/* M */
+@@ -1269,6 +1286,16 @@
+ 	val |= BIT(24);
+ 	writel(val, reg + SUN50I_H616_HDMI_CEC_CLK_REG);
+ 
++	/* TCON TV0 is modelled with its M divider only: clear its N divider */
++	val = readl(reg + SUN50I_H616_TCON_TV0_CLK_REG);
++	val &= ~GENMASK(9, 8);
++	writel(val, reg + SUN50I_H616_TCON_TV0_CLK_REG);
++
++	/* The HDMI clock never changes parent (see above): put it on pll-video0 */
++	val = readl(reg + SUN50I_H616_HDMI_CLK_REG);
++	val &= ~GENMASK(25, 24);
++	writel(val, reg + SUN50I_H616_HDMI_CLK_REG);
++
+ 	ret = devm_sunxi_ccu_probe(&pdev->dev, reg, &sun50i_h616_ccu_desc);
+ 	if (ret)
+ 		return ret;
+-- 
+Armbian
+
