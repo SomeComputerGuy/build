@@ -1,11 +1,13 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Sun, 15 Nov 2026 12:55:04 +0000
-Subject: clk: sunxi-ng: h616: register GPU PLL notifier before mux notifier
+Subject: clk: sunxi-ng: h616: Register GPU PLL notifier before mux notifier
 
 Register the GPU PLL notifier first, so the GPU goes back to the PLL
-only after it has re-locked. Commit 0ec5e7572ddc ("clk: sunxi-ng: h616:
-register CPU PLL notifier before mux notifier") did this for the CPU.
+only after it has re-locked, as required by commit 02ae2bc6febd
+("clk: sunxi-ng: Add clk notifier to gate then ungate PLL clocks").
+Commit 0ec5e7572ddc ("clk: sunxi-ng: h616: register CPU PLL notifier
+before mux notifier") did this for the CPU.
 
 Fixes: eb963d7948ce ("clk: sunxi-ng: h616: Reparent GPU clock during frequency changes")
 Assisted-by: LLM
