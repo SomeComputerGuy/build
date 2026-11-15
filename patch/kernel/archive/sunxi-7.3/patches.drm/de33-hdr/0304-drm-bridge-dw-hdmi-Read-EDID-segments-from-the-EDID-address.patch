@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 15 Nov 2026 01:00:01 +0000
+Subject: [PATCH] drm/bridge: dw-hdmi: Read EDID segments from the EDID address
+
+An E-DDC read of EDID blocks 2 and up starts with the segment pointer
+message to 0x30. The I2C master takes the slave address from the first
+message, so the data was read from 0x30 and the blocks came back as
+zeroes. Use the EDID address 0x50 then, as dw-hdmi-qp does.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+index 8546100..e4d4939 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+@@ -459,7 +459,14 @@ static int dw_hdmi_i2c_xfer(struct i2c_adapter *adap,
+ 	/* Unmute DONE and ERROR interrupts */
+ 	hdmi_writeb(hdmi, 0x00, HDMI_IH_MUTE_I2CM_STAT0);
+ 
+-	/* Set slave device address taken from the first I2C message */
++	/*
++	 * Set slave device address taken from the first I2C message. An
++	 * E-DDC read starts with the segment pointer write to 0x30; the
++	 * data itself comes from the EDID address.
++	 */
++	if (addr == DDC_SEGMENT_ADDR && msgs[0].len == 1)
++		addr = DDC_ADDR;
++
+ 	hdmi_writeb(hdmi, addr, HDMI_I2CM_SLAVE);
+ 
+ 	/* Set slave device register address on transfer */
+-- 
+2.53.0
+

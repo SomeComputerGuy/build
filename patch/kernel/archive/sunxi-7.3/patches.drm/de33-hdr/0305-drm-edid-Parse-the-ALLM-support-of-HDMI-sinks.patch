@@ -1,0 +1,47 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 15 Nov 2026 01:00:02 +0000
+Subject: [PATCH] drm/edid: Parse the ALLM support of HDMI sinks
+
+An HDMI 2.1 sink that supports Auto Low Latency Mode sets the ALLM bit in
+byte 8 of its HDMI Forum VSDB. DRM_EDID_ALLM was defined but not parsed:
+store it in drm_hdmi_info.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/drivers/gpu/drm/drm_edid.c b/drivers/gpu/drm/drm_edid.c
+index 0db1762..d690f63 100644
+--- a/drivers/gpu/drm/drm_edid.c
++++ b/drivers/gpu/drm/drm_edid.c
+@@ -6313,6 +6313,10 @@ static void drm_parse_hdmi_forum_scds(struct drm_connector *connector,
+ 		dsc_support = true;
+ 	}
+ 
++	/* hf_scds[8] is payload byte 8: it is present if the payload has 8 bytes */
++	if (cea_db_payload_len(hf_scds) >= 8)
++		hdmi->allm = hf_scds[8] & DRM_EDID_ALLM;
++
+ 	drm_dbg_kms(connector->dev,
+ 		    "[CONNECTOR:%d:%s] HF-VSDB: max TMDS clock: %d KHz, HDMI 2.1 support: %s, DSC 1.2 support: %s\n",
+ 		    connector->base.id, connector->name,
+diff --git a/include/drm/drm_connector.h b/include/drm/drm_connector.h
+index b191662..a302dda 100644
+--- a/include/drm/drm_connector.h
++++ b/include/drm/drm_connector.h
+@@ -341,6 +341,12 @@ struct drm_hdmi_info {
+ 
+ 	/** @dsc_cap: DSC capabilities of the sink */
+ 	struct drm_hdmi_dsc_cap dsc_cap;
++
++	/**
++	 * @allm: The sink supports Auto Low Latency Mode (ALLM), signalled in
++	 * the HDMI Forum vendor specific InfoFrame
++	 */
++	bool allm;
+ };
+ 
+ /**
+-- 
+2.53.0
+

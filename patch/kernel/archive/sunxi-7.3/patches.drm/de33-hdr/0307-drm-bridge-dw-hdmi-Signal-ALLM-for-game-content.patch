@@ -1,0 +1,95 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 15 Nov 2026 01:00:04 +0000
+Subject: [PATCH] drm/bridge: dw-hdmi: Signal ALLM for game content
+
+Send the HF-VSIF with ALLM_Mode set when the content type is Game and
+the sink supports ALLM. The controller has one vendor InfoFrame slot, so
+this is done only for modes that need no HDMI VIC or 3D signalling.
+Also stop the slot before a mode that sends no vendor InfoFrame.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+index e4d4939..de06107 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+@@ -2006,14 +2006,27 @@ static void hdmi_config_AVI(struct dw_hdmi *hdmi,
+ 	hdmi_writeb(hdmi, (frame.right_bar >> 8) & 0xff, HDMI_FC_AVISRB1);
+ }
+ 
++static bool dw_hdmi_want_allm(const struct drm_connector *connector)
++{
++	return connector->state &&
++	       connector->state->content_type == DRM_MODE_CONTENT_TYPE_GAME &&
++	       connector->display_info.hdmi.allm;
++}
++
+ static void hdmi_config_vendor_specific_infoframe(struct dw_hdmi *hdmi,
+ 						  const struct drm_connector *connector,
+ 						  const struct drm_display_mode *mode)
+ {
++	struct hdmi_forum_vendor_infoframe hf_frame;
+ 	struct hdmi_vendor_infoframe frame;
++	bool hf_vsif = false;
+ 	u8 buffer[10];
+ 	ssize_t err;
+ 
++	/* The previous mode's InfoFrame must not stay on the link. */
++	hdmi_mask_writeb(hdmi, 0, HDMI_FC_DATAUTO0, HDMI_FC_DATAUTO0_VSD_OFFSET,
++			HDMI_FC_DATAUTO0_VSD_MASK);
++
+ 	err = drm_hdmi_vendor_infoframe_from_display_mode(&frame, connector,
+ 							  mode);
+ 	if (err < 0)
+@@ -2025,14 +2038,26 @@ static void hdmi_config_vendor_specific_infoframe(struct dw_hdmi *hdmi,
+ 		 */
+ 		return;
+ 
+-	err = hdmi_vendor_infoframe_pack(&frame, buffer, sizeof(buffer));
++	/*
++	 * The controller has a single vendor specific InfoFrame slot. A mode
++	 * that needs neither an HDMI VIC nor 3D signalling can carry the HDMI
++	 * Forum InfoFrame in it instead, to ask for Auto Low Latency Mode.
++	 */
++	if (!frame.vic && frame.s3d_struct == HDMI_3D_STRUCTURE_INVALID &&
++	    dw_hdmi_want_allm(connector)) {
++		hdmi_forum_vendor_infoframe_init(&hf_frame);
++		hf_frame.allm = true;
++		hf_vsif = true;
++		err = hdmi_forum_vendor_infoframe_pack(&hf_frame, buffer,
++						       sizeof(buffer));
++	} else {
++		err = hdmi_vendor_infoframe_pack(&frame, buffer, sizeof(buffer));
++	}
+ 	if (err < 0) {
+ 		dev_err(hdmi->dev, "Failed to pack vendor infoframe: %zd\n",
+ 			err);
+ 		return;
+ 	}
+-	hdmi_mask_writeb(hdmi, 0, HDMI_FC_DATAUTO0, HDMI_FC_DATAUTO0_VSD_OFFSET,
+-			HDMI_FC_DATAUTO0_VSD_MASK);
+ 
+ 	/* Set the length of HDMI vendor specific InfoFrame payload */
+ 	hdmi_writeb(hdmi, buffer[2], HDMI_FC_VSDSIZE);
+@@ -2042,11 +2067,14 @@ static void hdmi_config_vendor_specific_infoframe(struct dw_hdmi *hdmi,
+ 	hdmi_writeb(hdmi, buffer[5], HDMI_FC_VSDIEEEID1);
+ 	hdmi_writeb(hdmi, buffer[6], HDMI_FC_VSDIEEEID2);
+ 
+-	/* Set HDMI_Video_Format and HDMI_VIC/3D_Structure */
++	/*
++	 * Set HDMI_Video_Format and HDMI_VIC/3D_Structure, or the HDMI Forum
++	 * InfoFrame version and feature flags
++	 */
+ 	hdmi_writeb(hdmi, buffer[7], HDMI_FC_VSDPAYLOAD0);
+ 	hdmi_writeb(hdmi, buffer[8], HDMI_FC_VSDPAYLOAD1);
+ 
+-	if (frame.s3d_struct >= HDMI_3D_STRUCTURE_SIDE_BY_SIDE_HALF)
++	if (!hf_vsif && frame.s3d_struct >= HDMI_3D_STRUCTURE_SIDE_BY_SIDE_HALF)
+ 		hdmi_writeb(hdmi, buffer[9], HDMI_FC_VSDPAYLOAD2);
+ 
+ 	/* Packet frame interpolation */
+-- 
+2.53.0
+
