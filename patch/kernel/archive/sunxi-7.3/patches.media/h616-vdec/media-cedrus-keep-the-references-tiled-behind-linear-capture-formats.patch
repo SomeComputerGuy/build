@@ -1,0 +1,807 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 15 Nov 2026 20:00:00 +0000
+Subject: [PATCH] media: cedrus: keep the references tiled behind linear
+ capture formats
+
+With a linear capture format (NV12, NV21, YU12, YV12) the primary
+output writes the picture linear, and the decoders read it back as a
+reference. Motion compensation from linear references is several times
+slower: a 4K H.265 picture takes 67 ms instead of 19.5 ms.
+
+On the H616, decode 8-bit pictures into a hidden NV12_32L32 surface
+appended to the capture buffer, as is already done with an AFBC surface
+for P010, and let the secondary output write the visible picture, as
+the vendor library does. This covers every decoder except AVS2, whose
+engine mode cannot write the tiled format, and JPEG, which has no
+references. The tiled, AFBC and P010 formats are unchanged.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.c
+@@ -1452,6 +1452,7 @@ static const struct cedrus_variant sun50i_h616_cedrus_variant = {
+ 	.h265_max_width	= 6144,
+ 	.h265_max_height = 4320,
+ 	.jpeg_rotate_out = true,
++	.linear_out_secondary = true,
+ 	/* The 0x12011 encoder: the vendor library's "h6" programming. */
+ 	.enc_flags	= CEDRUS_ENC_FLAG_ADDR_SHIFT_8 |
+ 			  CEDRUS_ENC_FLAG_ISP_SIZE_8PX |
+--- a/drivers/staging/media/sunxi/cedrus/cedrus.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus.h
+@@ -355,6 +355,11 @@ struct cedrus_dec_ops {
+ 	unsigned int (*extra_cap_size)(struct cedrus_ctx *ctx,
+ 				       struct v4l2_pix_format *pix_fmt);
+ 	void (*post_process)(struct cedrus_ctx *ctx);
++	/*
++	 * The decoder writes the linear capture formats through the
++	 * secondary output, see cedrus_fmt_is_tiled_behind().
++	 */
++	bool linear_out_secondary;
+ };
+ 
+ #define CEDRUS_WATCHDOG_TIMEOUT_MS	2000
+@@ -381,6 +386,11 @@ struct cedrus_variant {
+ 	 * vendor library does on the H616.
+ 	 */
+ 	bool		jpeg_rotate_out;
++	/*
++	 * The secondary output writes the linear capture formats while the
++	 * references stay tiled, see cedrus_fmt_is_tiled_behind().
++	 */
++	bool		linear_out_secondary;
+ 	/* Register conventions of the H.264 encoder, CEDRUS_ENC_FLAG_*. */
+ 	unsigned int	enc_flags;
+ };
+@@ -430,6 +440,7 @@ struct cedrus_dev {
+ 	unsigned int		h265_max_width;
+ 	unsigned int		h265_max_height;
+ 	bool			jpeg_rotate_out;
++	bool			linear_out_secondary;
+ 	unsigned int		enc_flags;
+ 	/* Buffers of the last encode job (struct cedrus_enc_layout). */
+ 	struct cedrus_enc_layout enc_layout;
+@@ -533,6 +544,41 @@ static inline bool cedrus_recon_is_afbc(struct cedrus_ctx *ctx)
+ 	return cedrus_dst_is_afbc(ctx) || cedrus_dst_is_p010(ctx);
+ }
+ 
++static inline bool cedrus_is_linear_format(u32 format)
++{
++	switch (format) {
++	case V4L2_PIX_FMT_NV12:
++	case V4L2_PIX_FMT_NV21:
++	case V4L2_PIX_FMT_YUV420:
++	case V4L2_PIX_FMT_YVU420:
++		return true;
++	default:
++		return false;
++	}
++}
++
++/*
++ * 8-bit pictures in a linear capture format: the primary output writes
++ * the picture into a hidden NV12_32L32 surface behind the visible one,
++ * which the decoders read as the reference, and the secondary output
++ * writes the visible picture, as the vendor library does. Motion
++ * compensation from linear references is several times slower: a 4K
++ * H.265 picture takes 67 ms instead of 19.5 ms.
++ */
++static inline bool cedrus_fmt_is_tiled_behind(struct cedrus_ctx *ctx,
++					      const struct v4l2_pix_format *fmt)
++{
++	return ctx->dev->linear_out_secondary && ctx->current_codec &&
++	       ctx->current_codec->linear_out_secondary &&
++	       ctx->bit_depth <= 8 &&
++	       cedrus_is_linear_format(fmt->pixelformat);
++}
++
++static inline bool cedrus_dst_is_tiled_behind(struct cedrus_ctx *ctx)
++{
++	return cedrus_fmt_is_tiled_behind(ctx, &ctx->dst_fmt);
++}
++
+ /*
+  * H.265 10-bit pictures from 5K up (the vendor library's threshold: 5120
+  * wide or 2880 high) can be written at half their size in each direction
+@@ -577,17 +623,45 @@ static inline u32 cedrus_afbc_10_size(unsigned int width, unsigned int height)
+ 
+ /*
+  * Offset of the hidden reconstruction surface, which follows the
+- * userspace-visible P010 surface at the start of the buffer.
++ * userspace-visible P010 or linear 8-bit surface at the start of the
++ * buffer.
+  */
+-static inline u32 cedrus_p010_recon_offset(const struct v4l2_pix_format *fmt)
++static inline u32 cedrus_recon_offset(const struct v4l2_pix_format *fmt)
+ {
+ 	return ALIGN(fmt->bytesperline * fmt->height * 3 / 2, SZ_4K);
+ }
+ 
++/* Layout of the NV12_32L32 surface of a picture, as cedrus_prepare_format(). */
++static inline void cedrus_tiled_fmt(struct v4l2_pix_format *fmt)
++{
++	fmt->pixelformat = V4L2_PIX_FMT_NV12_32L32;
++	fmt->bytesperline = ALIGN(fmt->width, 32);
++	fmt->height = ALIGN(fmt->height, 32);
++	fmt->sizeimage = fmt->bytesperline * fmt->height +
++			 fmt->bytesperline * ALIGN(fmt->height, 64) / 2;
++}
++
++/* Capture buffer space of the hidden NV12_32L32 surface. */
++static inline unsigned int
++cedrus_dst_tiled_behind_size(struct cedrus_ctx *ctx,
++			     const struct v4l2_pix_format *fmt)
++{
++	struct v4l2_pix_format tiled = *fmt;
++
++	if (!cedrus_fmt_is_tiled_behind(ctx, fmt))
++		return 0;
++
++	cedrus_tiled_fmt(&tiled);
++
++	return cedrus_recon_offset(fmt) -
++	       fmt->bytesperline * fmt->height * 3 / 2 + tiled.sizeimage;
++}
++
+ /*
+  * Format describing the reconstruction/reference surface.  For P010
+  * output this is a hidden 10-bit AFBC surface that follows the visible
+- * P010 data; otherwise it is the capture format itself.
++ * P010 data, for cedrus_fmt_is_tiled_behind() a hidden NV12_32L32
++ * surface; otherwise it is the capture format itself.
+  *
+  * A linear 8-bit NV12 + 2-bit reconstruction would also work, but motion
+  * compensation from linear references is slow (several times the read
+@@ -595,13 +669,16 @@ static inline u32 cedrus_p010_recon_offset(const struct v4l2_pix_format *fmt)
+  * on the H616. AFBC references are read compressed.
+  */
+ static inline struct v4l2_pix_format
+-cedrus_dst_frame_fmt_of(const struct v4l2_pix_format *dst_fmt)
++cedrus_dst_frame_fmt_of(struct cedrus_ctx *ctx,
++			const struct v4l2_pix_format *dst_fmt)
+ {
+ 	struct v4l2_pix_format fmt = *dst_fmt;
+ 
+ 	if (fmt.pixelformat == V4L2_PIX_FMT_P010) {
+ 		fmt.pixelformat = V4L2_PIX_FMT_YUV420_10_AFBC_16X16_SPLIT;
+ 		fmt.bytesperline = 0;
++	} else if (cedrus_fmt_is_tiled_behind(ctx, dst_fmt)) {
++		cedrus_tiled_fmt(&fmt);
+ 	}
+ 
+ 	return fmt;
+@@ -609,7 +686,7 @@ cedrus_dst_frame_fmt_of(const struct v4l2_pix_format *dst_fmt)
+ 
+ static inline struct v4l2_pix_format cedrus_dst_frame_fmt(struct cedrus_ctx *ctx)
+ {
+-	struct v4l2_pix_format fmt = cedrus_dst_frame_fmt_of(&ctx->dst_fmt);
++	struct v4l2_pix_format fmt = cedrus_dst_frame_fmt_of(ctx, &ctx->dst_fmt);
+ 
+ 	/* The references of a scaled-down output have the coded size. */
+ 	if (cedrus_fmt_is_scaled(ctx, &ctx->dst_fmt)) {
+@@ -622,23 +699,24 @@ static inline struct v4l2_pix_format cedrus_dst_frame_fmt(struct cedrus_ctx *ctx
+ 
+ /*
+  * Address of a plane of the reconstruction/reference surface of a buffer
+- * laid out as @dst_fmt.  Identical to cedrus_buf_addr() for non-P010
+- * output; for P010 it points past the visible P010 data to the hidden
+- * AFBC surface (which has a single plane).
++ * laid out as @dst_fmt.  Identical to cedrus_buf_addr() unless the
++ * surface is hidden: then it points past the visible picture to the
++ * hidden AFBC (a single plane) or NV12_32L32 surface.
+  */
+ static inline dma_addr_t
+-cedrus_dst_frame_addr_in(const struct v4l2_pix_format *dst_fmt,
++cedrus_dst_frame_addr_in(struct cedrus_ctx *ctx,
++			 const struct v4l2_pix_format *dst_fmt,
+ 			 struct vb2_buffer *buf, unsigned int plane)
+ {
+-	struct v4l2_pix_format fmt = cedrus_dst_frame_fmt_of(dst_fmt);
++	struct v4l2_pix_format fmt = cedrus_dst_frame_fmt_of(ctx, dst_fmt);
+ 	dma_addr_t addr;
+ 
+ 	if (!buf)
+ 		return 0;
+ 
+ 	addr = vb2_dma_contig_plane_dma_addr(buf, 0);
+-	if (dst_fmt->pixelformat == V4L2_PIX_FMT_P010)
+-		addr += cedrus_p010_recon_offset(dst_fmt);
++	if (fmt.pixelformat != dst_fmt->pixelformat)
++		addr += cedrus_recon_offset(dst_fmt);
+ 
+ 	return addr + (dma_addr_t)fmt.bytesperline * fmt.height * plane;
+ }
+@@ -648,7 +726,7 @@ static inline dma_addr_t cedrus_dst_frame_addr(struct cedrus_ctx *ctx,
+ 					       struct vb2_buffer *buf,
+ 					       unsigned int plane)
+ {
+-	return cedrus_dst_frame_addr_in(&ctx->dst_fmt, buf, plane);
++	return cedrus_dst_frame_addr_in(ctx, &ctx->dst_fmt, buf, plane);
+ }
+ 
+ /*
+@@ -686,7 +764,7 @@ cedrus_dst_10bit_extra_size(struct cedrus_ctx *ctx,
+ 		}
+ 
+ 		/* Hidden AFBC reconstruction surface, 4 KiB aligned. */
+-		return cedrus_p010_recon_offset(pix_fmt) - visible +
++		return cedrus_recon_offset(pix_fmt) - visible +
+ 		       cedrus_afbc_10_size(width, height);
+ 	}
+ 
+@@ -704,8 +782,8 @@ static inline void cedrus_write_ref_buf_addr(struct cedrus_ctx *ctx,
+ 	struct cedrus_dev *dev = ctx->dev;
+ 	struct vb2_buffer *buf = vb2_find_buffer(q, timestamp);
+ 
+-	cedrus_write(dev, luma_reg, cedrus_dst_buf_addr(ctx, buf, 0));
+-	cedrus_write(dev, chroma_reg, cedrus_dst_buf_addr(ctx, buf, 1));
++	cedrus_write(dev, luma_reg, cedrus_dst_frame_addr(ctx, buf, 0));
++	cedrus_write(dev, chroma_reg, cedrus_dst_frame_addr(ctx, buf, 1));
+ }
+ 
+ static inline struct cedrus_buffer *
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_avs.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_avs.c
+@@ -128,8 +128,8 @@ static void cedrus_avs_write_ref(struct cedrus_ctx *ctx,
+ 	if (!buf)
+ 		buf = cur;
+ 
+-	cedrus_write(dev, luma_reg, cedrus_dst_buf_addr(ctx, buf, 0));
+-	cedrus_write(dev, chroma_reg, cedrus_dst_buf_addr(ctx, buf, 1));
++	cedrus_write(dev, luma_reg, cedrus_dst_frame_addr(ctx, buf, 0));
++	cedrus_write(dev, chroma_reg, cedrus_dst_frame_addr(ctx, buf, 1));
+ }
+ 
+ static int cedrus_avs_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+@@ -209,6 +209,10 @@ static int cedrus_avs_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	src_addr = vb2_dma_contig_plane_dma_addr(src_buf, 0);
+ 
+ 	ctrl = VE_AVS_CTRL_IS_AVS | VE_H264_CTRL_INT_MASK;
++	if (cedrus_dst_is_tiled_behind(ctx)) {
++		cedrus_h264_tiled_behind_set(ctx, dst_buf);
++		ctrl |= VE_H264_CTRL_WRITE_SDROT_PIC;
++	}
+ 	cedrus_write(dev, VE_H264_CTRL, ctrl);
+ 
+ 	reg = VE_AVS_PIC_MB_SIZE_HEIGHT(seq->vertical_size) |
+@@ -333,9 +337,9 @@ static int cedrus_avs_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	cedrus_write(dev, VE_AVS_MB_INFO_ADDR, ctx->codec.avs.mb_info_buf_addr);
+ 
+ 	/* Reconstruction and references. */
+-	cedrus_write(dev, VE_AVS_REC_LUMA, cedrus_dst_buf_addr(ctx, dst_buf, 0));
++	cedrus_write(dev, VE_AVS_REC_LUMA, cedrus_dst_frame_addr(ctx, dst_buf, 0));
+ 	cedrus_write(dev, VE_AVS_REC_CHROMA,
+-		     cedrus_dst_buf_addr(ctx, dst_buf, 1));
++		     cedrus_dst_frame_addr(ctx, dst_buf, 1));
+ 	cedrus_avs_write_ref(ctx, fwd_buf, dst_buf,
+ 			     VE_AVS_FWD_LUMA, VE_AVS_FWD_CHROMA);
+ 	cedrus_avs_write_ref(ctx, bwd_buf, dst_buf,
+@@ -443,4 +447,5 @@ struct cedrus_dec_ops cedrus_dec_ops_avs = {
+ 	.stop		= cedrus_avs_stop,
+ 	.buf_cleanup	= cedrus_avs_buf_cleanup,
+ 	.trigger	= cedrus_avs_trigger,
++	.linear_out_secondary = true,
+ };
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_dec.c
+@@ -257,7 +257,14 @@ void cedrus_device_run(void *priv)
+ 	 */
+ 	cedrus_engine_switch_reset(ctx);
+ 
+-	cedrus_dst_format_set(dev, &ctx->dst_fmt);
++	if (cedrus_dst_is_tiled_behind(ctx)) {
++		struct v4l2_pix_format recon = cedrus_dst_frame_fmt(ctx);
++
++		cedrus_dst_format_set(dev, &recon);
++		cedrus_dst_tiled_behind_set(dev, &ctx->dst_fmt);
++	} else {
++		cedrus_dst_format_set(dev, &ctx->dst_fmt);
++	}
+ 
+ 	error = ctx->current_codec->setup(ctx, &run);
+ 	if (error)
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+@@ -84,8 +84,8 @@ static void cedrus_fill_ref_pic(struct cedrus_ctx *ctx,
+ 		frame_info |= BIT(0) | BIT(4);
+ 	pic->frame_info = cpu_to_le32(frame_info);
+ 
+-	pic->luma_ptr = cpu_to_le32(cedrus_buf_addr(vbuf, &ctx->dst_fmt, 0));
+-	pic->chroma_ptr = cpu_to_le32(cedrus_buf_addr(vbuf, &ctx->dst_fmt, 1));
++	pic->luma_ptr = cpu_to_le32(cedrus_dst_frame_addr(ctx, vbuf, 0));
++	pic->chroma_ptr = cpu_to_le32(cedrus_dst_frame_addr(ctx, vbuf, 1));
+ 	pic->mv_col_top_ptr = cpu_to_le32(cedrus_h264_mv_col_buf_addr(buf, 0));
+ 	pic->mv_col_bot_ptr = cpu_to_le32(cedrus_h264_mv_col_buf_addr(buf, 1));
+ }
+@@ -486,10 +486,11 @@ static void cedrus_set_params(struct cedrus_ctx *ctx,
+ 	cedrus_write(dev, VE_H264_STATUS, cedrus_read(dev, VE_H264_STATUS));
+ 
+ 	// enable int
+-	cedrus_write(dev, VE_H264_CTRL,
+-		     VE_H264_CTRL_SLICE_DECODE_INT |
+-		     VE_H264_CTRL_DECODE_ERR_INT |
+-		     VE_H264_CTRL_VLD_DATA_REQ_INT);
++	reg = VE_H264_CTRL_SLICE_DECODE_INT | VE_H264_CTRL_DECODE_ERR_INT |
++	      VE_H264_CTRL_VLD_DATA_REQ_INT;
++	if (cedrus_dst_is_tiled_behind(ctx))
++		reg |= VE_H264_CTRL_WRITE_SDROT_PIC;
++	cedrus_write(dev, VE_H264_CTRL, reg);
+ }
+ 
+ static enum cedrus_irq_status
+@@ -554,7 +555,10 @@ static int cedrus_h264_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 
+ 	cedrus_engine_enable(ctx);
+ 
+-	cedrus_write(dev, VE_H264_SDROT_CTRL, 0);
++	if (cedrus_dst_is_tiled_behind(ctx))
++		cedrus_h264_tiled_behind_set(ctx, &run->dst->vb2_buf);
++	else
++		cedrus_write(dev, VE_H264_SDROT_CTRL, 0);
+ 	cedrus_write(dev, VE_H264_EXTRA_BUFFER1,
+ 		     ctx->codec.h264.pic_info_buf_dma);
+ 	cedrus_write(dev, VE_H264_EXTRA_BUFFER2,
+@@ -752,4 +756,5 @@ struct cedrus_dec_ops cedrus_dec_ops_h264 = {
+ 	.stop		= cedrus_h264_stop,
+ 	.buf_cleanup	= cedrus_h264_buf_cleanup,
+ 	.trigger	= cedrus_h264_trigger,
++	.linear_out_secondary = true,
+ };
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
+@@ -839,9 +839,19 @@ static int cedrus_h265_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 				     VE_DEC_H265_SDRT_CTRL_SCALE_HORZ(1));
+ 	}
+ 
++	/* The secondary output writes the visible linear 8-bit picture. */
++	if (cedrus_dst_is_tiled_behind(ctx)) {
++		cedrus_write(dev, VE_DEC_H265_10BIT_CONFIGURE, 0);
++		cedrus_write(dev, VE_DEC_H265_SDRT_CTRL, 0);
++		cedrus_write(dev, VE_DEC_H265_SDRT_LUMA_ADDR,
++			     cedrus_dst_buf_addr(ctx, &run->dst->vb2_buf, 0) >> 8);
++		cedrus_write(dev, VE_DEC_H265_SDRT_CHROMA_ADDR,
++			     cedrus_dst_buf_addr(ctx, &run->dst->vb2_buf, 1) >> 8);
++	}
++
+ 	/* Enable appropriate interruptions. */
+ 	reg = VE_DEC_H265_CTRL_IRQ_MASK;
+-	if (cedrus_dst_is_p010(ctx))
++	if (cedrus_dst_is_p010(ctx) || cedrus_dst_is_tiled_behind(ctx))
+ 		reg |= VE_DEC_H265_CTRL_ROTATE_SCALE_OUT_EN;
+ 	cedrus_write(dev, VE_DEC_H265_CTRL, reg);
+ 
+@@ -929,6 +939,7 @@ struct cedrus_dec_ops cedrus_dec_ops_h265 = {
+ 	.irq_status	= cedrus_h265_irq_status,
+ 	.setup		= cedrus_h265_setup,
+ 	.start		= cedrus_h265_start,
++	.linear_out_secondary = true,
+ 	.stop		= cedrus_h265_stop,
+ 	.buf_cleanup	= cedrus_h265_buf_cleanup,
+ 	.trigger	= cedrus_h265_trigger,
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.c
+@@ -171,14 +171,9 @@ void cedrus_dst_format_set(struct cedrus_dev *dev,
+ 	}
+ }
+ 
+-/*
+- * Set up the secondary output for a linear capture format, mirroring the
+- * primary setup done by cedrus_dst_format_set(). The JPEG decoder writes
+- * its picture through the rotate/scale path, which takes its layout from
+- * the secondary ("EXT") output registers.
+- */
+-void cedrus_dst_secondary_format_set(struct cedrus_dev *dev,
+-				     struct v4l2_pix_format *fmt)
++static void cedrus_dst_ext_format_set(struct cedrus_dev *dev,
++				      const struct v4l2_pix_format *fmt,
++				      bool tiled_primary)
+ {
+ 	unsigned int bytesperline = fmt->bytesperline;
+ 	u32 chroma_size = bytesperline * ALIGN(fmt->height, 16) / 2;
+@@ -201,6 +196,9 @@ void cedrus_dst_secondary_format_set(struct cedrus_dev *dev,
+ 		/* tiled: the primary setup already covers both outputs */
+ 		return;
+ 	}
++	if (tiled_primary)
++		reg = (reg & ~VE_PRIMARY_OUT_FMT_MASK) |
++		      VE_PRIMARY_OUT_FMT_TILED_32_NV12;
+ 	cedrus_write(dev, VE_PRIMARY_OUT_FMT, reg);
+ 
+ 	reg = VE_CHROMA_BUF_LEN_SDRT(chroma_size / 2) |
+@@ -213,6 +211,51 @@ void cedrus_dst_secondary_format_set(struct cedrus_dev *dev,
+ 	cedrus_write(dev, VE_SECONDARY_FB_LINE_STRIDE, reg);
+ }
+ 
++/*
++ * Set up the secondary output for a linear capture format, mirroring the
++ * primary setup done by cedrus_dst_format_set(). The JPEG decoder writes
++ * its picture through the rotate/scale path, which takes its layout from
++ * the secondary ("EXT") output registers.
++ */
++void cedrus_dst_secondary_format_set(struct cedrus_dev *dev,
++				     struct v4l2_pix_format *fmt)
++{
++	cedrus_dst_ext_format_set(dev, fmt, false);
++}
++
++/*
++ * The primary output writes the hidden NV12_32L32 surface, the secondary
++ * output the visible picture laid out as @pic (cedrus_fmt_is_tiled_behind()).
++ * The decoders enable the secondary output and give it the addresses of
++ * the visible picture in their own registers.
++ */
++void cedrus_dst_tiled_behind_set(struct cedrus_dev *dev,
++				 const struct v4l2_pix_format *pic)
++{
++	cedrus_dst_ext_format_set(dev, pic, true);
++}
++
++/* Addresses of the visible picture for the secondary output of the MPEG engine. */
++void cedrus_mpeg_tiled_behind_set(struct cedrus_ctx *ctx, struct vb2_buffer *dst)
++{
++	struct cedrus_dev *dev = ctx->dev;
++
++	cedrus_write(dev, VE_DEC_MPEG_ROT_LUMA, cedrus_dst_buf_addr(ctx, dst, 0));
++	cedrus_write(dev, VE_DEC_MPEG_ROT_CHROMA,
++		     cedrus_dst_buf_addr(ctx, dst, 1));
++	cedrus_write(dev, VE_DEC_MPEG_SD_ROT_DBLK_CTL, 0);
++}
++
++/* The same for the H.264 engine (H.264, VP8 and AVS). */
++void cedrus_h264_tiled_behind_set(struct cedrus_ctx *ctx, struct vb2_buffer *dst)
++{
++	struct cedrus_dev *dev = ctx->dev;
++
++	cedrus_write(dev, VE_H264_SDROT_CTRL, 0);
++	cedrus_write(dev, VE_H264_SDROT_LUMA, cedrus_dst_buf_addr(ctx, dst, 0));
++	cedrus_write(dev, VE_H264_SDROT_CHROMA, cedrus_dst_buf_addr(ctx, dst, 1));
++}
++
+ /*
+  * Program the secondary ("scale-down/rotate") output engine to write the
+  * userspace-visible P010 surface at the start of the capture buffer.  The
+@@ -398,6 +441,7 @@ int cedrus_hw_probe(struct cedrus_dev *dev)
+ 	dev->h265_max_width = variant->h265_max_width;
+ 	dev->h265_max_height = variant->h265_max_height;
+ 	dev->jpeg_rotate_out = variant->jpeg_rotate_out;
++	dev->linear_out_secondary = variant->linear_out_secondary;
+ 	dev->enc_flags = variant->enc_flags;
+ 
+ 	irq_dec = platform_get_irq(dev->pdev, 0);
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_hw.h
+@@ -20,6 +20,12 @@ int cedrus_engine_enable(struct cedrus_ctx *ctx);
+ 
+ void cedrus_dst_format_set(struct cedrus_dev *dev,
+ 			   struct v4l2_pix_format *fmt);
++void cedrus_dst_tiled_behind_set(struct cedrus_dev *dev,
++				 const struct v4l2_pix_format *pic);
++void cedrus_mpeg_tiled_behind_set(struct cedrus_ctx *ctx,
++				  struct vb2_buffer *dst);
++void cedrus_h264_tiled_behind_set(struct cedrus_ctx *ctx,
++				  struct vb2_buffer *dst);
+ void cedrus_dst_secondary_format_set(struct cedrus_dev *dev,
+ 				     struct v4l2_pix_format *fmt);
+ 
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg2.c
+@@ -204,18 +204,18 @@ static int cedrus_mpeg2_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 		bwd = &run->dst->vb2_buf;
+ 
+ 	cedrus_write(dev, VE_DEC_MPEG_FWD_REF_LUMA_ADDR,
+-		     cedrus_dst_buf_addr(ctx, fwd, 0));
++		     cedrus_dst_frame_addr(ctx, fwd, 0));
+ 	cedrus_write(dev, VE_DEC_MPEG_FWD_REF_CHROMA_ADDR,
+-		     cedrus_dst_buf_addr(ctx, fwd, 1));
++		     cedrus_dst_frame_addr(ctx, fwd, 1));
+ 	cedrus_write(dev, VE_DEC_MPEG_BWD_REF_LUMA_ADDR,
+-		     cedrus_dst_buf_addr(ctx, bwd, 0));
++		     cedrus_dst_frame_addr(ctx, bwd, 0));
+ 	cedrus_write(dev, VE_DEC_MPEG_BWD_REF_CHROMA_ADDR,
+-		     cedrus_dst_buf_addr(ctx, bwd, 1));
++		     cedrus_dst_frame_addr(ctx, bwd, 1));
+ 
+ 	/* Destination luma and chroma buffers. */
+ 
+-	dst_luma_addr = cedrus_dst_buf_addr(ctx, &run->dst->vb2_buf, 0);
+-	dst_chroma_addr = cedrus_dst_buf_addr(ctx, &run->dst->vb2_buf, 1);
++	dst_luma_addr = cedrus_dst_frame_addr(ctx, &run->dst->vb2_buf, 0);
++	dst_chroma_addr = cedrus_dst_frame_addr(ctx, &run->dst->vb2_buf, 1);
+ 
+ 	cedrus_write(dev, VE_DEC_MPEG_REC_LUMA, dst_luma_addr);
+ 	cedrus_write(dev, VE_DEC_MPEG_REC_CHROMA, dst_chroma_addr);
+@@ -256,6 +256,11 @@ static int cedrus_mpeg2_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	reg = VE_DEC_MPEG_CTRL_IRQ_MASK | VE_DEC_MPEG_CTRL_MC_NO_WRITEBACK |
+ 	      VE_DEC_MPEG_CTRL_MC_CACHE_EN;
+ 
++	if (cedrus_dst_is_tiled_behind(ctx)) {
++		cedrus_mpeg_tiled_behind_set(ctx, &run->dst->vb2_buf);
++		reg |= VE_DEC_MPEG_CTRL_ROTATE_SCALE_OUT_EN;
++	}
++
+ 	cedrus_write(dev, VE_DEC_MPEG_CTRL, reg);
+ 
+ 	return 0;
+@@ -288,4 +293,5 @@ struct cedrus_dec_ops cedrus_dec_ops_mpeg2 = {
+ 	.setup		= cedrus_mpeg2_setup,
+ 	.start		= cedrus_mpeg2_start,
+ 	.trigger	= cedrus_mpeg2_trigger,
++	.linear_out_secondary = true,
+ };
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_mpeg4.c
+@@ -750,18 +750,18 @@ static int cedrus_mpeg4_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 		bwd = vb2_find_buffer(vq, vop->backward_ref_ts) ?: dst_vb;
+ 
+ 	cedrus_write(dev, VE_DEC_MPEG_FWD_REF_LUMA_ADDR,
+-		     cedrus_dst_buf_addr(ctx, fwd, 0));
++		     cedrus_dst_frame_addr(ctx, fwd, 0));
+ 	cedrus_write(dev, VE_DEC_MPEG_FWD_REF_CHROMA_ADDR,
+-		     cedrus_dst_buf_addr(ctx, fwd, 1));
++		     cedrus_dst_frame_addr(ctx, fwd, 1));
+ 	cedrus_write(dev, VE_DEC_MPEG_BWD_REF_LUMA_ADDR,
+-		     cedrus_dst_buf_addr(ctx, bwd, 0));
++		     cedrus_dst_frame_addr(ctx, bwd, 0));
+ 	cedrus_write(dev, VE_DEC_MPEG_BWD_REF_CHROMA_ADDR,
+-		     cedrus_dst_buf_addr(ctx, bwd, 1));
++		     cedrus_dst_frame_addr(ctx, bwd, 1));
+ 
+ 	cedrus_write(dev, VE_DEC_MPEG_REC_LUMA,
+-		     cedrus_dst_buf_addr(ctx, dst_vb, 0));
++		     cedrus_dst_frame_addr(ctx, dst_vb, 0));
+ 	cedrus_write(dev, VE_DEC_MPEG_REC_CHROMA,
+-		     cedrus_dst_buf_addr(ctx, dst_vb, 1));
++		     cedrus_dst_frame_addr(ctx, dst_vb, 1));
+ 
+ 	/*
+ 	 * A B picture reads the macroblock information and not coded flags
+@@ -799,6 +799,11 @@ static int cedrus_mpeg4_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	if (!h263 && (vol->flags & V4L2_MPEG4_VOL_FLAG_QUARTER_SAMPLE))
+ 		ctrl |= cedrus_mpeg4_qpel_ctrl(coding_type, quirks);
+ 
++	if (cedrus_dst_is_tiled_behind(ctx)) {
++		cedrus_mpeg_tiled_behind_set(ctx, dst_vb);
++		ctrl |= VE_DEC_MPEG_CTRL_ROTATE_SCALE_OUT_EN;
++	}
++
+ 	cedrus_write(dev, VE_DEC_MPEG_CTRL, ctrl);
+ 
+ 	/* Bitstream. */
+@@ -993,4 +998,5 @@ struct cedrus_dec_ops cedrus_dec_ops_mpeg4 = {
+ 	.buf_cleanup	= cedrus_mpeg4_buf_cleanup,
+ 	.trigger	= cedrus_mpeg4_trigger,
+ 	.trigger_next	= cedrus_mpeg4_trigger_next,
++	.linear_out_secondary = true,
+ };
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_regs.h
+@@ -107,6 +107,7 @@
+ 
+ #define VE_PRIMARY_OUT_FMT			0xec
+ 
++#define VE_PRIMARY_OUT_FMT_MASK			(0x07 << 4)
+ #define VE_PRIMARY_OUT_FMT_TILED_32_NV12	(0x00 << 4)
+ #define VE_PRIMARY_OUT_FMT_TILED_128_NV12	(0x01 << 4)
+ #define VE_PRIMARY_OUT_FMT_YU12			(0x02 << 4)
+@@ -853,6 +854,7 @@
+ 
+ #define VE_H264_CTRL			0x220
+ #define VE_H264_CTRL_VP8			BIT(29)
++#define VE_H264_CTRL_WRITE_SDROT_PIC		BIT(9)
+ #define VE_H264_CTRL_VLD_DATA_REQ_INT		BIT(2)
+ #define VE_H264_CTRL_DECODE_ERR_INT		BIT(1)
+ #define VE_H264_CTRL_SLICE_DECODE_INT		BIT(0)
+@@ -893,6 +895,8 @@
+ #define VE_H264_VLD_LEN			0x238
+ #define VE_H264_VLD_END			0x23c
+ #define VE_H264_SDROT_CTRL		0x240
++#define VE_H264_SDROT_LUMA		0x244
++#define VE_H264_SDROT_CHROMA		0x248
+ #define VE_H264_OUTPUT_FRAME_IDX	0x24c
+ #define VE_H264_EXTRA_BUFFER1		0x250
+ #define VE_H264_EXTRA_BUFFER2		0x254
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+@@ -905,8 +905,8 @@ static int cedrus_vc1_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 
+ 	/* Destination luma and chroma buffers. */
+ 
+-	dst_luma_addr = cedrus_dst_buf_addr(ctx, &run->dst->vb2_buf, 0);
+-	dst_chroma_addr = cedrus_dst_buf_addr(ctx, &run->dst->vb2_buf, 1);
++	dst_luma_addr = cedrus_dst_frame_addr(ctx, &run->dst->vb2_buf, 0);
++	dst_chroma_addr = cedrus_dst_frame_addr(ctx, &run->dst->vb2_buf, 1);
+ 
+ 	cedrus_write(dev, VE_DEC_VC1_REC_LUMA, dst_luma_addr);
+ 	cedrus_write(dev, VE_DEC_VC1_REC_CHROMA, dst_chroma_addr);
+@@ -915,9 +915,9 @@ static int cedrus_vc1_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 
+ 	if (forward_vb2) {
+ 		cedrus_write(dev, VE_DEC_VC1_FWD_REF_LUMA_ADDR,
+-			     cedrus_dst_buf_addr(ctx, forward_vb2, 0));
++			     cedrus_dst_frame_addr(ctx, forward_vb2, 0));
+ 		cedrus_write(dev, VE_DEC_VC1_FWD_REF_CHROMA_ADDR,
+-			     cedrus_dst_buf_addr(ctx, forward_vb2, 1));
++			     cedrus_dst_frame_addr(ctx, forward_vb2, 1));
+ 	} else {
+ 		cedrus_write(dev, VE_DEC_VC1_FWD_REF_LUMA_ADDR, dst_luma_addr);
+ 		cedrus_write(dev, VE_DEC_VC1_FWD_REF_CHROMA_ADDR, dst_chroma_addr);
+@@ -925,9 +925,9 @@ static int cedrus_vc1_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 
+ 	if (backward_vb2) {
+ 		cedrus_write(dev, VE_DEC_VC1_BWD_REF_LUMA_ADDR,
+-			     cedrus_dst_buf_addr(ctx, backward_vb2, 0));
++			     cedrus_dst_frame_addr(ctx, backward_vb2, 0));
+ 		cedrus_write(dev, VE_DEC_VC1_BWD_REF_CHROMA_ADDR,
+-			     cedrus_dst_buf_addr(ctx, backward_vb2, 1));
++			     cedrus_dst_frame_addr(ctx, backward_vb2, 1));
+ 	} else {
+ 		cedrus_write(dev, VE_DEC_VC1_BWD_REF_LUMA_ADDR, dst_luma_addr);
+ 		cedrus_write(dev, VE_DEC_VC1_BWD_REF_CHROMA_ADDR, dst_chroma_addr);
+@@ -945,6 +945,13 @@ static int cedrus_vc1_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	      VE_DEC_VC1_CTRL_ERROR_IRQ_EN |
+ 	      VE_DEC_VC1_CTRL_VLD_DATA_REQ_IRQ_EN |
+ 	      VE_DEC_VC1_CTRL_MCRI_CACHE_EN;
++	if (cedrus_dst_is_tiled_behind(ctx)) {
++		cedrus_write(dev, VE_DEC_VC1_ROT_LUMA_ADDR,
++			     cedrus_dst_buf_addr(ctx, &run->dst->vb2_buf, 0));
++		cedrus_write(dev, VE_DEC_VC1_ROT_CHROMA_ADDR,
++			     cedrus_dst_buf_addr(ctx, &run->dst->vb2_buf, 1));
++		reg |= VE_DEC_VC1_CTRL_WRITE_ROTATE_PIC;
++	}
+ 	cedrus_write(dev, VE_DEC_VC1_CTRL, reg);
+ 
+ 	return 0;
+@@ -996,4 +1003,5 @@ struct cedrus_dec_ops cedrus_dec_ops_vc1 = {
+ 	.start		= cedrus_vc1_start,
+ 	.stop		= cedrus_vc1_stop,
+ 	.trigger	= cedrus_vc1_trigger,
++	.linear_out_secondary = true,
+ };
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_video.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_video.c
+@@ -574,6 +574,8 @@ static int cedrus_try_fmt_vid_cap_p(struct cedrus_ctx *ctx,
+ 		pix_fmt->sizeimage +=
+ 			ctx->current_codec->extra_cap_size(ctx, pix_fmt);
+ 
++	pix_fmt->sizeimage += cedrus_dst_tiled_behind_size(ctx, pix_fmt);
++
+ 	return 0;
+ }
+ 
+@@ -1121,8 +1123,8 @@ static int cedrus_buf_prepare(struct vb2_buffer *vb)
+ 	 * Buffer's bytesused must be written by driver for CAPTURE buffers.
+ 	 * (for OUTPUT buffers, if userspace passes 0 bytesused, v4l2-core sets
+ 	 * it to buffer length). The private space the decoder appends to a
+-	 * capture buffer (the 10-bit reconstruction surface) is not part of
+-	 * the picture, so it is not reported as payload.
++	 * capture buffer (the 10-bit or tiled reconstruction surface) is not
++	 * part of the picture, so it is not reported as payload.
+ 	 */
+ 	if (V4L2_TYPE_IS_CAPTURE(vq->type)) {
+ 		unsigned int payload = pix_fmt->sizeimage;
+@@ -1133,6 +1135,7 @@ static int cedrus_buf_prepare(struct vb2_buffer *vb)
+ 		if (ctx->current_codec && ctx->current_codec->extra_cap_size)
+ 			payload -= ctx->current_codec->extra_cap_size(ctx,
+ 								     pix_fmt);
++		payload -= cedrus_dst_tiled_behind_size(ctx, pix_fmt);
+ 
+ 		vb2_set_plane_payload(vb, 0, payload);
+ 	}
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_vp8.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_vp8.c
+@@ -817,8 +817,8 @@ static int cedrus_vp8_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	reg |= VE_VP8_LF_DELTA0(slice->lf.mb_mode_delta[0]);
+ 	cedrus_write(dev, VE_VP8_MODE_LF_DELTA, reg);
+ 
+-	luma_addr = cedrus_dst_buf_addr(ctx, &run->dst->vb2_buf, 0);
+-	chroma_addr = cedrus_dst_buf_addr(ctx, &run->dst->vb2_buf, 1);
++	luma_addr = cedrus_dst_frame_addr(ctx, &run->dst->vb2_buf, 0);
++	chroma_addr = cedrus_dst_frame_addr(ctx, &run->dst->vb2_buf, 1);
+ 	cedrus_write(dev, VE_VP8_REC_LUMA, luma_addr);
+ 	cedrus_write(dev, VE_VP8_REC_CHROMA, chroma_addr);
+ 
+@@ -829,9 +829,13 @@ static int cedrus_vp8_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	cedrus_write_ref_buf_addr(ctx, cap_q, slice->alt_frame_ts,
+ 				  VE_VP8_ALT_LUMA, VE_VP8_ALT_CHROMA);
+ 
+-	cedrus_write(dev, VE_H264_CTRL, VE_H264_CTRL_VP8 |
+-		     VE_H264_CTRL_DECODE_ERR_INT |
+-		     VE_H264_CTRL_SLICE_DECODE_INT);
++	reg = VE_H264_CTRL_VP8 | VE_H264_CTRL_DECODE_ERR_INT |
++	      VE_H264_CTRL_SLICE_DECODE_INT;
++	if (cedrus_dst_is_tiled_behind(ctx)) {
++		cedrus_h264_tiled_behind_set(ctx, &run->dst->vb2_buf);
++		reg |= VE_H264_CTRL_WRITE_SDROT_PIC;
++	}
++	cedrus_write(dev, VE_H264_CTRL, reg);
+ 
+ 	if (slice->lf.level) {
+ 		ctx->codec.vp8.last_filter_type =
+@@ -947,4 +951,5 @@ struct cedrus_dec_ops cedrus_dec_ops_vp8 = {
+ 	.start		= cedrus_vp8_start,
+ 	.stop		= cedrus_vp8_stop,
+ 	.trigger	= cedrus_vp8_trigger,
++	.linear_out_secondary = true,
+ };
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_vp9.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_vp9.c
+@@ -821,7 +821,7 @@ static dma_addr_t cedrus_vp9_frame_addr(struct cedrus_ctx *ctx,
+ 	const struct v4l2_pix_format *fmt = cb->fmt.sizeimage ? &cb->fmt :
+ 							       &ctx->dst_fmt;
+ 
+-	return cedrus_dst_frame_addr_in(fmt, &cb->m2m_buf.vb.vb2_buf, plane);
++	return cedrus_dst_frame_addr_in(ctx, fmt, &cb->m2m_buf.vb.vb2_buf, plane);
+ }
+ 
+ /*
+@@ -859,7 +859,8 @@ static int cedrus_vp9_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	dma_addr_t src_dma, src_end, luma, chroma;
+ 	u32 src_len, hdr_off, cur_w, cur_h, mi_cols, mi_rows, stride;
+ 	u32 hdr_syn, fc, reg;
+-	bool intra_only, p010, afbc, resolution_change, use_temporal_mv;
++	bool intra_only, p010, afbc, tiled_behind, resolution_change;
++	bool use_temporal_mv;
+ 	int ret;
+ 
+ 	if (!dec || !prob)
+@@ -875,6 +876,7 @@ static int cedrus_vp9_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	mi_rows = DIV_ROUND_UP(cur_h, 8);
+ 	p010 = cedrus_dst_is_p010(ctx);
+ 	afbc = cedrus_recon_is_afbc(ctx);
++	tiled_behind = cedrus_fmt_is_tiled_behind(ctx, fmt);
+ 
+ 	/*
+ 	 * VP9 inter frames may change the frame size and then predict from
+@@ -959,7 +961,7 @@ static int cedrus_vp9_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 		reg |= VE_MODE_PIC_WIDTH_MORE_2048;
+ 	cedrus_write(dev, VE_MODE, reg);
+ 
+-	recon = cedrus_dst_frame_fmt_of(fmt);
++	recon = cedrus_dst_frame_fmt_of(ctx, fmt);
+ 	out = recon;
+ 	out.width = ALIGN(cur_w, 16);
+ 	out.height = ALIGN(cur_h, 16);
+@@ -967,6 +969,11 @@ static int cedrus_vp9_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	if (out.bytesperline)
+ 		out.bytesperline = stride;
+ 	cedrus_dst_format_set(dev, &out);
++	if (tiled_behind) {
++		/* The visible picture, laid out as a linear reconstruction. */
++		out.pixelformat = fmt->pixelformat;
++		cedrus_dst_tiled_behind_set(dev, &out);
++	}
+ 
+ 	/* The whole frame is in a single buffer. */
+ 	src_dma = vb2_dma_contig_plane_dma_addr(src_buf, 0);
+@@ -1152,6 +1159,14 @@ static int cedrus_vp9_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 		vis.height = ALIGN(cur_h, 16);
+ 		vis.bytesperline = ALIGN(cur_w, 16) * 2;
+ 		cedrus_dst_p010_output_set(ctx, &run->dst->vb2_buf, fmt, &vis);
++	} else if (tiled_behind) {
++		cedrus_write(dev, VE_DEC_VP9_10BIT_CFG, 0);
++		cedrus_write(dev, VE_DEC_VP9_SDRT_LUMA_ADDR,
++			     VE_DEC_VP9_BUF_ADDR(cedrus_buf_addr(&run->dst->vb2_buf,
++								 fmt, 0)));
++		cedrus_write(dev, VE_DEC_VP9_SDRT_CHROMA_ADDR,
++			     VE_DEC_VP9_BUF_ADDR(cedrus_buf_addr(&run->dst->vb2_buf,
++								 fmt, 1)));
+ 	} else {
+ 		cedrus_write(dev, VE_DEC_VP9_SDRT_LUMA_ADDR, 0);
+ 		cedrus_write(dev, VE_DEC_VP9_SDRT_CHROMA_ADDR, 0);
+@@ -1205,7 +1220,7 @@ static int cedrus_vp9_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+ 	/* DDR consistency: vendor heuristic for widths of 129 to 192. */
+ 	if (out.width > 128 && out.width <= 192 && out.height > 64)
+ 		fc |= VE_DEC_VP9_FUNC_CTRL_DDR_CONS;
+-	if (p010)
++	if (p010 || tiled_behind)
+ 		fc |= VE_DEC_VP9_FUNC_CTRL_SECOND_OUT;
+ 	cedrus_write(dev, VE_DEC_VP9_FUNC_CTRL, fc);
+ 
+@@ -1441,4 +1456,5 @@ struct cedrus_dec_ops cedrus_dec_ops_vp9 = {
+ 	.start		= cedrus_vp9_start,
+ 	.stop		= cedrus_vp9_stop,
+ 	.trigger	= cedrus_vp9_trigger,
++	.linear_out_secondary = true,
+ };
