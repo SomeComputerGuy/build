@@ -1,0 +1,38 @@
+From 352361175a372e65a38316a4ef979a2495c28a01 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 15 Nov 2026 00:04:09 +0000
+Subject: [PATCH 4/4] fix(allwinner): stop the watchdog for SYSTEM_OFF
+
+Without a PMIC, SYSTEM_OFF only turns the CPUs off and the SoC stays
+powered. A watchdog that the OS left running (Linux with
+watchdog.stop_on_reboot=0 and a forced power-off) then resets the
+system a few seconds later and it boots again.
+
+Stop the watchdog once the PMIC power-down has not taken effect.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ plat/allwinner/common/sunxi_native_pm.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/plat/allwinner/common/sunxi_native_pm.c b/plat/allwinner/common/sunxi_native_pm.c
+index 1b95bbf..d2892bc 100644
+--- a/plat/allwinner/common/sunxi_native_pm.c
++++ b/plat/allwinner/common/sunxi_native_pm.c
+@@ -219,6 +219,12 @@ static void sunxi_system_off(void)
+ 	/* Attempt to power down the board (may not return) */
+ 	sunxi_power_down();
+ 
++	/*
++	 * The power stays on (no PMIC), only the CPUs are turned off. Stop the
++	 * watchdog, or one that the OS left running brings the system back up.
++	 */
++	mmio_write_32(SUNXI_WDOG0_MODE_REG, 0);
++
+ 	/* Turn off all CPUs */
+ 	sunxi_cpu_power_off_others();
+ 	sunxi_cpu_power_off_self();
+-- 
+2.55.0
+

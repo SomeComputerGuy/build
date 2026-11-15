@@ -1,0 +1,40 @@
+From 26f4c87a14214df37476e01cef9ecbf0cea22dd5 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 14 Nov 2026 23:48:57 +0000
+Subject: [PATCH 3/4] fix(allwinner): restart the watchdog for SYSTEM_RESET
+
+SYSTEM_RESET sets the shortest watchdog interval and enables the
+watchdog, but does not restart its counter. The watchdog fires when its
+count reaches the interval, so if the OS left it running and the count
+is already past 0.5 seconds, it never fires and BL31 panics.
+
+On the H616 this is the watchdog Linux uses; with
+watchdog.stop_on_reboot=0 every forced reboot hit it. Restart the
+counter after setting the interval, as Linux's sunxi_wdt restart
+handler does.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ plat/allwinner/common/sunxi_native_pm.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/plat/allwinner/common/sunxi_native_pm.c b/plat/allwinner/common/sunxi_native_pm.c
+index 5a6907b..1b95bbf 100644
+--- a/plat/allwinner/common/sunxi_native_pm.c
++++ b/plat/allwinner/common/sunxi_native_pm.c
+@@ -232,6 +232,11 @@ static void __dead2 sunxi_system_reset(void)
+ 	mmio_write_32(SUNXI_WDOG0_CFG_REG, 1);
+ 	/* Enable the watchdog with the shortest timeout (0.5 seconds) */
+ 	mmio_write_32(SUNXI_WDOG0_MODE_REG, (0 << 4) | 1);
++	/*
++	 * Restart the counter. If the OS left the watchdog running, its count
++	 * may already be past 0.5 seconds, and the reset would never come.
++	 */
++	mmio_write_32(SUNXI_WDOG0_CTRL_REG, (0xa57 << 1) | 1);
+ 	/* Wait for twice the watchdog timeout before panicking */
+ 	mdelay(1000);
+ 
+-- 
+2.55.0
+
