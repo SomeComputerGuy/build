@@ -1,0 +1,51 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 15 Nov 2026 09:00:00 +0000
+Subject: [PATCH] drm/sun4i: hdmi-phy: H616 deep color PLL settings up to 272 MHz
+
+The H616 MPLL and current tables jump from 148.5 MHz to 297 MHz, so
+10-bit output at pixel clocks in between (1600x1200@60, 162 MHz) gets
+the 297 MHz settings (0x3b4c), which the vendor BSP and the H6 table
+only use from about 272 MHz. The sink gets no picture.
+
+Add the 226.67 and 272 MHz rows with the H6 breakpoints and the BSP
+values for these rates (10-bit 0x214c, current 0x33; 12-bit 0x4064 /
+0x5a64). The 8-bit column keeps its current values.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+diff --git a/drivers/gpu/drm/sun4i/sun8i_hdmi_phy.c b/drivers/gpu/drm/sun4i/sun8i_hdmi_phy.c
+index 23dbac1..3188b61 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_hdmi_phy.c
++++ b/drivers/gpu/drm/sun4i/sun8i_hdmi_phy.c
+@@ -144,6 +144,18 @@ static const struct dw_hdmi_mpll_config sun50i_h616_mpll_cfg[] = {
+ 			{ 0x214c, 0x0003 },
+ 			{ 0x4064, 0x0003 },
+ 		},
++	},  {
++		226666000, {
++			{ 0x0040, 0x0003 },
++			{ 0x214c, 0x0003 },
++			{ 0x4064, 0x0003 },
++		},
++	},  {
++		272000000, {
++			{ 0x0040, 0x0003 },
++			{ 0x214c, 0x0003 },
++			{ 0x5a64, 0x0003 },
++		},
+ 	},  {
+ 		297000000, {
+ 			{ 0x0040, 0x0003 },
+@@ -170,6 +182,8 @@ static const struct dw_hdmi_curr_ctrl sun50i_h616_cur_ctr[] = {
+ 	{ 27000000,  { 0x0012, 0x0000, 0x0000 }, },
+ 	{ 74250000,  { 0x0013, 0x0013, 0x0013 }, },
+ 	{ 148500000, { 0x0019, 0x0019, 0x0019 }, },
++	{ 226666000, { 0x0019, 0x0033, 0x0034 }, },
++	{ 272000000, { 0x0019, 0x0033, 0x001b }, },
+ 	{ 297000000, { 0x0019, 0x001b, 0x0019 }, },
+ 	{ 594000000, { 0x0010, 0x0010, 0x0010 }, },
+ 	{ ~0UL,      { 0x0000, 0x0000, 0x0000 }, }
+-- 
+2.47.0
