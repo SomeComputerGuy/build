@@ -1,0 +1,122 @@
+From 40969bfba3cac5ebab5f83fbb3e76ba366c8148e Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 15 Nov 2026 08:47:18 +0000
+Subject: [PATCH] drm/bridge: dw-hdmi: Send the gamut metadata packet with
+ xvYCC
+
+HDMI 1.4 section 6.7.2.3: xvYCC601 and xvYCC709 video shall be sent
+together with valid gamut boundary metadata. dw-hdmi signalled xvYCC
+in the AVI InfoFrame but never sent the Gamut Metadata Packet, although
+the frame composer has a slot for it (FC_GMD_*). The Allwinner BSP
+driver for the same controller sends it.
+
+When the AVI InfoFrame carries xvYCC and the sink sets MD0 in its
+Colorimetry Data Block, send a P0 packet with a range GBD (HDMI 1.4
+table E-6) describing R, G and B from 0.0 to 1.0, the gamut of video
+converted from RGB. Stop it otherwise.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/bridge/synopsys/dw-hdmi.c | 58 +++++++++++++++++++++++
+ drivers/gpu/drm/bridge/synopsys/dw-hdmi.h |  8 ++++
+ 2 files changed, 66 insertions(+)
+
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+index 8ecf84e..5e386d2 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+@@ -1874,6 +1874,62 @@ static void hdmi_tx_hdcp_config(struct dw_hdmi *hdmi)
+ 		  HDMI_A_HDCPCFG1_ENCRYPTIONDISABLE_MASK, HDMI_A_HDCPCFG1);
+ }
+ 
++/*
++ * xvYCC video must be sent with a Gamut Metadata Packet (HDMI 1.4 section
++ * 6.7.2.3). The video comes from RGB inside [0, 1], so the gamut is described
++ * by the range GBD of HDMI 1.4 table E-6: R, G and B from 0.0 to 1.0, 12-bit
++ * sign/magnitude fixed point with 9 fraction bits (1.0 = 0x200), P0 profile.
++ */
++static void hdmi_config_gamut_metadata(struct dw_hdmi *hdmi,
++				       const struct drm_connector *connector,
++				       const struct hdmi_avi_infoframe *frame)
++{
++	static const u8 range[] = { 0x00, 0x02, 0x00, 0x00, 0x02, 0x00,
++				    0x00, 0x02, 0x00 };
++	u8 gbd[28] = {};
++	u8 seq;
++	int i;
++
++	hdmi_writeb(hdmi, 0, HDMI_FC_GMD_EN);
++
++	if (frame->colorimetry != HDMI_COLORIMETRY_EXTENDED ||
++	    !(connector->display_info.hdmi.gamut_metadata & BIT(0)))
++		return;
++
++	switch (frame->extended_colorimetry) {
++	case HDMI_EXTENDED_COLORIMETRY_XV_YCC_601:
++		gbd[0] = 1;
++		break;
++	case HDMI_EXTENDED_COLORIMETRY_XV_YCC_709:
++		gbd[0] = 2;
++		break;
++	default:
++		return;
++	}
++
++	/* Format_Flag = 1 (range), GBD_Color_Precision = 2 (12 bit) */
++	gbd[0] |= BIT(7) | 2 << 3;
++	memcpy(&gbd[1], range, sizeof(range));
++
++	/* P0: one packet per field */
++	hdmi_writeb(hdmi, 1 << HDMI_FC_GMD_CONF_PACKETS_PER_FRAME_OFFSET |
++			  1 << HDMI_FC_GMD_CONF_LINE_SPACING_OFFSET,
++		    HDMI_FC_GMD_CONF);
++
++	for (i = 0; i < ARRAY_SIZE(gbd); i++)
++		hdmi_writeb(hdmi, gbd[i], HDMI_FC_GMD_PB0 + i);
++
++	/* The new GBD applies to the next gamut sequence */
++	seq = hdmi_readb(hdmi, HDMI_FC_GMD_STAT) &
++	      HDMI_FC_GMD_STAT_CURRENT_SEQ_MASK;
++	hdmi_writeb(hdmi, 0 << HDMI_FC_GMD_HB_PROFILE_OFFSET |
++			  ((seq + 1) & HDMI_FC_GMD_HB_AFFECTED_SEQ_MASK),
++		    HDMI_FC_GMD_HB);
++
++	hdmi_writeb(hdmi, HDMI_FC_GMD_EN_TX, HDMI_FC_GMD_EN);
++	hdmi_writeb(hdmi, HDMI_FC_GMD_UP_UPDATE, HDMI_FC_GMD_UP);
++}
++
+ static void hdmi_config_AVI(struct dw_hdmi *hdmi,
+ 			    const struct drm_connector *connector,
+ 			    const struct drm_display_mode *mode)
+@@ -2004,6 +2060,8 @@ static void hdmi_config_AVI(struct dw_hdmi *hdmi,
+ 	hdmi_writeb(hdmi, (frame.left_bar >> 8) & 0xff, HDMI_FC_AVIELB1);
+ 	hdmi_writeb(hdmi, frame.right_bar & 0xff, HDMI_FC_AVISRB0);
+ 	hdmi_writeb(hdmi, (frame.right_bar >> 8) & 0xff, HDMI_FC_AVISRB1);
++
++	hdmi_config_gamut_metadata(hdmi, connector, &frame);
+ }
+ 
+ static bool dw_hdmi_want_allm(const struct drm_connector *connector)
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.h b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.h
+index e18d25c..7d066fc 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.h
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.h
+@@ -860,6 +860,14 @@ enum {
+ 	HDMI_FC_DBGFORCE_FORCEVIDEO = 0x1,
+ 
+ /* FC_DATAUTO0 field values */
++	HDMI_FC_GMD_STAT_CURRENT_SEQ_MASK = 0x0f,
++	HDMI_FC_GMD_EN_TX = 0x01,
++	HDMI_FC_GMD_UP_UPDATE = 0x01,
++	HDMI_FC_GMD_CONF_PACKETS_PER_FRAME_OFFSET = 4,
++	HDMI_FC_GMD_CONF_LINE_SPACING_OFFSET = 0,
++	HDMI_FC_GMD_HB_PROFILE_OFFSET = 4,
++	HDMI_FC_GMD_HB_AFFECTED_SEQ_MASK = 0x0f,
++
+ 	HDMI_FC_DATAUTO0_VSD_MASK = 0x08,
+ 	HDMI_FC_DATAUTO0_VSD_OFFSET = 3,
+ 
+-- 
+2.55.0
+

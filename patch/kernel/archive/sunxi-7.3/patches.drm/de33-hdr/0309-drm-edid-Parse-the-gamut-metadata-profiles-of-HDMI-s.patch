@@ -1,0 +1,87 @@
+From cdf6c5f5da86200f6b09eb6aba3e919b538cbefa Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 15 Nov 2026 08:46:21 +0000
+Subject: [PATCH] drm/edid: Parse the gamut metadata profiles of HDMI sinks
+
+A sink that accepts the HDMI Gamut Metadata Packet sets the MD0-MD3
+bits of its CTA Colorimetry Data Block, one per transmission profile.
+HDMI 1.4 section 6.7.3 forbids sending the packet otherwise, and xvYCC
+video must be sent with it. Store the bits in drm_hdmi_info.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/drm_edid.c  | 18 ++++++++++++++++++
+ include/drm/drm_connector.h |  6 ++++++
+ 2 files changed, 24 insertions(+)
+
+diff --git a/drivers/gpu/drm/drm_edid.c b/drivers/gpu/drm/drm_edid.c
+index d690f63..37f9f52 100644
+--- a/drivers/gpu/drm/drm_edid.c
++++ b/drivers/gpu/drm/drm_edid.c
+@@ -4183,6 +4183,7 @@ static int add_detailed_modes(struct drm_connector *connector,
+ /* CTA-861-H Table 62 - CTA Extended Tag Codes */
+ #define CTA_EXT_DB_VIDEO_CAP		0
+ #define CTA_EXT_DB_VENDOR		1
++#define CTA_EXT_DB_COLORIMETRY		5
+ #define CTA_EXT_DB_HDR_STATIC_METADATA	6
+ #define CTA_EXT_DB_420_VIDEO_DATA	14
+ #define CTA_EXT_DB_420_VIDEO_CAP_MAP	15
+@@ -5257,6 +5258,12 @@ static bool cea_db_is_y420vdb(const struct cea_db *db)
+ 	return cea_db_is_extended_tag(db, CTA_EXT_DB_420_VIDEO_DATA);
+ }
+ 
++static bool cea_db_is_colorimetry(const struct cea_db *db)
++{
++	return cea_db_is_extended_tag(db, CTA_EXT_DB_COLORIMETRY) &&
++		cea_db_payload_len(db) >= 3;
++}
++
+ static bool cea_db_is_hdmi_hdr_metadata_block(const struct cea_db *db)
+ {
+ 	return cea_db_is_extended_tag(db, CTA_EXT_DB_HDR_STATIC_METADATA) &&
+@@ -5486,6 +5493,15 @@ static uint8_t hdr_metadata_type(const u8 *edid_ext)
+ 		BIT(HDMI_STATIC_METADATA_TYPE1);
+ }
+ 
++static void drm_parse_colorimetry(struct drm_connector *connector,
++				  const struct cea_db *db)
++{
++	const u8 *data = cea_db_data(db);
++
++	/* MD0-MD3 */
++	connector->display_info.hdmi.gamut_metadata = data[2] & 0xf;
++}
++
+ static void
+ drm_parse_hdr_metadata_block(struct drm_connector *connector, const u8 *db)
+ {
+@@ -6534,6 +6550,8 @@ static void drm_parse_cea_ext(struct drm_connector *connector,
+ 			drm_parse_vcdb(connector, data);
+ 		else if (cea_db_is_hdmi_hdr_metadata_block(db))
+ 			drm_parse_hdr_metadata_block(connector, data);
++		else if (cea_db_is_colorimetry(db))
++			drm_parse_colorimetry(connector, db);
+ 		else if (cea_db_tag(db) == CTA_DB_VIDEO)
+ 			parse_cta_vdb(connector, db);
+ 		else if (cea_db_tag(db) == CTA_DB_AUDIO)
+diff --git a/include/drm/drm_connector.h b/include/drm/drm_connector.h
+index a302dda..d802de4 100644
+--- a/include/drm/drm_connector.h
++++ b/include/drm/drm_connector.h
+@@ -347,6 +347,12 @@ struct drm_hdmi_info {
+ 	 * the HDMI Forum vendor specific InfoFrame
+ 	 */
+ 	bool allm;
++
++	/**
++	 * @gamut_metadata: Gamut metadata profiles the sink accepts, from the
++	 * MD0-MD3 bits of the CTA Colorimetry Data Block, bit N is profile PN
++	 */
++	u8 gamut_metadata;
+ };
+ 
+ /**
+-- 
+2.55.0
+

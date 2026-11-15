@@ -1,0 +1,61 @@
+From 17a954681d987dd163aca3426648e41ef87f9a08 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sun, 15 Nov 2026 08:45:59 +0000
+Subject: [PATCH] drm/bridge: dw-hdmi: Do not offer BT.2020 constant luminance
+
+The Colorspace property listed every HDMI colorimetry, including
+BT2020_CYCC. Constant luminance needs Y computed from linear light,
+which no colour conversion in front of the TMDS encoder can do: the
+dw-hdmi CSC and the display engine CSCs are matrices on gamma-encoded
+values. Selecting it sent non-constant luminance video labelled as
+constant luminance in the AVI InfoFrame.
+
+Leave BT2020_CYCC out of the property, so that setting it fails.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/bridge/synopsys/dw-hdmi.c | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+index de06107..8ecf84e 100644
+--- a/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
++++ b/drivers/gpu/drm/bridge/synopsys/dw-hdmi.c
+@@ -2766,6 +2766,18 @@ static const struct drm_connector_helper_funcs dw_hdmi_connector_helper_funcs =
+ 	.atomic_check = dw_hdmi_connector_atomic_check,
+ };
+ 
++#define DW_HDMI_COLORSPACES (BIT(DRM_MODE_COLORIMETRY_SMPTE_170M_YCC) | \
++			     BIT(DRM_MODE_COLORIMETRY_BT709_YCC) | \
++			     BIT(DRM_MODE_COLORIMETRY_XVYCC_601) | \
++			     BIT(DRM_MODE_COLORIMETRY_XVYCC_709) | \
++			     BIT(DRM_MODE_COLORIMETRY_SYCC_601) | \
++			     BIT(DRM_MODE_COLORIMETRY_OPYCC_601) | \
++			     BIT(DRM_MODE_COLORIMETRY_OPRGB) | \
++			     BIT(DRM_MODE_COLORIMETRY_BT2020_RGB) | \
++			     BIT(DRM_MODE_COLORIMETRY_BT2020_YCC) | \
++			     BIT(DRM_MODE_COLORIMETRY_DCI_P3_RGB_D65) | \
++			     BIT(DRM_MODE_COLORIMETRY_DCI_P3_RGB_THEATER))
++
+ static int dw_hdmi_connector_create(struct dw_hdmi *hdmi)
+ {
+ 	struct drm_connector *connector = &hdmi->connector;
+@@ -2820,7 +2832,13 @@ static int dw_hdmi_connector_create(struct dw_hdmi *hdmi)
+ 	if (hdmi->version >= 0x200a && hdmi->plat_data->use_drm_infoframe) {
+ 		drm_connector_attach_hdr_output_metadata_property(connector);
+ 
+-		if (!drm_mode_create_hdmi_colorspace_property(connector, 0))
++		/*
++		 * BT.2020 constant luminance needs Y computed from linear
++		 * light. Neither the dw-hdmi CSC nor the CSCs in front of it
++		 * can do that, they are matrices on gamma-encoded values.
++		 */
++		if (!drm_mode_create_hdmi_colorspace_property(connector,
++							      DW_HDMI_COLORSPACES))
+ 			drm_connector_attach_colorspace_property(connector);
+ 	}
+ 
+-- 
+2.55.0
+
