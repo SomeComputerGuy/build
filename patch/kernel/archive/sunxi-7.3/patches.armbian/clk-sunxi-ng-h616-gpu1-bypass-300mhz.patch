@@ -1,0 +1,50 @@
+From 402c11136a16bbbfabe781190cba732b2fa4d242 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Mon, 16 Nov 2026 06:10:21 +0000
+Subject: [PATCH] clk: sunxi-ng: h616: Lower the GPU bypass clock to 300 MHz
+
+Chen-Yu Tsai pointed out that the GPU runs from GPU_CLK1 while the GPU
+PLL changes rate, and that GPU_CLK1 is set to 400 MHz. That is above
+the lower GPU operating points (306 to 384 MHz), so a switch between
+two of them briefly runs the GPU at 400 MHz while its supply can still
+be at the voltage of the lower point.
+
+Set the GPU_CLK1 divider to 4, for 300 MHz, below the lowest GPU
+operating point.
+
+Suggested-by: Chen-Yu Tsai <wens@kernel.org>
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/clk/sunxi-ng/ccu-sun50i-h616.c | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
+index c5e5b3f78846..47e98d94220d 100644
+--- a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
++++ b/drivers/clk/sunxi-ng/ccu-sun50i-h616.c
+@@ -1164,7 +1164,7 @@ static struct ccu_mux_nb sun50i_h616_gpu_nb = {
+ 	.common		= &gpu0_clk.common,
+ 	.cm		= &gpu0_clk.mux,
+ 	.delay_us	= 1, /* manual doesn't really say */
+-	.bypass_index	= 1, /* GPU_CLK1@400MHz */
++	.bypass_index	= 1, /* GPU_CLK1@300MHz */
+ };
+ 
+ static struct ccu_pll_nb sun50i_h616_pll_gpu_nb = {
+@@ -1224,11 +1224,11 @@ static int sun50i_h616_ccu_probe(struct platform_device *pdev)
+ 	writel(val, reg + SUN50I_H616_PLL_AUDIO_REG);
+ 
+ 	/*
+-	 * Set the input-divider for the gpu1 clock to 3, to reach a safe 400 MHz.
++	 * Set the input-divider for the gpu1 clock to 4, to reach a safe 300 MHz.
+ 	 */
+ 	val = readl(reg + SUN50I_H616_GPU_CLK1_REG);
+ 	val &= ~GENMASK(1, 0);
+-	val |= 2;
++	val |= 3;
+ 	writel(val, reg + SUN50I_H616_GPU_CLK1_REG);
+ 
+ 	/*
+-- 
+2.55.0
+

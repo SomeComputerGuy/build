@@ -33,7 +33,7 @@ index 111111111111..222222222222 100644
  			reg_dcdcc: dcdcc {
  				regulator-always-on;
 -				regulator-min-microvolt = <810000>;
-+				regulator-min-microvolt = <900000>;
++				regulator-min-microvolt = <890000>;
  				regulator-max-microvolt = <990000>;
  				regulator-name = "vdd-gpu-sys";
  			};
