@@ -46,10 +46,10 @@ index 6469de1..8ec8fbe 100644
  	planes = devm_kzalloc(dev, sizeof(*planes), GFP_KERNEL);
  	if (!planes)
 diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
-index 0659339..bfe6b46 100644
+index b8ea1ce..9a7b1e6 100644
 --- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
 +++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
-@@ -807,6 +807,13 @@ static int sun8i_mixer_bind(struct device *dev, struct device *master,
+@@ -689,6 +689,13 @@ static int sun8i_mixer_bind(struct device *dev, struct device *master,
  		}
  
  		mixer->planes_dev = &pdev->dev;
