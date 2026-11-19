@@ -8,6 +8,11 @@ the sink supports ALLM. The controller has one vendor InfoFrame slot, so
 this is done only for modes that need no HDMI VIC or 3D signalling.
 Also stop the slot before a mode that sends no vendor InfoFrame.
 
+Send the vendor InfoFrame in every frame instead of every other one, as
+amdgpu and i915 do. With one frame skipped between packets, a TV in
+its ALLM game mode blanked the picture for about half a second every
+few seconds.
+
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
@@ -73,7 +78,7 @@ index e4d4939..de06107 100644
  
  	/* Set the length of HDMI vendor specific InfoFrame payload */
  	hdmi_writeb(hdmi, buffer[2], HDMI_FC_VSDSIZE);
-@@ -2042,11 +2067,14 @@ static void hdmi_config_vendor_specific_infoframe(struct dw_hdmi *hdmi,
+@@ -2042,12 +2067,15 @@ static void hdmi_config_vendor_specific_infoframe(struct dw_hdmi *hdmi,
  	hdmi_writeb(hdmi, buffer[5], HDMI_FC_VSDIEEEID1);
  	hdmi_writeb(hdmi, buffer[6], HDMI_FC_VSDIEEEID2);
  
@@ -89,7 +94,10 @@ index e4d4939..de06107 100644
 +	if (!hf_vsif && frame.s3d_struct >= HDMI_3D_STRUCTURE_SIDE_BY_SIDE_HALF)
  		hdmi_writeb(hdmi, buffer[9], HDMI_FC_VSDPAYLOAD2);
  
- 	/* Packet frame interpolation */
+-	/* Packet frame interpolation */
+-	hdmi_writeb(hdmi, 1, HDMI_FC_DATAUTO1);
++	/* Packet frame interpolation: no frames between two packets */
++	hdmi_writeb(hdmi, 0, HDMI_FC_DATAUTO1);
 -- 
 2.53.0
 
