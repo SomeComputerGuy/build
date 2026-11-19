@@ -1,0 +1,42 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Carlo Caione <ccaione@baylibre.com>
+Date: Thu, 19 Nov 2026 21:49:32 +0100
+Subject: [PATCH v3 2/4] clk: divider: Fix round-closest for rates above the parent rate
+
+When the requested rate is above the parent rate, _div_round_closest()
+computes a down divider of 0 and divides the parent rate by it. Asking a
+CLK_DIVIDER_ROUND_CLOSEST divider without CLK_SET_RATE_PARENT for its
+maximum rate with clk_round_rate(clk, ULONG_MAX) then traps on x86.
+
+No divider goes above the parent rate, so the smallest one is the
+closest. Return it before dividing.
+
+Fixes: 26bac95aa88c ("clk: divider: fix selection of divider when rounding to closest")
+Reviewed-by: Sebastian Reichel <sebastian.reichel@collabora.com>
+Reviewed-by: Brian Masney <masneyb@kernel.org>
+Signed-off-by: Carlo Caione <ccaione@baylibre.com>
+---
+Upstream: posted, not merged yet. [PATCH v3 2/4], https://lore.kernel.org/r/20261119-upstream-clk-divider-large-rates-v3-2-838eccd2e497@baylibre.com
+
+ drivers/clk/clk-divider.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/drivers/clk/clk-divider.c b/drivers/clk/clk-divider.c
+index c3f46f9ee451..ed60fa9b04fa 100644
+--- a/drivers/clk/clk-divider.c
++++ b/drivers/clk/clk-divider.c
+@@ -254,6 +254,11 @@ static int _div_round_closest(const struct clk_div_table *table,
+ 	int up, down;
+ 	unsigned long up_rate, down_rate;
+ 
++	/* No divider goes above the parent rate: the smallest one is the closest */
++	if (rate >= parent_rate)
++		return table && !(flags & CLK_DIVIDER_POWER_OF_TWO) ?
++		       _get_table_mindiv(table) : 1;
++
+ 	up = _get_div_round_up(parent_rate, rate);
+ 	down = parent_rate / rate;
+ 
+
+-- 
+2.56.1
