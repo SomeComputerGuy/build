@@ -10,9 +10,9 @@ Subject: Add sunxi-addr driver - Used to fix uwe5622 bluetooth MAC addresses
  drivers/misc/sunxi-addr/Makefile     |   5 +
  drivers/misc/sunxi-addr/sha256.c     | 180 +++++
  drivers/misc/sunxi-addr/sha256.h     |  10 +
- drivers/misc/sunxi-addr/sunxi-addr.c | 358 ++++++++++
+ drivers/misc/sunxi-addr/sunxi-addr.c | 357 ++++++++++
  include/linux/soc/sunxi/sunxi_addr.h |  15 +
- 8 files changed, 576 insertions(+)
+ 8 files changed, 575 insertions(+)
 
 diff --git a/drivers/misc/Kconfig b/drivers/misc/Kconfig
 index 111111111111..222222222222 100644
@@ -263,7 +263,7 @@ new file mode 100644
 index 000000000000..111111111111
 --- /dev/null
 +++ b/drivers/misc/sunxi-addr/sunxi-addr.c
-@@ -0,0 +1,358 @@
+@@ -0,0 +1,357 @@
 +/*
 + * The driver of SUNXI NET MAC ADDR Manager.
 + *
@@ -281,6 +281,7 @@ index 000000000000..111111111111
 +#include <linux/of.h>
 +#include <linux/platform_device.h>
 +#include <linux/soc/sunxi/sunxi_addr.h>
++#include <linux/soc/sunxi/sunxi_sid.h>
 +
 +#include "sha256.h"
 +
@@ -343,8 +344,6 @@ index 000000000000..111111111111
 +	{TYPE_ANY, TYPE_ANY, 0, NULL, "bt"  },
 +	{TYPE_ANY, TYPE_ANY, 1, NULL, "eth" },
 +};
-+
-+extern int sunxi_get_soc_chipid(unsigned char *chipid);
 +
 +static int addr_parse(int fmt, const char *addr, int check)
 +{
