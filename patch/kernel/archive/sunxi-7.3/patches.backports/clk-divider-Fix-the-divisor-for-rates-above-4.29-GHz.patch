@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Carlo Caione <ccaione@baylibre.com>
+Date: Thu, 19 Nov 2026 21:49:31 +0100
+Subject: [PATCH v3 1/4] clk: divider: Fix the divisor for rates above 4.29 GHz
+
+DIV_ROUND_UP_ULL() takes a 32-bit divisor, so on 64-bit platforms a
+requested rate above 4.29 GHz is truncated. A divider fed by a 5.94 GHz
+PLL then computes a divisor of 7, not 1, for 5.94 GHz.
+
+Round up with (parent_rate - 1) / rate + 1 instead, building on an
+earlier fix by Sebastian Reichel. It divides by the full rate and does
+not overflow with clk_round_rate(clk, ULONG_MAX).
+
+Fixes: 9556f9dad8f5 ("clk: divider: handle integer overflow when dividing large clock rates")
+Suggested-by: Jerome Brunet <jbrunet@baylibre.com>
+Suggested-by: David Laight <david.laight.linux@gmail.com>
+Reviewed-by: Sebastian Reichel <sebastian.reichel@collabora.com>
+Reviewed-by: Brian Masney <masneyb@kernel.org>
+Reviewed-by: Jerome Brunet <jbrunet@baylibre.com>
+Signed-off-by: Carlo Caione <ccaione@baylibre.com>
+---
+Upstream: posted, not merged yet. [PATCH v3 1/4], https://lore.kernel.org/r/20261119-upstream-clk-divider-large-rates-v3-1-838eccd2e497@baylibre.com
+
+ drivers/clk/clk-divider.c | 16 +++++++++++++---
+ 1 file changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/clk/clk-divider.c b/drivers/clk/clk-divider.c
+index f68216c65d3d..c3f46f9ee451 100644
+--- a/drivers/clk/clk-divider.c
++++ b/drivers/clk/clk-divider.c
+@@ -223,11 +223,21 @@ static int _round_down_table(const struct clk_div_table *table, int div)
+ 	return down;
+ }
+ 
++/*
++ * DIV_ROUND_UP() without the addition, which overflows for rates close to
++ * ULONG_MAX, as with clk_round_rate(clk, ULONG_MAX)
++ */
++static unsigned long _get_div_round_up(unsigned long parent_rate,
++				       unsigned long rate)
++{
++	return parent_rate ? (parent_rate - 1) / rate + 1 : 0;
++}
++
+ static int _div_round_up(const struct clk_div_table *table,
+ 			 unsigned long parent_rate, unsigned long rate,
+ 			 unsigned long flags)
+ {
+-	int div = DIV_ROUND_UP_ULL((u64)parent_rate, rate);
++	int div = _get_div_round_up(parent_rate, rate);
+ 
+ 	if (flags & CLK_DIVIDER_POWER_OF_TWO)
+ 		div = __roundup_pow_of_two(div);
+@@ -244,7 +254,7 @@ static int _div_round_closest(const struct clk_div_table *table,
+ 	int up, down;
+ 	unsigned long up_rate, down_rate;
+ 
+-	up = DIV_ROUND_UP_ULL((u64)parent_rate, rate);
++	up = _get_div_round_up(parent_rate, rate);
+ 	down = parent_rate / rate;
+ 
+ 	if (flags & CLK_DIVIDER_POWER_OF_TWO) {
+@@ -423,7 +433,7 @@ int divider_get_val(unsigned long rate, unsigned long parent_rate,
+ {
+ 	unsigned int div, value;
+ 
+-	div = DIV_ROUND_UP_ULL((u64)parent_rate, rate);
++	div = _get_div_round_up(parent_rate, rate);
+ 
+ 	if (!_is_valid_div(table, div, flags))
+ 		return -EINVAL;
+
+-- 
+2.56.1

@@ -24,7 +24,7 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  		.hw.init	= CLK_HW_INIT("pll-video0", "osc24M",
  					      &ccu_nm_ops,
  					      CLK_SET_RATE_UNGATE),
-@@ -612,13 +613,19 @@
+@@ -612,13 +613,18 @@
  
  static SUNXI_CCU_GATE(bus_keyadc_clk, "bus-keyadc", "apb1", 0xa9c, BIT(0), 0);
  
@@ -36,9 +36,8 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
 -				 BIT(31),	/* gate */
 -				 0);
 +/*
-+ * HDMI needs tcon-tv0 and hdmi at the same rate from the same PLL. Both
-+ * take pll-video0 only (their other PLLs differ) and divide it by M only
-+ * (hdmi has no N divider), so hdmi can follow every tcon-tv0 rate.
++ * HDMI needs tcon-tv0 and hdmi at the same rate, so both get only what
++ * they share: pll-video0 as the PLL and the M divider.
 + */
 +static const char * const hdmi_parents[] = { "pll-video0", "pll-video0-4x" };
 +#define SUN50I_H616_HDMI_CLK_REG		0xb00
@@ -51,7 +50,7 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  
  static SUNXI_CCU_GATE(hdmi_slow_clk, "hdmi-slow", "osc24M", 0xb04, BIT(31), 0);
  
-@@ -678,14 +685,14 @@
+@@ -678,14 +684,14 @@
   * parent so that a mode set on one output can never re-rate the PLL that
   * drives the other.
   */
@@ -74,7 +73,7 @@ diff --git a/drivers/clk/sunxi-ng/ccu-sun50i-h616.c b/drivers/clk/sunxi-ng/ccu-s
  static SUNXI_CCU_MP_WITH_MUX_GATE(tcon_tv1_clk, "tcon-tv1",
  				  tcon_tv_parents, 0xb84,
  				  0, 4,		/* M */
-@@ -1253,6 +1260,15 @@
+@@ -1253,6 +1259,15 @@
  	val |= BIT(24);
  	writel(val, reg + SUN50I_H616_HDMI_CEC_CLK_REG);
  
