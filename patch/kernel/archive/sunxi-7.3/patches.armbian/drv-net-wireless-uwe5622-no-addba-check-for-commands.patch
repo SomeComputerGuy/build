@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Thu, 19 Nov 2026 07:00:00 +0000
+Subject: wireless: uwe5622: do not read the station index of a command
+
+sprdwl_tx_msg_func() calls prepare_addba() for every message. For a
+command the buffer holds no tx_msdu_dscr, so sta_lut_index is a command
+byte and intf->tx_num[] is read out of bounds:
+
+  BUG: KASAN: slab-out-of-bounds in sprdwl_tx_msg_func+0xeb0/0x13a0 [sprdwl_ng]
+  Read of size 8 at addr ffff0000109d5900 by task kworker/u17:0/122
+   sprdwl_send_cmd+0x6c/0x140 [sprdwl_ng]
+   sprdwl_cmd_send_to_ic+0x11c/0x3a0 [sprdwl_ng]
+   sprdwl_cmd_send_recv+0x300/0xf60 [sprdwl_ng]
+   sprdwl_set_mc_filter+0xe0/0x160 [sprdwl_ng]
+
+prepare_addba() does nothing without a peer entry, which only data
+messages have. Call it only then.
+
+Upstream: to be submitted to https://github.com/armbian/uwe5622
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/net/wireless/uwe5622/unisocwifi/tx_msg.c | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/wireless/uwe5622/unisocwifi/tx_msg.c b/drivers/net/wireless/uwe5622/unisocwifi/tx_msg.c
+--- a/drivers/net/wireless/uwe5622/unisocwifi/tx_msg.c
++++ b/drivers/net/wireless/uwe5622/unisocwifi/tx_msg.c
+@@ -1310,8 +1310,9 @@ int sprdwl_tx_msg_func(void *pdev, struc
+ 	if (msg->msg_type != SPRDWL_TYPE_DATA)
+ 		sprdwl_queue_msg_buf(msg, msg->msglist);
+ 
+-	prepare_addba(intf, dscr->sta_lut_index, (struct sk_buff *)msg->skb,
+-			 peer_entry, tid);
++	if (peer_entry)
++		prepare_addba(intf, dscr->sta_lut_index,
++			      (struct sk_buff *)msg->skb, peer_entry, tid);
+ 
+ 	if (msg->msg_type == SPRDWL_TYPE_CMD)
+ 		tx_up(tx_msg);
