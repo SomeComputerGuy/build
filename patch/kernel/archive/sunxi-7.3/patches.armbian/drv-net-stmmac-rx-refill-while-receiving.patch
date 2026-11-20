@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 20 Nov 2026 08:26:01 +0000
+Subject: [PATCH 1/5] net: stmmac: refill the RX ring while receiving
+
+stmmac_rx() gives buffers back to the DMA only at the end of a poll.
+A frame that spans several buffers can make one poll take more
+descriptors than the ring has (64 frames x 9 descriptors at MTU 16356),
+so the ring runs empty and the DMA clips the frame it is receiving.
+
+Refill every STMMAC_RX_FILL_BATCH descriptors inside the loop, as
+stmmac_rx_zc() does, and keep polling while a refill falls short.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../net/ethernet/stmicro/stmmac/stmmac_main.c   | 17 ++++++++++++++---
+ 1 file changed, 14 insertions(+), 3 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index c1bffae..929ee69 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -5204,8 +5204,9 @@ static void stmmac_rx_vlan(struct net_device *dev, struct sk_buff *skb)
+  * @queue: RX queue index
+  * Description : this is to reallocate the skb for the reception process
+  * that is based on zero-copy.
++ * Return: true if every used descriptor got a buffer back.
+  */
+-static inline void stmmac_rx_refill(struct stmmac_priv *priv, u32 queue)
++static bool stmmac_rx_refill(struct stmmac_priv *priv, u32 queue)
+ {
+ 	struct stmmac_rx_queue *rx_q = &priv->dma_conf.rx_queue[queue];
+ 	int dirty = stmmac_rx_dirty(priv, queue);
+@@ -5262,6 +5263,8 @@ static inline void stmmac_rx_refill(struct stmmac_priv *priv, u32 queue)
+ 	stmmac_set_queue_rx_tail_ptr(priv, rx_q, queue, rx_q->dirty_rx);
+ 	/* Wake up Rx DMA from the suspend state if required */
+ 	stmmac_enable_dma_reception(priv, priv->ioaddr, queue);
++
++	return dirty < 0;
+ }
+ 
+ static unsigned int stmmac_rx_buf1_len(struct stmmac_priv *priv,
+@@ -5864,6 +5867,7 @@ static int stmmac_rx(struct stmmac_priv *priv, int limit, u32 queue)
+ 	struct stmmac_xdp_buff ctx;
+ 	bool fcs_stripped = false;
+ 	int xdp_status = 0;
++	bool failure;
+ 	int bufsz;
+ 
+ 	dma_dir = page_pool_get_dma_dir(rx_q->page_pool);
+@@ -5901,6 +5905,12 @@ read_again:
+ 		if (count >= limit)
+ 			break;
+ 
++		/* A frame may span many buffers: hand them back to the DMA
++		 * as we go, not only at the end of the poll.
++		 */
++		if (stmmac_rx_dirty(priv, queue) >= STMMAC_RX_FILL_BATCH)
++			stmmac_rx_refill(priv, queue);
++
+ 		buf1_len = 0;
+ 		buf2_len = 0;
+ 		entry = next_entry;
+@@ -6132,7 +6142,7 @@ drain_data:
+ 
+ 	stmmac_finalize_xdp_rx(priv, xdp_status);
+ 
+-	stmmac_rx_refill(priv, queue);
++	failure = !stmmac_rx_refill(priv, queue);
+ 
+ 	u64_stats_update_begin(&rxq_stats->napi_syncp);
+ 	u64_stats_add(&rxq_stats->napi.rx_packets, rx_packets);
+@@ -6143,7 +6153,8 @@ drain_data:
+ 	priv->xstats.rx_dropped += rx_dropped;
+ 	priv->xstats.rx_errors += rx_errors;
+ 
+-	return count;
++	/* Keep polling until the ring is full again */
++	return failure ? limit : count;
+ }
+ 
+ static int stmmac_napi_poll_rx(struct napi_struct *napi, int budget)
+-- 
+2.55.0
+

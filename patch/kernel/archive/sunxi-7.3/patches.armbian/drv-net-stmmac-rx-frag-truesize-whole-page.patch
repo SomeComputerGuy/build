@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 20 Nov 2026 08:26:08 +0000
+Subject: [PATCH 2/5] net: stmmac: count the whole page as the truesize of an
+ RX fragment
+
+Each RX buffer is a page pool page of napi_skb_frag_size bytes, but
+skb_add_rx_frag() was given dma_buf_sz. With 2032-byte buffers on 4 KiB
+pages, a socket was charged half the memory its frames hold.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/net/ethernet/stmicro/stmmac/stmmac_main.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+index 929ee69..081d61a 100644
+--- a/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
++++ b/drivers/net/ethernet/stmicro/stmmac/stmmac_main.c
+@@ -6072,7 +6072,7 @@ read_again:
+ 						buf1_len, dma_dir);
+ 			skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
+ 					buf->page, buf->page_offset, buf1_len,
+-					priv->dma_conf.dma_buf_sz);
++					rx_q->napi_skb_frag_size);
+ 			buf->page = NULL;
+ 		}
+ 
+@@ -6081,7 +6081,7 @@ read_again:
+ 						buf2_len, dma_dir);
+ 			skb_add_rx_frag(skb, skb_shinfo(skb)->nr_frags,
+ 					buf->sec_page, 0, buf2_len,
+-					priv->dma_conf.dma_buf_sz);
++					rx_q->napi_skb_frag_size);
+ 			buf->sec_page = NULL;
+ 		}
+ 
+-- 
+2.55.0
+
