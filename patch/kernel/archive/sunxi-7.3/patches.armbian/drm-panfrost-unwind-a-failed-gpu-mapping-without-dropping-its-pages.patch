@@ -1,7 +1,7 @@
-From 6df53376abdaf962a233c8cebb0f99932c6a060f Mon Sep 17 00:00:00 2001
+From 71a2cf874c02a71cd1962c1efa7462a0a997bf3e Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 04:59:55 +0000
-Subject: [PATCH 05/14] drm/panfrost: Unwind a failed GPU mapping without
+Subject: [PATCH 05/15] drm/panfrost: Unwind a failed GPU mapping without
  dropping its pages
 
 Two error paths of a BO mapping leave the wrong state behind when an

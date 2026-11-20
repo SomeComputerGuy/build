@@ -1,7 +1,7 @@
-From adbdee1ea7850ca9d8e92a49ade01b532ffcdc40 Mon Sep 17 00:00:00 2001
+From 292f584af85aa77dee6770a36221edee24a70510 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 03:40:07 +0000
-Subject: [PATCH 07/14] drm/panfrost: Don't WARN for a heap folio a
+Subject: [PATCH 07/15] drm/panfrost: Don't WARN for a heap folio a
  neighbouring chunk filled
 
 panfrost_mmu_map_fault_addr() fills the page array of a heap BO a whole
