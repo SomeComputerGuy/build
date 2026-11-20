@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 20 Nov 2026 09:00:00 +0000
+Subject: [PATCH] media: h264: Recover the stateless encode from a failed
+ picture
+
+A picture that fails in the hardware (e.g. a full coded buffer) never
+completes, but its step already flushed the DPB if it was an IDR picture
+and made its SPS and PPS the active ones. The next P picture then has no
+reference (WARN_ON in ref_step(), -EINVAL from the driver), and the
+parameter sets of the failed picture are never written.
+
+Write the parameter sets of a picture that did not complete again with
+the next one, and make the picture after a failed IDR picture an IDR
+picture.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/media/v4l2-core/v4l2-h264-enc.c | 26 +++++++++++++++++++++++++
+ include/media/v4l2-h264-enc.h           |  4 ++++
+ 2 files changed, 30 insertions(+)
+
+diff --git a/drivers/media/v4l2-core/v4l2-h264-enc.c b/drivers/media/v4l2-core/v4l2-h264-enc.c
+index 6647323..e5f454b 100644
+--- a/drivers/media/v4l2-core/v4l2-h264-enc.c
++++ b/drivers/media/v4l2-core/v4l2-h264-enc.c
+@@ -107,6 +107,8 @@ int v4l2_h264_enc_init(struct v4l2_h264_enc *enc)
+ 	memset(&enc->state_active, 0, sizeof(enc->state_active));
+ 	memset(&enc->state_next, 0, sizeof(enc->state_next));
+ 	enc->state_serial = 0;
++	enc->rbsp_pending = 0;
++	enc->idr_pending = false;
+ 
+ 	memset(&enc->ref, 0, sizeof(enc->ref));
+ 
+@@ -491,6 +493,16 @@ static int state_prepare_params(struct v4l2_h264_enc *enc)
+ 	    !sps->max_num_ref_frames)
+ 		return -EINVAL;
+ 
++	/* A failed IDR picture never reached the stream: restart with this one. */
++	if (enc->idr_pending && !(encode->flags & V4L2_H264_ENCODE_FLAG_IDR_PIC)) {
++		encode->slice_type = V4L2_H264_SLICE_TYPE_I;
++		encode->flags |= V4L2_H264_ENCODE_FLAG_IDR_PIC;
++		encode->frame_num = 0;
++		encode->pic_order_cnt_lsb = 0;
++		encode->idr_pic_id = enc->idr_pic_id;
++		encode->nal_ref_idc = max_t(u8, encode->nal_ref_idc, 1);
++	}
++
+ 	/* Ensure the stream starts with an I frame. */
+ 	if (!enc->state_serial && encode->slice_type != V4L2_H264_SLICE_TYPE_I)
+ 		return -EINVAL;
+@@ -736,6 +748,8 @@ static int state_complete(struct v4l2_h264_enc *enc,
+ 	 * detect a stream start case after the first frame failed to encode.
+ 	 */
+ 	enc->state_serial++;
++	enc->rbsp_pending = 0;
++	enc->idr_pending = false;
+ 
+ 	return 0;
+ }
+@@ -1309,6 +1323,7 @@ static int rc_complete(struct v4l2_h264_enc *enc,
+ int v4l2_h264_enc_step(struct v4l2_h264_enc *enc,
+ 		       struct vb2_v4l2_buffer *buffer)
+ {
++	struct v4l2_ctrl_h264_encode_params *encode = &enc->state_active.encode;
+ 	int ret;
+ 
+ 	ret = state_prepare(enc);
+@@ -1319,6 +1334,9 @@ int v4l2_h264_enc_step(struct v4l2_h264_enc *enc,
+ 	if (ret)
+ 		return ret;
+ 
++	/* Parameter sets of a picture that did not complete are written again. */
++	enc->rbsp_update |= enc->rbsp_pending;
++
+ 	ret = rc_update(enc);
+ 	if (ret)
+ 		return ret;
+@@ -1327,6 +1345,14 @@ int v4l2_h264_enc_step(struct v4l2_h264_enc *enc,
+ 	if (ret)
+ 		return ret;
+ 
++	enc->rbsp_pending = enc->rbsp_update & (V4L2_H264_ENC_RBSP_UPDATE_SPS |
++						V4L2_H264_ENC_RBSP_UPDATE_PPS);
++
++	if (encode->flags & V4L2_H264_ENCODE_FLAG_IDR_PIC) {
++		enc->idr_pending = true;
++		enc->idr_pic_id = encode->idr_pic_id;
++	}
++
+ 	ret = ref_step(enc);
+ 	if (ret)
+ 		return ret;
+diff --git a/include/media/v4l2-h264-enc.h b/include/media/v4l2-h264-enc.h
+index ff71661..bac9962 100644
+--- a/include/media/v4l2-h264-enc.h
++++ b/include/media/v4l2-h264-enc.h
+@@ -124,6 +124,10 @@ struct v4l2_h264_enc {
+ 	struct v4l2_h264_enc_ref ref;
+ 	struct v4l2_h264_enc_rbsp rbsp;
+ 	unsigned int rbsp_update;
++	unsigned int rbsp_pending;
++
++	bool idr_pending;
++	u16 idr_pic_id;
+ 
+ 	unsigned int flags;
+ };
+-- 
+2.55.0
+
