@@ -1,67 +1,37 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
-Date: Fri, 20 Nov 2026 07:00:00 +0000
+Date: Fri, 20 Nov 2026 08:10:00 +0000
 Subject: wireless: uwe5622: do not cancel the loopcheck work from itself
 
 When the firmware misses a loopcheck ack, loopcheck_work_queue() calls
-stop_loopcheck(), which does cancel_delayed_work_sync() on the work that
-is running it and waits forever. The CP2 reset that should follow never
-happens, and the next stop_loopcheck() (marlin_cp2_reset() from a WLAN
-command timeout) blocks behind it too: WLAN and Bluetooth stay dead
-until reboot, with hung task reports for both workers.
+stop_loopcheck() and then mdbg_assert_interface(), whose CP2 reset
+calls stop_loopcheck() again through marlin_set_power(). Both run in
+the loopcheck work, and stop_loopcheck() does cancel_delayed_work_sync()
+on that work: it waits for itself forever. The CP2 reset never
+finishes, WLAN and Bluetooth stay dead until reboot, and every later
+stop_loopcheck() (e.g. the WLAN command timeout reset) blocks too.
 
 Seen on an Orange Pi Zero2 after an SDIO CMD53 timeout under full
-system load.
+system load (hung task reports for both paths).
 
-Clear the open bit and complete the waiter without the synchronous
-cancel when stopping from the work itself.
+Skip the synchronous cancel when stop_loopcheck() runs in the loopcheck
+work; that work does not requeue itself once the open bit is clear.
 
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
 --- a/drivers/net/wireless/uwe5622/unisocwcn/platform/loopcheck.c
 +++ b/drivers/net/wireless/uwe5622/unisocwcn/platform/loopcheck.c
-@@ -51,6 +51,8 @@
- }
- 
- #ifdef CONFIG_WCN_LOOPCHECK
-+static bool loopcheck_clear_open(void);
-+
- static void loopcheck_work_queue(struct work_struct *work)
- {
- 	int ret;
-@@ -68,7 +70,9 @@
- 	if (!test_bit(WCN_LOOPCHECK_OPEN, &loopcheck.status))
+@@ -210,7 +210,12 @@
  		return;
- 	if (!timeleft) {
--		stop_loopcheck();
-+		/* stop_loopcheck() would wait for this work to finish */
-+		if (!loopcheck_clear_open())
-+			return;
- 		WCN_ERR("didn't get loopcheck ack\n");
- 		WCN_INFO("start dump CP2 mem\n");
- 		mdbg_assert_interface("loopcheck fail");
-@@ -203,14 +207,20 @@
- 	queue_delayed_work(loopcheck.workqueue, &loopcheck.work, HZ);
- }
- 
--void stop_loopcheck(void)
-+static bool loopcheck_clear_open(void)
- {
- 	if (!test_bit(WCN_LOOPCHECK_INIT, &loopcheck.status) ||
- 	    !test_and_clear_bit(WCN_LOOPCHECK_OPEN, &loopcheck.status))
--		return;
--	WCN_INFO("%s\n", __func__);
-+		return false;
-+	WCN_INFO("stop_loopcheck\n");
+ 	WCN_INFO("%s\n", __func__);
  	complete_all(&loopcheck.completion);
 -	cancel_delayed_work_sync(&loopcheck.work);
-+	return true;
-+}
-+
-+void stop_loopcheck(void)
-+{
-+	if (loopcheck_clear_open())
++	/*
++	 * The work stops loopcheck itself when an ack is missing, directly
++	 * and through the CP2 reset; it must not wait for its own end.
++	 */
++	if (current_work() != &loopcheck.work.work)
 +		cancel_delayed_work_sync(&loopcheck.work);
  }
  
