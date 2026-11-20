@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 20 Nov 2026 14:00:00 +0000
+Subject: wireless: uwe5622: unlink an interface before freeing it
+
+Unisoc's later sprdwl driver (sc2355/merlion) already does this.
+
+sprdwl_cfg80211_del_iface() frees the vif in sprdwl_del_iface() and then
+list_del()s it. For a P2P device (wpa_supplicant's p2p-dev-wlan0) the vif
+is kfree()d at once:
+
+  BUG: KASAN: slab-use-after-free in sprdwl_cfg80211_del_iface+0x23c/0x280 [sprdwl_ng]
+  Freed by task 758:
+   kfree+0x24c/0x490
+   sprdwl_del_iface+0x12c/0x1c0 [sprdwl_ng]
+   sprdwl_cfg80211_del_iface+0x128/0x280 [sprdwl_ng]
+
+Unlink it under the list lock first, as sprdwl_del_all_ifaces() does.
+An unknown wdev no longer reaches sprdwl_del_iface() with the list head.
+
+Upstream: to be submitted to https://github.com/armbian/uwe5622
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/net/wireless/uwe5622/unisocwifi/cfg80211.c | 19 +++++++------------
+ 1 file changed, 7 insertions(+), 12 deletions(-)
+
+diff --git a/drivers/net/wireless/uwe5622/unisocwifi/cfg80211.c b/drivers/net/wireless/uwe5622/unisocwifi/cfg80211.c
+--- a/drivers/net/wireless/uwe5622/unisocwifi/cfg80211.c
++++ b/drivers/net/wireless/uwe5622/unisocwifi/cfg80211.c
+@@ -581,27 +581,22 @@ static int sprdwl_cfg80211_del_iface(str
+ 				     struct wireless_dev *wdev)
+ {
+ 	struct sprdwl_priv *priv = wiphy_priv(wiphy);
+-	struct sprdwl_vif *vif = NULL, *tmp_vif = NULL;
++	struct sprdwl_vif *vif;
+ 
+ 	if (sprdwl_intf_is_exit(priv)) {
+ 		wiphy_err(wiphy, "%s driver removing!\n", __func__);
+ 		return 0;
+ 	}
+ 	spin_lock_bh(&priv->list_lock);
+-	list_for_each_entry_safe(vif, tmp_vif, &priv->vif_list, vif_node) {
+-		if (&vif->wdev == wdev)
+-			break;
++	list_for_each_entry(vif, &priv->vif_list, vif_node) {
++		if (&vif->wdev == wdev) {
++			list_del(&vif->vif_node);
++			spin_unlock_bh(&priv->list_lock);
++			return sprdwl_del_iface(priv, vif);
++		}
+ 	}
+ 	spin_unlock_bh(&priv->list_lock);
+ 
+-	if (vif != NULL) {
+-		sprdwl_del_iface(priv, vif);
+-
+-		spin_lock_bh(&priv->list_lock);
+-		list_del(&vif->vif_node);
+-		spin_unlock_bh(&priv->list_lock);
+-	}
+-
+ 	return 0;
+ }
+ 
