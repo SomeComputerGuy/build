@@ -13,7 +13,8 @@ select that same DMA device.
 Signed-off-by: Jernej Skrabec <jernej.skrabec@gmail.com>
 Link: https://github.com/LibreELEC/LibreELEC.tv/blob/12207af344a0de3341243325bd8400df043fd81d/projects/Allwinner/patches/linux/0240-drm-sun4i-Share-the-DE33-DMA-address-space.patch
 [aiyengar: sun50i_wb.c and sun8i_rdma_init() hunks dropped: this tree
- has neither the writeback driver nor DE33 RCQ]
+ has neither the writeback driver nor DE33 RCQ; DMA mask 32 bits, as
+ the layers write only the low address registers]
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
@@ -39,7 +40,7 @@ index 6469de1..8ec8fbe 100644
  	void __iomem *regs;
 +	int ret;
 +
-+	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(40));
++	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 +	if (ret)
 +		return dev_err_probe(dev, ret, "Cannot set DMA mask\n");
  
