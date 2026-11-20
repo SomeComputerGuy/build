@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 20 Nov 2026 08:00:00 +0000
+Subject: wireless: uwe5622: do not read a sent command on timeout
+
+The vendor's bugfix update (uwe5622-allwinner-bugfix-v6.3.patch in the
+old Armbian stack) has this change; the uwe5622 repo base lacks it.
+
+A sent command belongs to the tx path, which frees it after transfer or
+when it drops it as expired. The timeout message in
+sprdwl_cmd_send_recv() still read mstime from it:
+
+  BUG: KASAN: slab-use-after-free in sprdwl_cmd_send_recv+0xcf4/0xf60 [sprdwl_ng]
+  Freed by task 877:
+   kfree+0x24c/0x490
+   sprdwl_tx_cmd.isra.0+0x3c4/0x600 [sprdwl_ng]
+   sprdwl_tx_work_queue+0x14c/0x620 [sprdwl_ng]
+
+Print the copy in g_sprdwl_cmd instead.
+
+Upstream: to be submitted to https://github.com/armbian/uwe5622
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/net/wireless/uwe5622/unisocwifi/cmdevt.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/net/wireless/uwe5622/unisocwifi/cmdevt.c b/drivers/net/wireless/uwe5622/unisocwifi/cmdevt.c
+--- a/drivers/net/wireless/uwe5622/unisocwifi/cmdevt.c
++++ b/drivers/net/wireless/uwe5622/unisocwifi/cmdevt.c
+@@ -617,7 +617,7 @@ int sprdwl_cmd_send_recv(struct sprdwl_p
+ 		}
+ 	} else {
+ 		wl_err("ctx_id:%d cmd: %s[%d] rsp timeout (mstime = %d), num=%d\n",
+-		       ctx_id, cmd2str(cmd_id), cmd_id, le32_to_cpu(hdr->mstime),
++		       ctx_id, cmd2str(cmd_id), cmd_id, cmd->mstime,
+ 		       tx_msg->cmd_send);
+ 		if (cmd_id == WIFI_CMD_CLOSE) {
+ 			sprdwl_atcmd_assert(priv, ctx_id, cmd_id, CMD_RSP_TIMEOUT_ERROR);
