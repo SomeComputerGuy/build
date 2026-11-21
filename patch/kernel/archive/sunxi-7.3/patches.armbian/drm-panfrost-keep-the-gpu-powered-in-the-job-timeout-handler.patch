@@ -1,0 +1,66 @@
+From d41a7f61b6e9ac49d3218313c18a1f02cc59616c Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 20 Nov 2026 08:50:07 +0000
+Subject: [PATCH 13/15] drm/panfrost: Keep the GPU powered in the job timeout
+ handler
+
+panfrost_job_timedout() reads the job slot registers and resets the GPU
+without a runtime PM reference of its own. If the job completes after
+the fence check, it drops its reference, and the GPU can autosuspend
+before those accesses (with its clocks off on GPU_PM_RT platforms: an
+external abort).
+
+Hold a reference across the handler. It need not resume the GPU: if the
+fence is still not signalled once it is taken, the job's own reference
+was held at that point.
+
+Fixes: f3ba91228e8e ("drm/panfrost: Add initial panfrost driver")
+Cc: stable@vger.kernel.org
+Reported-by: Sashiko <sashiko-bot@kernel.org>
+Closes: https://lore.kernel.org/all/sashiko-outbox-212575@kernel.org/
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/panfrost/panfrost_job.c | 20 ++++++++++++++++++--
+ 1 file changed, 18 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
+index 83996b3..5cf8c54 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_job.c
++++ b/drivers/gpu/drm/panfrost/panfrost_job.c
+@@ -799,8 +799,8 @@ panfrost_reset(struct panfrost_device *pfdev,
+ 	dma_fence_end_signalling(cookie);
+ }
+ 
+-static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
+-						     *sched_job)
++static enum drm_gpu_sched_stat
++panfrost_job_handle_timeout(struct drm_sched_job *sched_job)
+ {
+ 	struct panfrost_job *job = to_panfrost_job(sched_job);
+ 	struct panfrost_device *pfdev = job->pfdev;
+@@ -845,6 +845,22 @@ static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
+ 	return DRM_GPU_SCHED_STAT_RESET;
+ }
+ 
++static enum drm_gpu_sched_stat panfrost_job_timedout(struct drm_sched_job
++						     *sched_job)
++{
++	struct panfrost_device *pfdev = to_panfrost_job(sched_job)->pfdev;
++	enum drm_gpu_sched_stat stat;
++
++	/* The job drops its reference when its fence is signalled. If it is
++	 * not signalled after this, the GPU was and stays powered.
++	 */
++	pm_runtime_get_noresume(pfdev->base.dev);
++	stat = panfrost_job_handle_timeout(sched_job);
++	pm_runtime_put_autosuspend(pfdev->base.dev);
++
++	return stat;
++}
++
+ static void panfrost_reset_work(struct work_struct *work)
+ {
+ 	struct panfrost_device *pfdev;
+-- 
+2.55.0
+

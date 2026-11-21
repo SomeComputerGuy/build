@@ -1,7 +1,7 @@
-From ffb1fdd7e4d72c3cc32f7f3a4ef338b81da4c08c Mon Sep 17 00:00:00 2001
+From a133d9a7efef1770b3271487dcbcf13ad5f5cfcc Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 03:43:56 +0000
-Subject: [PATCH 06/14] drm/panfrost: Give back the pages of a heap chunk that
+Subject: [PATCH 06/15] drm/panfrost: Give back the pages of a heap chunk that
  failed to map
 
 panfrost_mmu_map_fault_addr() grows a heap BO by one 2 MB chunk per
