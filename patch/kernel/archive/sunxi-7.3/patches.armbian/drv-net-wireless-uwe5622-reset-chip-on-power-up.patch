@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 21 Nov 2026 04:01:00 +0000
+Subject: wireless: uwe5622: reset the chip when powering it up again
+
+On Allwinner boards sdiohal_remove_card() keeps the card and the SDIO
+driver in place when the chip is powered down. Powering it up again
+registers the driver a second time, which fails, and start_marlin()
+times out waiting for the card. Once WLAN and Bluetooth were both off,
+for example after a CP2 reset, the chip cannot be powered up again.
+
+Reset the chip through the MMC core instead, as the Rockchip start-up
+retry does, and report the card as a probe does.
+
+Upstream: to be submitted to https://github.com/armbian/uwe5622
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../uwe5622/unisocwcn/sdio/sdiohal_main.c     | 21 +++++++++++++++++--
+ 1 file changed, 19 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/wireless/uwe5622/unisocwcn/sdio/sdiohal_main.c b/drivers/net/wireless/uwe5622/unisocwcn/sdio/sdiohal_main.c
+index 22f88a6..a7937d1 100644
+--- a/drivers/net/wireless/uwe5622/unisocwcn/sdio/sdiohal_main.c
++++ b/drivers/net/wireless/uwe5622/unisocwcn/sdio/sdiohal_main.c
+@@ -2168,8 +2168,8 @@ void sdiohal_remove_card(void)
+ /*
+  * Power-cycle the chip through the MMC core and enable function 1 again.
+  * On boards with an mmc-pwrseq this pulses the chip's reset line, the same
+- * as unbinding and rebinding the SDIO host. Only used during start-up,
+- * before the SDIO interrupt is claimed and before firmware is loaded.
++ * as unbinding and rebinding the SDIO host. Only used while powering the
++ * chip up, before the SDIO interrupt is claimed and before firmware is loaded.
+  */
+ int sdiohal_hw_reset_card(void)
+ {
+@@ -2280,6 +2280,23 @@ int sdiohal_scan_card(void)
+ 		return 0;
+ #endif
+ 
++#ifdef CONFIG_AW_BOARD
++		/*
++		 * sdiohal_remove_card() leaves the card and this driver in
++		 * place here, so registering the driver again below would
++		 * fail. Reset the chip instead and report the card as a
++		 * probe does.
++		 */
++		ret = sdiohal_hw_reset_card();
++		if (ret)
++			return ret;
++		atomic_set(&p_data->xmit_start, 1);
++		if (scan_card_notify != NULL)
++			scan_card_notify();
++		sdiohal_info("scan end!\n");
++		return 0;
++#endif
++
+ 		sdiohal_remove_card();
+ 		msleep(100);
+ 	}

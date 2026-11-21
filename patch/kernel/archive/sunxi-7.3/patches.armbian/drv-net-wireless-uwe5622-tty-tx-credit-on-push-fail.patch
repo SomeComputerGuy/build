@@ -1,0 +1,37 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 21 Nov 2026 04:03:00 +0000
+Subject: wireless: uwe5622: tty-sdio: return the TX credit when a push fails
+
+mtty_write() and marlin_sdio_write() take a TX credit before pushing a
+buffer and only the TX completion gives it back. A failed push, as
+during a chip reset, kept the credit; after 63 failures every write
+blocks for good.
+
+Upstream: to be submitted to https://github.com/armbian/uwe5622
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/net/wireless/uwe5622/tty-sdio/tty.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/drivers/net/wireless/uwe5622/tty-sdio/tty.c b/drivers/net/wireless/uwe5622/tty-sdio/tty.c
+index 01ca0dd..0552e6e 100644
+--- a/drivers/net/wireless/uwe5622/tty-sdio/tty.c
++++ b/drivers/net/wireless/uwe5622/tty-sdio/tty.c
+@@ -462,6 +462,7 @@ static int mtty_write(struct tty_struct *tty,
+ 		kfree(tx_head->buf);
+ 		tx_head->buf = NULL;
+ 		sprdwcn_bus_list_free(BT_TX_CHANNEL, tx_head, tx_tail, num);
++		up(&sem_id);
+ 		return -EBUSY;
+ 	}
+ 
+@@ -814,6 +815,7 @@ int marlin_sdio_write(const unsigned char *buf, int count)
+ 		kfree(tx_head->buf);
+ 		tx_head->buf = NULL;
+ 		sprdwcn_bus_list_free(BT_TX_CHANNEL, tx_head, tx_tail, num);
++		up(&sem_id);
+ 		return -EBUSY;
+ 	}
+ 
