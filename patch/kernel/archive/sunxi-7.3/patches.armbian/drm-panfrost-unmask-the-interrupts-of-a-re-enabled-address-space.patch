@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 21 Nov 2026 08:35:56 +0000
+Subject: [PATCH 3/3] drm/panfrost: Unmask the interrupts of a re-enabled
+ address space
+
+Sashiko reported this in a review of an unrelated patch.
+
+After an unhandled page fault, the address space is added to
+as_faulty_mask, its MMU is disabled, and the IRQ thread unmasks every
+interrupt but the ones of that AS. panfrost_mmu_as_get() re-enables the
+AS for the next job, but it writes ~as_faulty_mask to MMU_INT_MASK
+before it removes the AS from as_faulty_mask, so the interrupts of the
+AS stay masked. The next fault on it, a heap growth fault for example,
+raises no interrupt, and the job hangs until the scheduler timeout
+resets the GPU.
+
+Remove the AS from as_faulty_mask before writing the mask.
+
+Fixes: ed7a34c57def ("drm/panfrost: Disable the AS on unhandled page faults")
+Reported-by: Sashiko <sashiko-bot@kernel.org>
+Closes: https://lore.kernel.org/all/20260811215454.A1C8D1F000E9@smtp.kernel.org/
+Cc: stable@vger.kernel.org
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/panfrost/panfrost_mmu.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_mmu.c b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+index 70fa751..289cbac 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_mmu.c
++++ b/drivers/gpu/drm/panfrost/panfrost_mmu.c
+@@ -283,9 +283,9 @@ int panfrost_mmu_as_get(struct panfrost_device *pfdev, struct panfrost_mmu *mmu)
+ 			 * disabled. We need to re-enable the MMU after
+ 			 * clearing+unmasking the AS interrupts.
+ 			 */
++			pfdev->as_faulty_mask &= ~mask;
+ 			mmu_write(pfdev, MMU_INT_CLEAR, mask);
+ 			mmu_write(pfdev, MMU_INT_MASK, ~pfdev->as_faulty_mask);
+-			pfdev->as_faulty_mask &= ~mask;
+ 			panfrost_mmu_enable(pfdev, mmu);
+ 		}
+ 
+-- 
+2.55.0
+
