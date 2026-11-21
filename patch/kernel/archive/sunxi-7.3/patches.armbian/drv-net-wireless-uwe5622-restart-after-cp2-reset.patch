@@ -1,0 +1,299 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 21 Nov 2026 04:02:00 +0000
+Subject: wireless: uwe5622: restart WLAN and Bluetooth after a CP2 reset
+
+After a firmware assert or a missed loopcheck ack, the CP2 reset powers
+WLAN and Bluetooth down and nothing powers them up again; both stay dead
+until reboot. The "ready" notification that should follow the reset is
+commented out.
+
+Send it. WLAN probes its device again, which powers the chip up and
+loads the firmware. Bluetooth powers its core up again if it was on,
+sends PSKEY/RF again and then reports an HCI Hardware Error event, so
+the host stack resets the controller. The vendor event sent so far
+(ff 02 57 a5) is meant for the Android Bluetooth HAL; BlueZ ignores it.
+
+Also remove the Bluetooth reset notifier when the driver goes away.
+
+Upstream: to be submitted to https://github.com/armbian/uwe5622
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ .../net/wireless/uwe5622/tty-sdio/rfkill.c    | 77 ++++++++++++++-----
+ .../net/wireless/uwe5622/tty-sdio/rfkill.h    |  1 +
+ drivers/net/wireless/uwe5622/tty-sdio/tty.c   | 53 ++++++-------
+ .../unisocwcn/include/marlin_platform.h       |  1 +
+ .../uwe5622/unisocwcn/platform/wcn_procfs.c   |  4 +-
+ .../net/wireless/uwe5622/unisocwifi/wl_core.c | 17 ++++
+ 6 files changed, 106 insertions(+), 47 deletions(-)
+
+diff --git a/drivers/net/wireless/uwe5622/tty-sdio/rfkill.c b/drivers/net/wireless/uwe5622/tty-sdio/rfkill.c
+index 3bbd13f..8a7bb51 100644
+--- a/drivers/net/wireless/uwe5622/tty-sdio/rfkill.c
++++ b/drivers/net/wireless/uwe5622/tty-sdio/rfkill.c
+@@ -15,6 +15,7 @@
+ #include <linux/delay.h>
+ #include <linux/device.h>
+ #include <linux/module.h>
++#include <linux/mutex.h>
+ #include <linux/platform_device.h>
+ #include <linux/rfkill.h>
+ #include <linux/gpio.h>
+@@ -35,41 +36,79 @@ static struct rfkill *bt_rfk;
+ static struct device *bt_dev;
+ static const char bt_name[] = "bluetooth";
+ 
+-static int bluetooth_set_power(void *data, bool blocked)
++/* Serialises the rfkill callback with the restart after a CP2 reset. */
++static DEFINE_MUTEX(bt_power_lock);
++static bool bt_powered;
++
++static int bluetooth_power_on(void)
+ {
+ 	int ret;
+ 
++	ret = start_marlin(MARLIN_BLUETOOTH);
++	if (ret) {
++		pr_err("%s: start_marlin failed: %d\n", __func__, ret);
++		return ret;
++	}
++	/*
++	 * The core is powered but unconfigured; send PSKEY/RF/enable
++	 * so that a plain HCI line discipline can drive it. On failure
++	 * power it down again and report the error, so the rfkill
++	 * switch stays blocked and userspace can retry.
++	 */
++	ret = sprd_bt_init(bt_dev);
++	if (ret) {
++		pr_err("%s: Bluetooth vendor init failed: %d\n",
++			__func__, ret);
++		stop_marlin(MARLIN_BLUETOOTH);
++	}
++	return ret;
++}
++
++static int bluetooth_set_power(void *data, bool blocked)
++{
++	int ret = 0;
++
+ 	pr_info("%s: start_block=%d\n", __func__, blocked);
++	mutex_lock(&bt_power_lock);
+ 	if (!blocked) {
+-		ret = start_marlin(MARLIN_BLUETOOTH);
+-		if (ret) {
+-			pr_err("%s: start_marlin failed: %d\n", __func__, ret);
+-			return ret;
+-		}
+-		/*
+-		 * The core is powered but unconfigured; send PSKEY/RF/enable
+-		 * so that a plain HCI line discipline can drive it. On failure
+-		 * power it down again and report the error, so the rfkill
+-		 * switch stays blocked and userspace can retry.
+-		 */
+-		ret = sprd_bt_init(bt_dev);
+-		if (ret) {
+-			pr_err("%s: Bluetooth vendor init failed: %d\n",
+-				__func__, ret);
+-			stop_marlin(MARLIN_BLUETOOTH);
+-			return ret;
+-		}
++		ret = bluetooth_power_on();
++		bt_powered = !ret;
+ 	} else {
++		bt_powered = false;
+ 		sprd_bt_init_invalidate();
+ 		ret = stop_marlin(MARLIN_BLUETOOTH);
+ 		if (ret)
+ 			pr_err("%s: stop_marlin failed: %d\n", __func__, ret);
++		ret = 0;
+ 	}
++	mutex_unlock(&bt_power_lock);
++	if (ret)
++		return ret;
+ 
+ 	pr_info("%s: end_block=%d\n", __func__, blocked);
+ 	return 0;
+ }
+ 
++/*
++ * After a CP2 reset the core is off: power and configure it again if it was
++ * on. Returns 1 if it was restarted, 0 if it is off, or an error.
++ */
++int rfkill_bluetooth_restart(void)
++{
++	int ret = 0;
++
++	mutex_lock(&bt_power_lock);
++	if (bt_powered) {
++		ret = bluetooth_power_on();
++		if (ret)
++			bt_powered = false;
++		else
++			ret = 1;
++	}
++	mutex_unlock(&bt_power_lock);
++	return ret;
++}
++
+ static struct rfkill_ops rfkill_bluetooth_ops = {
+ 	.set_block = bluetooth_set_power,
+ };
+diff --git a/drivers/net/wireless/uwe5622/tty-sdio/rfkill.h b/drivers/net/wireless/uwe5622/tty-sdio/rfkill.h
+index 3dcfb01..199da5f 100644
+--- a/drivers/net/wireless/uwe5622/tty-sdio/rfkill.h
++++ b/drivers/net/wireless/uwe5622/tty-sdio/rfkill.h
+@@ -21,5 +21,6 @@
+ 
+ int rfkill_bluetooth_init(struct platform_device *pdev);
+ int rfkill_bluetooth_remove(struct platform_device *pdev);
++int rfkill_bluetooth_restart(void);
+ 
+ #endif
+diff --git a/drivers/net/wireless/uwe5622/tty-sdio/tty.c b/drivers/net/wireless/uwe5622/tty-sdio/tty.c
+index 91e6bc5..01ca0dd 100644
+--- a/drivers/net/wireless/uwe5622/tty-sdio/tty.c
++++ b/drivers/net/wireless/uwe5622/tty-sdio/tty.c
+@@ -645,37 +645,36 @@ struct mchn_ops_t bt_tx_ops = {
+ #endif
+ };
+ 
+-static int bluetooth_reset(struct notifier_block *this, unsigned long ev, void *ptr)
++static void mtty_bt_restart(struct work_struct *work)
+ {
+-#define RESET_BUFSIZE 5
+-	int ret = 0;
+-	int block_size = RESET_BUFSIZE;
+-	unsigned char reset_buf[RESET_BUFSIZE] = {0x04, 0xff, 0x02, 0x57, 0xa5};
++	/* HCI Hardware Error event: the host stack resets the controller */
++	static const unsigned char hw_error[] = {0x04, 0x10, 0x01, 0x00};
++	int ret;
++
++	ret = rfkill_bluetooth_restart();
++	if (ret <= 0) {
++		if (ret)
++			pr_err("%s: Bluetooth restart failed: %d\n", __func__, ret);
++		return;
++	}
++	pr_info("%s: Bluetooth restarted\n", __func__);
++	if (mtty_dev && atomic_read(&mtty_dev->state) == MTTY_STATE_OPEN &&
++	    tty_insert_flip_string(mtty_dev->port, hw_error, sizeof(hw_error)))
++		tty_flip_buffer_push(mtty_dev->port);
++}
+ 
+-	if (!ev) {
++static DECLARE_WORK(mtty_bt_restart_work, mtty_bt_restart);
++
++static int bluetooth_reset(struct notifier_block *this, unsigned long ev, void *ptr)
++{
++	if (ev == MARLIN_CP2_STS_ASSERTED) {
+ 		pr_info("%s:reset callback coming\n", __func__);
+-		/* the firmware restarted: PSKEY/RF must be sent again */
++		/* the firmware restarts: PSKEY/RF must be sent again */
+ 		sprd_bt_init_invalidate();
+-		if (mtty_dev != NULL) {
+-			if (!work_pending(&mtty_dev->bt_rx_work)) {
+-				pr_info("%s tty_insert_flip_string", __func__);
+-				while (ret < block_size) {
+-					pr_info("%s before tty_insert_flip_string ret: %d, len: %d\n",
+-							__func__, ret, RESET_BUFSIZE);
+-					ret = tty_insert_flip_string(mtty_dev->port,
+-							(unsigned char *)reset_buf,
+-							RESET_BUFSIZE);   // -BT_SDIO_HEAD_LEN
+-					pr_info("%s ret: %d, len: %d\n", __func__, ret, RESET_BUFSIZE);
+-					if (ret)
+-						tty_flip_buffer_push(mtty_dev->port);
+-					block_size = block_size - ret;
+-					ret = 0;
+-				}
+-			}
+-		}
+-		ret = NOTIFY_DONE;
++	} else if (ev == MARLIN_CP2_STS_READY) {
++		schedule_work(&mtty_bt_restart_work);
+ 	}
+-	return ret;
++	return NOTIFY_DONE;
+ }
+ 
+ static struct notifier_block bluetooth_reset_block = {
+@@ -845,6 +844,8 @@ static int mtty_remove(struct platform_device *pdev)
+ {
+ 	struct mtty_device *mtty = platform_get_drvdata(pdev);
+ 
++	marlin_reset_callback_unregister(MARLIN_BLUETOOTH, &bluetooth_reset_block);
++	cancel_work_sync(&mtty_bt_restart_work);
+ 	/* Unregister first: its set_block callback must not run during teardown */
+ 	rfkill_bluetooth_remove(pdev);
+ 	mtty_tty_driver_exit(mtty);
+diff --git a/drivers/net/wireless/uwe5622/unisocwcn/include/marlin_platform.h b/drivers/net/wireless/uwe5622/unisocwcn/include/marlin_platform.h
+index b9e23cc..5c06523 100644
+--- a/drivers/net/wireless/uwe5622/unisocwcn/include/marlin_platform.h
++++ b/drivers/net/wireless/uwe5622/unisocwcn/include/marlin_platform.h
+@@ -84,6 +84,7 @@ enum marlin_wake_host_en {
+ 
+ enum marlin_cp2_status {
+ 	MARLIN_CP2_STS_ASSERTED = 0,
++	MARLIN_CP2_STS_READY,
+ };
+ 
+ enum wcn_hw_type wcn_get_hw_if_type(void);
+diff --git a/drivers/net/wireless/uwe5622/unisocwcn/platform/wcn_procfs.c b/drivers/net/wireless/uwe5622/unisocwcn/platform/wcn_procfs.c
+index 0053f16..550fc0e 100644
+--- a/drivers/net/wireless/uwe5622/unisocwcn/platform/wcn_procfs.c
++++ b/drivers/net/wireless/uwe5622/unisocwcn/platform/wcn_procfs.c
+@@ -120,7 +120,7 @@ void mdbg_assert_interface(char *str)
+ 	marlin_reset_notify_call(MARLIN_CP2_STS_ASSERTED);
+ 	marlin_cp2_reset();
+ 	msleep(1000);
+-	// marlin_reset_notify_call(MARLIN_CP2_STS_READY);
++	marlin_reset_notify_call(MARLIN_CP2_STS_READY);
+ #endif
+ 
+ }
+@@ -180,7 +180,7 @@ int mdbg_assert_read(int channel, struct mbuf_t *head,
+ 		marlin_reset_notify_call(MARLIN_CP2_STS_ASSERTED);
+ 		marlin_cp2_reset();
+ 		msleep(1000);
+-		// marlin_reset_notify_call(MARLIN_CP2_STS_READY);
++		marlin_reset_notify_call(MARLIN_CP2_STS_READY);
+ #endif
+ 	return 0;
+ }
+diff --git a/drivers/net/wireless/uwe5622/unisocwifi/wl_core.c b/drivers/net/wireless/uwe5622/unisocwifi/wl_core.c
+index 1cff521..1a35c0f 100644
+--- a/drivers/net/wireless/uwe5622/unisocwifi/wl_core.c
++++ b/drivers/net/wireless/uwe5622/unisocwifi/wl_core.c
+@@ -569,8 +569,22 @@ static int wifi_exception_event(void)
+ 	return 0;
+ }
+ 
++/* The reset tore the interface down; a new probe sets it up on the restarted chip. */
++static void sprdwl_reprobe(struct work_struct *work)
++{
++	if (device_reprobe(sprdwl_dev))
++		wl_err("cp2 reset: probing again failed\n");
++}
++
++static DECLARE_WORK(sprdwl_reprobe_work, sprdwl_reprobe);
++
+ static int wifi_reset_callback(struct notifier_block *nb, unsigned long event, void *v)
+ {
++	if (event == MARLIN_CP2_STS_READY) {
++		schedule_work(&sprdwl_reprobe_work);
++		return NOTIFY_OK;
++	}
++
+ 	sprdwl_wifi_reset();
+ 	wifi_exception_event();
+ 	return NOTIFY_OK;
+@@ -767,6 +781,9 @@ static int __init unisoc_wlan_init(void)
+ static void __exit unisoc_wlan_exit(void)
+ {
+     platform_driver_unregister(&sprdwl_driver);
++#ifdef CP2_RESET_SUPPORT
++    cancel_work_sync(&sprdwl_reprobe_work);
++#endif
+     platform_device_del(unisoc_pdev);
+ }
+ 
