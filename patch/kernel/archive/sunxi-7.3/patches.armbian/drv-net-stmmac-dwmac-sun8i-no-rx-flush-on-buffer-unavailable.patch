@@ -1,0 +1,71 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 20 Nov 2026 08:26:15 +0000
+Subject: [PATCH 3/5] net: stmmac: dwmac-sun8i: disable flushing frames on RX
+ buffer unavailable
+
+Same change as commit 45d100ee0d6e ("net: stmmac: dwmac: Disable
+flushing frames on Rx Buffer Unavailable") for dwmac1000.
+
+With FLUSH_RX_FRM clear (the reset value), the EMAC drops the frames in
+its RX FIFO whenever the RX DMA finds no free descriptor, and no counter
+sees them. In store-and-forward mode keep them in the FIFO, and write
+RX_DMA_START after a refill to resume the suspended RX DMA, as
+dwmac1000 issues a receive poll demand.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
+--- a/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
++++ b/drivers/net/ethernet/stmicro/stmmac/dwmac-sun8i.c
+@@ -220,6 +220,7 @@ static const struct emac_variant emac_variant_h6 = {
+ #define EMAC_FRM_FLT_MULTICAST          BIT(16)
+ 
+ /* Used in RX_CTL1*/
++#define EMAC_RX_NO_FLUSH        BIT(0)
+ #define EMAC_RX_MD              BIT(1)
+ #define EMAC_RX_TH_MASK		GENMASK(5, 4)
+ /* RX_CTL1 RX_TH encoding (H616 UM 6.5.10): 00 = 64, 01 = 32 bytes */
+@@ -496,6 +497,16 @@ static void sun8i_dwmac_dma_start_rx(struct stmmac_priv *priv,
+ 	writel(v, ioaddr + EMAC_RX_CTL1);
+ }
+ 
++/* Resume an RX DMA suspended on a descriptor it did not own */
++static void sun8i_dwmac_enable_dma_reception(void __iomem *ioaddr, u32 chan)
++{
++	u32 v;
++
++	v = readl(ioaddr + EMAC_RX_CTL1);
++	v |= EMAC_RX_DMA_START;
++	writel(v, ioaddr + EMAC_RX_CTL1);
++}
++
+ static void sun8i_dwmac_dma_stop_rx(struct stmmac_priv *priv,
+ 				    void __iomem *ioaddr, u32 chan)
+ {
+@@ -602,9 +613,9 @@ static void sun8i_dwmac_dma_operation_mode_rx(struct stmmac_priv *priv,
+ 
+ 	v = readl(ioaddr + EMAC_RX_CTL1);
+ 	if (mode == SF_DMA_MODE) {
+-		v |= EMAC_RX_MD;
++		v |= EMAC_RX_MD | EMAC_RX_NO_FLUSH;
+ 	} else {
+-		v &= ~EMAC_RX_MD;
++		v &= ~(EMAC_RX_MD | EMAC_RX_NO_FLUSH);
+ 		v &= ~EMAC_RX_TH_MASK;
+ 		/* the smallest threshold of at least @mode bytes */
+ 		if (mode <= 32)
+@@ -659,6 +670,7 @@ static const struct stmmac_dma_ops sun8i_dwmac_dma_ops = {
+ 	.dma_rx_mode = sun8i_dwmac_dma_operation_mode_rx,
+ 	.dma_tx_mode = sun8i_dwmac_dma_operation_mode_tx,
+ 	.enable_dma_transmission = sun8i_dwmac_enable_dma_transmission,
++	.enable_dma_reception = sun8i_dwmac_enable_dma_reception,
+ 	.enable_dma_irq = sun8i_dwmac_enable_dma_irq,
+ 	.disable_dma_irq = sun8i_dwmac_disable_dma_irq,
+ 	.start_tx = sun8i_dwmac_dma_start_tx,
+-- 
+2.55.0
