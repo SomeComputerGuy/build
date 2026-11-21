@@ -1,7 +1,7 @@
-From 675412f18222a602a7dfc873955ea90ae8c9da73 Mon Sep 17 00:00:00 2001
+From 3486c04f2439314f452e97f9ed7f9085cb4f5330 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 08:30:41 +0000
-Subject: [PATCH 02/14] drm/panfrost: Refuse to sync the CPU caches of a heap
+Subject: [PATCH 02/15] drm/panfrost: Refuse to sync the CPU caches of a heap
  BO
 
 panfrost_gem_sync() calls drm_gem_shmem_get_pages_sgt() on any BO that is
