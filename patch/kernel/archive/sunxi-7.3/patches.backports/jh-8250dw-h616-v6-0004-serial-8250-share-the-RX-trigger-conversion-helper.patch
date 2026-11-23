@@ -1,0 +1,82 @@
+From d8e059192a02435f15b33144aa2311ef84103eb9 Mon Sep 17 00:00:00 2001
+From: James Hilliard <james.hilliard1@gmail.com>
+Date: Mon, 2 Nov 2026 12:55:17 -0700
+Subject: [PATCH 4/9] serial: 8250: share the RX trigger conversion helper
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Drivers can supply receive-trigger thresholds through the RX trigger
+callbacks without adding a legacy port type to uart_config[]. Extract the
+threshold search into serial8250_bytes_to_fcr() so those drivers can use
+the same conversion as the generic 8250 implementation.
+
+Keep the implementation in 8250_port.c and export it in the SERIAL_8250
+namespace. Include the unsupported-table check and preserve the existing
+nearest-lower selection and highest-encoding fallback.
+
+Suggested-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Reviewed-by: Andy Shevchenko <andriy.shevchenko@linux.intel.com>
+Reviewed-by: Ilpo Järvinen <ilpo.jarvinen@linux.intel.com>
+Signed-off-by: James Hilliard <james.hilliard1@gmail.com>
+---
+ drivers/tty/serial/8250/8250.h      |  2 ++
+ drivers/tty/serial/8250/8250_port.c | 21 +++++++++++++--------
+ 2 files changed, 15 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/tty/serial/8250/8250.h b/drivers/tty/serial/8250/8250.h
+index 9337fec..4941184 100644
+--- a/drivers/tty/serial/8250/8250.h
++++ b/drivers/tty/serial/8250/8250.h
+@@ -73,6 +73,8 @@ struct serial8250_config {
+ 	unsigned int	flags;
+ };
+ 
++int serial8250_bytes_to_fcr(const unsigned char *rxtrig_bytes, unsigned char bytes);
++
+ #define UART_CAP_FIFO	BIT(8)	/* UART has FIFO */
+ #define UART_CAP_EFR	BIT(9)	/* UART has EFR */
+ #define UART_CAP_SLEEP	BIT(10)	/* UART has IER sleep */
+diff --git a/drivers/tty/serial/8250/8250_port.c b/drivers/tty/serial/8250/8250_port.c
+index b01baff..32871e6 100644
+--- a/drivers/tty/serial/8250/8250_port.c
++++ b/drivers/tty/serial/8250/8250_port.c
+@@ -2991,22 +2991,27 @@ static int fcr_get_rxtrig_bytes(struct uart_8250_port *up)
+ 	return bytes ? bytes : -EOPNOTSUPP;
+ }
+ 
+-static int bytes_to_fcr_rxtrig(struct uart_8250_port *up, unsigned char bytes)
++int serial8250_bytes_to_fcr(const unsigned char *rxtrig_bytes, unsigned char bytes)
+ {
+-	const struct serial8250_config *conf_type = &uart_config[up->port.type];
+-	int i;
+-
+-	if (!conf_type->rxtrig_bytes[UART_FCR_R_TRIG_BITS(UART_FCR_R_TRIG_00)])
++	if (!rxtrig_bytes[UART_FCR_R_TRIG_BITS(UART_FCR_R_TRIG_00)])
+ 		return -EOPNOTSUPP;
+ 
+-	for (i = 1; i < UART_FCR_R_TRIG_MAX_STATE; i++) {
+-		if (bytes < conf_type->rxtrig_bytes[i])
++	for (unsigned int i = 1; i < UART_FCR_R_TRIG_MAX_STATE; i++) {
++		if (bytes < rxtrig_bytes[i])
+ 			/* Use the nearest lower value */
+-			return (--i) << UART_FCR_R_TRIG_SHIFT;
++			return (i - 1) << UART_FCR_R_TRIG_SHIFT;
+ 	}
+ 
+ 	return UART_FCR_R_TRIG_11;
+ }
++EXPORT_SYMBOL_NS_GPL(serial8250_bytes_to_fcr, "SERIAL_8250");
++
++static int bytes_to_fcr_rxtrig(struct uart_8250_port *up, unsigned char bytes)
++{
++	const struct serial8250_config *conf_type = &uart_config[up->port.type];
++
++	return serial8250_bytes_to_fcr(conf_type->rxtrig_bytes, bytes);
++}
+ 
+ static int do_get_rxtrig(struct tty_port *port)
+ {
+-- 
+2.55.0
+

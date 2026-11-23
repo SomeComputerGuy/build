@@ -1,0 +1,58 @@
+From deac52fbfd5ba18b92da101d42f79f2a8261b1d9 Mon Sep 17 00:00:00 2001
+From: James Hilliard <james.hilliard1@gmail.com>
+Date: Sat, 24 Oct 2026 14:05:57 -0600
+Subject: [PATCH 1/9] serial: 8250: clear RX trigger callbacks when removing a
+ port
+
+serial8250_unregister_port() removes the device supplied by a driver and
+normally re-registers the persistent slot as an unknown legacy port. The
+slot retains its RX trigger callbacks and sysfs attribute group, so the
+replacement rx_trig_bytes attribute can still call the removed driver's
+code. Unloading that driver leaves the callbacks pointing into freed
+module text.
+
+Clear both callbacks after uart_remove_one_port() has drained the old
+sysfs users and before registering the fallback port. Its RX trigger
+attribute then uses the generic handlers, which reject a port without
+FIFO capabilities.
+
+Also copy the callbacks unconditionally during registration. A replacement
+port without custom handlers must use the generic implementation instead
+of inheriting callbacks from the previous owner of the slot.
+
+Fixes: 8a6c543cf8b3 ("serial: 8250: allow UART drivers to override rx_trig_bytes handling")
+Signed-off-by: James Hilliard <james.hilliard1@gmail.com>
+---
+ drivers/tty/serial/8250/8250_core.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/tty/serial/8250/8250_core.c b/drivers/tty/serial/8250/8250_core.c
+index b875d39..7eeda7b 100644
+--- a/drivers/tty/serial/8250/8250_core.c
++++ b/drivers/tty/serial/8250/8250_core.c
+@@ -845,10 +845,8 @@ int serial8250_register_8250_port(const struct uart_8250_port *up)
+ 		uart->port.get_divisor = up->port.get_divisor;
+ 	if (up->port.set_divisor)
+ 		uart->port.set_divisor = up->port.set_divisor;
+-	if (up->port.get_rxtrig)
+-		uart->port.get_rxtrig = up->port.get_rxtrig;
+-	if (up->port.set_rxtrig)
+-		uart->port.set_rxtrig = up->port.set_rxtrig;
++	uart->port.get_rxtrig = up->port.get_rxtrig;
++	uart->port.set_rxtrig = up->port.set_rxtrig;
+ 	if (up->port.startup)
+ 		uart->port.startup = up->port.startup;
+ 	if (up->port.shutdown)
+@@ -930,6 +928,9 @@ void serial8250_unregister_port(int line)
+ 	}
+ 
+ 	uart_remove_one_port(&serial8250_reg, &uart->port);
++	/* The fallback port must use the generic RX trigger handlers. */
++	uart->port.get_rxtrig = NULL;
++	uart->port.set_rxtrig = NULL;
+ 	if (serial8250_isa_devs) {
+ 		uart->port.flags &= ~UPF_BOOT_AUTOCONF;
+ 		uart->port.type = PORT_UNKNOWN;
+-- 
+2.55.0
+
