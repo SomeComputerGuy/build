@@ -11,8 +11,8 @@ one plane per channel this is what the plane loop programmed so far.
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- drivers/gpu/drm/sun4i/sun8i_mixer.c | 88 +++++++++++++++++++++++------
- 1 file changed, 72 insertions(+), 16 deletions(-)
+ drivers/gpu/drm/sun4i/sun8i_mixer.c | 90 +++++++++++++++++++++++------
+ 1 file changed, 73 insertions(+), 17 deletions(-)
 
 diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
 index 7055d9db4..5ad4a9773 100644
@@ -104,14 +104,16 @@ index 7055d9db4..5ad4a9773 100644
  
  		/*
  		 * Tell the blender whether the pipe already carries
-@@ -716,15 +740,47 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
- 		 * alpha) keep the non-pre-multiplied path, which their global
- 		 * alpha relies on.
+@@ -716,16 +740,48 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+ 		 * without pixel alpha keep the non-pre-multiplied path, which
+ 		 * their global alpha relies on.
  		 */
 -		if (plane->blend_mode_property &&
+-		    plane_state->fb->format->has_alpha &&
 -		    plane_state->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI)
 -			premul |= SUN8I_MIXER_BLEND_PREMULTIPLY_EN(zpos);
 +		ch->premul = plane->blend_mode_property &&
++			     plane_state->fb->format->has_alpha &&
 +			     plane_state->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI;
 +	}
 +
