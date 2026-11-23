@@ -1,13 +1,12 @@
-From 7072c8466ae576060369618cb5615bacac1283e2 Mon Sep 17 00:00:00 2001
+From ee69d637b9b9aa06efbb9ac353b621dc090697b2 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Sat, 21 Nov 2026 04:11:13 +0000
 Subject: [PATCH 01/17] drm/panfrost: Freeze the reset workqueue during system
  sleep
 
-pm_runtime_force_suspend() ignores the usage count, and from
-drm_sched_stop() on the GPU looks idle, so system sleep can power it off
-under a running timeout handler or reset work. Make their workqueue
-freezable: the freezer waits for them before devices are suspended.
+System sleep can power the GPU off under a running timeout handler or
+reset work: pm_runtime_force_suspend() ignores the usage count. Make
+their workqueue freezable, so the freezer waits for them.
 
 Fixes: f3ba91228e8e ("drm/panfrost: Add initial panfrost driver")
 Cc: stable@vger.kernel.org

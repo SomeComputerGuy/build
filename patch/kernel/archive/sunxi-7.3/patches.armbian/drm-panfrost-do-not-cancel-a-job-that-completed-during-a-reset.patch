@@ -1,4 +1,4 @@
-From 6d649b0fbdd27d635f1d59376378a1bfd806153a Mon Sep 17 00:00:00 2001
+From 0ed94f2f7bb34572817c096ac892bf86b6aa1f38 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 08:39:49 +0000
 Subject: [PATCH 10/17] drm/panfrost: Don't cancel a job that completed during

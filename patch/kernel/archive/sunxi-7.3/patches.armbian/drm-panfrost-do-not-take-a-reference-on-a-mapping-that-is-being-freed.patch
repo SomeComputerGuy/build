@@ -1,4 +1,4 @@
-From 13240209a78e67c1b689f381df1dae881db47208 Mon Sep 17 00:00:00 2001
+From 5779bd0e25b2f7adfcb1e00913017b77f75da63c Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 08:32:38 +0000
 Subject: [PATCH 04/17] drm/panfrost: Don't take a reference on a mapping that

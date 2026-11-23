@@ -1,12 +1,13 @@
-From 52bd6b4b65f40140f306deefceca7c07914ec210 Mon Sep 17 00:00:00 2001
+From bfb9126914f3f27bf911eda0b485dd4a39b8c4bb Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Sat, 21 Nov 2026 04:11:26 +0000
 Subject: [PATCH 15/17] drm/panfrost: Keep the job interrupts masked during a
  reset
 
 panfrost_reset() masks the job interrupts without setting
-PANFROST_COMP_BIT_JOB, so an IRQ thread still running unmasks them
-before synchronize_irq() returns. Use panfrost_jm_suspend_irq().
+PANFROST_COMP_BIT_JOB, so a running IRQ thread unmasks them again. Use
+panfrost_jm_suspend_irq(), and mask once more after its
+synchronize_irq(), for a thread that tested the bit just before.
 
 Fixes: 1d0cab5461d7 ("drm/panfrost: Make sure job interrupts are masked before resetting")
 Cc: stable@vger.kernel.org
@@ -14,14 +15,22 @@ Reported-by: Sashiko <sashiko-bot@kernel.org>
 Closes: https://sashiko.dev/#/patchset/20261113-panfrost-long-jobs-v3-0-80ae78d38f6e@gmail.com?part=8
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- drivers/gpu/drm/panfrost/panfrost_job.c | 3 +--
- 1 file changed, 1 insertion(+), 2 deletions(-)
+ drivers/gpu/drm/panfrost/panfrost_job.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index 8ff79ac..d11e9c7 100644
+index 8ff79ac..27a098c 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
-@@ -707,8 +707,7 @@ panfrost_reset(struct panfrost_device *pfdev,
+@@ -465,6 +465,7 @@ void panfrost_jm_suspend_irq(struct panfrost_device *pfdev)
+ 
+ 	job_write(pfdev, JOB_INT_MASK, 0);
+ 	synchronize_irq(pfdev->js->irq);
++	job_write(pfdev, JOB_INT_MASK, 0);
+ }
+ 
+ static void panfrost_job_handle_err(struct panfrost_device *pfdev,
+@@ -707,8 +708,7 @@ panfrost_reset(struct panfrost_device *pfdev,
  	/* Mask job interrupts and synchronize to make sure we won't be
  	 * interrupted during our reset.
  	 */

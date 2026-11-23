@@ -1,4 +1,4 @@
-From 96150b2e417542ac891c821b49c19dcc20138992 Mon Sep 17 00:00:00 2001
+From e924228a02908f7a63a62ec7afa0ab5e6d3f6549 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 03:43:56 +0000
 Subject: [PATCH 07/17] drm/panfrost: Give back the pages of a heap chunk that

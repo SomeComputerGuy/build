@@ -1,4 +1,4 @@
-From cf5d9ab394d306ee5363b44343a43b128127a1fa Mon Sep 17 00:00:00 2001
+From 148f5d22ac423c9a69a497dbf4031377f98bd3a8 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 04:59:29 +0000
 Subject: [PATCH 05/17] drm/panfrost: Don't WARN when a GEM mapping cannot get

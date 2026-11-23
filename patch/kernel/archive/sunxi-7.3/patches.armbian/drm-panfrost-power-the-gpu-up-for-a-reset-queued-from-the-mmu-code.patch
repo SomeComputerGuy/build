@@ -1,4 +1,4 @@
-From 9295a6fb250357acb7309d1bc037e3e5ce2b035b Mon Sep 17 00:00:00 2001
+From 12930c131cf181aae9cfd24347d4191e476e349b Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 08:29:22 +0000
 Subject: [PATCH 02/17] drm/panfrost: Power the GPU up for a reset queued from
