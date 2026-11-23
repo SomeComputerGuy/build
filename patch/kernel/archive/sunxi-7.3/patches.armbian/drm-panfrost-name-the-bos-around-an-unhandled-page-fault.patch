@@ -1,23 +1,21 @@
-From ce26b03489d4c65a7927c1dc297d055609e0ea26 Mon Sep 17 00:00:00 2001
+From 18dd2ffdbae6633b77fa7b9c73dde7a9841dc8e0 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 05:00:27 +0000
-Subject: [PATCH 15/15] drm/panfrost: Name the BOs around an unhandled page
+Subject: [PATCH 17/17] drm/panfrost: Name the BOs around an unhandled page
  fault
 
-An unhandled GPU page fault only reports the faulting VA. That does not
-tell a GPU access just past the end of a buffer (a userspace or hardware
-overrun) from a stale or garbage pointer.
+An unhandled GPU page fault reports only the faulting VA, which does not
+tell an access just past the end of a buffer from a stale or garbage
+pointer.
 
-After the fault report, look the address up in the faulting address
-space and print the BO that contains it, or else the nearest BO below
-and above it: VA range, size, the distance of the fault from it,
-heap/noexec, and the label userspace gave it (Mesa labels its BOs with
-their use, format and size). A BO that has been freed is no longer in the
-address space, so an access to it shows up as a hole between its
-neighbours. Mappings whose last reference is gone, which stay in the
-address space until their teardown takes mm_lock, are skipped. For an
-OpenCL image read on a Mali-G31 this gave (with an earlier version of
-this patch, which also printed whether the BO was mapped):
+Also print the BO that contains the address, or else the nearest BO
+below and above it: VA range, size, distance of the fault from it,
+heap/noexec and the label userspace gave it (Mesa labels its BOs with
+use, format and size). A freed BO has left the address space, so an
+access to it shows up as a hole between its neighbours. Mappings whose
+last reference is gone are skipped. For an OpenCL image read on a
+Mali-G31 this gave (with an earlier version of this patch, which also
+printed "mapped"):
 
   panfrost 1800000.gpu: Unhandled Page fault in AS0 at VA 0x000000000A181000
   ...
@@ -26,7 +24,7 @@ this patch, which also printed whether the BO was mapped):
 that is, the texture unit reading past the end of a 96-bit-per-texel
 texture, which userspace can avoid by padding such textures.
 
-Only the unhandled fault path is affected; heap growth faults are not.
+Heap growth faults are not affected.
 
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---

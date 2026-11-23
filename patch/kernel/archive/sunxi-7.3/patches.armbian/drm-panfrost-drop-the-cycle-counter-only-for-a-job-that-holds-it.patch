@@ -1,20 +1,19 @@
-From 67aef1a5d206145bec410de784a043f1ebcd58b8 Mon Sep 17 00:00:00 2001
+From a12bb8abfcef841f1b17e33a5eeef2d4e4515479 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 03:17:23 +0000
-Subject: [PATCH 10/15] drm/panfrost: Drop the cycle counter only for a job
+Subject: [PATCH 11/17] drm/panfrost: Drop the cycle counter only for a job
  that holds it
 
-panfrost_job_hw_submit() takes a cycle counter reference only when it
-starts the job, which it does not while a reset is pending, but the job
-is put in pfdev->jobs[] either way. panfrost_reset() then drops a
-reference for every job in pfdev->jobs[] that wants the counter, and
-use_count goes below zero. The same happens for a job that was stopped
-(its reference dropped at dequeue) and resubmitted while a reset was
-pending: is_profiled is still set from its first run.
+panfrost_job_hw_submit() puts a job in pfdev->jobs[] but, while a reset
+is pending, does not start it and takes no cycle counter reference.
+panfrost_reset() drops one for every job in pfdev->jobs[] that wants the
+counter, so use_count goes below zero. The same happens for a job that
+was stopped (reference dropped at dequeue) and resubmitted while a reset
+was pending: is_profiled is still set from its first run.
 
-Today a GPU reset follows, and panfrost_gpu_soft_reset() WARNs and sets
-use_count back to 0. Without a reset (patch "Soft-stop and resume a job
-that outlives the timeout") the count stays wrong, and
+Today the GPU reset that follows WARNs in panfrost_gpu_soft_reset() and
+sets use_count back to 0. Without a reset ("Soft-stop and resume a job
+that outlives the timeout") the count stays wrong and
 panfrost_cycle_counter_get() no longer starts the counter.
 
 Record in the job whether it holds a reference, and drop it only then.
@@ -32,7 +31,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  2 files changed, 15 insertions(+), 6 deletions(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index d37ea57..2fcd1f3 100644
+index 4293eae..79e4c21 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -158,6 +158,14 @@ panfrost_get_job_chain_flag(const struct panfrost_job *job)

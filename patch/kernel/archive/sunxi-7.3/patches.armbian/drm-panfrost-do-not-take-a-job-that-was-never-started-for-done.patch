@@ -1,19 +1,19 @@
-From 8096d3575c7361e154c1b7844cd552c34045b49b Mon Sep 17 00:00:00 2001
+From f0ae4eb2d7707e0efb11dcb78343248696f32b04 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 03:17:39 +0000
-Subject: [PATCH 11/15] drm/panfrost: Don't take a job that was never started
+Subject: [PATCH 12/17] drm/panfrost: Don't take a job that was never started
  for done
 
 While a reset is pending, panfrost_job_hw_submit() puts the job in
-pfdev->jobs[] but does not start it, so that the reset resubmits it.
-reset.pending is set before panfrost_reset() masks the job interrupt,
-by a timeout or a job fault. If such a job waits behind a running one
-and that job completes in the window, panfrost_jm_handle_irq() finds
-both subslots inactive and takes the waiting job for done as well. Its
-fence is signalled and its jc cleared, so it is never run.
+pfdev->jobs[] without starting it; the reset resubmits it. But
+reset.pending is set, by a timeout or a job fault, before
+panfrost_reset() masks the job interrupt. If such a job waits behind a
+running one that completes in that window, panfrost_jm_handle_irq()
+finds both subslots inactive and takes the waiting job for done as well.
+Its fence is signalled and its jc cleared, so it is never run.
 
-Mark a job as started when JS_COMMAND_START is written for it, and
-leave a job that was not on the slot for the reset.
+Mark a job as started when JS_COMMAND_START is written for it, and leave
+a job that was not started to the reset.
 
 Found by code review (Sashiko). Not reproduced.
 
@@ -28,7 +28,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  2 files changed, 8 insertions(+), 2 deletions(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index 2fcd1f3..1683bab 100644
+index 79e4c21..b0a5a18 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -259,6 +259,7 @@ static int panfrost_job_hw_submit(struct panfrost_job *job, int js)

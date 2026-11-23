@@ -1,26 +1,13 @@
-From 3486c04f2439314f452e97f9ed7f9085cb4f5330 Mon Sep 17 00:00:00 2001
+From 74c10d8b60a55578ec6fa8c7b73002e9908b678f Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 08:30:41 +0000
-Subject: [PATCH 02/15] drm/panfrost: Refuse to sync the CPU caches of a heap
+Subject: [PATCH 03/17] drm/panfrost: Refuse to sync the CPU caches of a heap
  BO
 
-panfrost_gem_sync() calls drm_gem_shmem_get_pages_sgt() on any BO that is
-not write-combined. Heap BOs are write-combined only on non-coherent
-GPUs; on a coherent one, a PANFROST_SYNC_BO on a heap BO reaches
-drm_gem_shmem_get_pages_sgt() with bo->base.pages being the sparse page
-array of the GPU fault handler, and drm_prime_pages_to_sg() dereferences
-the NULL entries of the chunks not faulted in yet. On a heap BO with no
-chunk faulted in yet, it instead pins the whole heap and leaves
-bo->base.pages set without bo->sgts, and the next GPU fault on the heap
-dereferences the NULL bo->sgts.
-
-Heap BOs are not CPU-mappable (panfrost_ioctl_mmap_bo() refuses them, and
-panfrost_gem_create() refuses PANFROST_BO_WB_MMAP for them), so there is
-nothing to sync: return -EINVAL, as for imported BOs.
-
-Found by code review (Sashiko). Not tested on a coherent GPU: the
-Mali-G31 here is not coherent, so a heap BO is write-combined and the
-sync returned early before.
+On a coherent GPU, PANFROST_SYNC_BO on a heap BO builds an sg table
+from the fault handler's sparse page array and dereferences its NULL
+entries. Heap BOs cannot be CPU-mapped, so there is nothing to sync:
+return -EINVAL, as for imported BOs. Not tested on a coherent GPU.
 
 Fixes: 7be45f548976 ("drm/panfrost: Add a PANFROST_SYNC_BO ioctl")
 Cc: stable@vger.kernel.org

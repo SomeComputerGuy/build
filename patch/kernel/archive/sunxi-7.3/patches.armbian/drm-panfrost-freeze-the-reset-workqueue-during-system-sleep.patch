@@ -1,0 +1,35 @@
+From 0b098769fb894997ed5e4585861c04844f85dde0 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 21 Nov 2026 04:11:13 +0000
+Subject: [PATCH 01/17] drm/panfrost: Freeze the reset workqueue during system
+ sleep
+
+pm_runtime_force_suspend() powers the GPU off even under a running
+timeout handler or reset work. Make their workqueue freezable.
+
+Fixes: f3ba91228e8e ("drm/panfrost: Add initial panfrost driver")
+Cc: stable@vger.kernel.org
+Reported-by: Sashiko <sashiko-bot@kernel.org>
+Closes: https://lore.kernel.org/all/sashiko-outbox-210830@kernel.org/
+Closes: https://sashiko.dev/#/patchset/20261113-panfrost-long-jobs-v3-0-80ae78d38f6e@gmail.com?part=13
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/panfrost/panfrost_job.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
+index d59b486..a3c90c5 100644
+--- a/drivers/gpu/drm/panfrost/panfrost_job.c
++++ b/drivers/gpu/drm/panfrost/panfrost_job.c
+@@ -889,7 +889,7 @@ int panfrost_jm_init(struct panfrost_device *pfdev)
+ 		return ret;
+ 	}
+ 
+-	pfdev->reset.wq = alloc_ordered_workqueue("panfrost-reset", 0);
++	pfdev->reset.wq = alloc_ordered_workqueue("panfrost-reset", WQ_FREEZABLE);
+ 	if (!pfdev->reset.wq)
+ 		return -ENOMEM;
+ 	args.timeout_wq = pfdev->reset.wq;
+-- 
+2.55.0
+

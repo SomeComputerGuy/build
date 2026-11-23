@@ -1,31 +1,14 @@
-From 552986d54bfe61ba720f86c916f10070a89ffcb6 Mon Sep 17 00:00:00 2001
+From cfd63a1c113336bab2dd7ee9644454fee638abeb Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 08:39:49 +0000
-Subject: [PATCH 09/15] drm/panfrost: Don't cancel a job that completed during
+Subject: [PATCH 10/17] drm/panfrost: Don't cancel a job that completed during
  a reset
 
-panfrost_reset() stops the schedulers, which detaches them from the done
-fences of the jobs on the GPU, then soft-stops the slots and handles the
-interrupts that are still pending. A job that finishes in that window
-instead of stopping is completed by panfrost_jm_handle_done(): its done
-fence is signalled and its jc cleared. drm_sched_resubmit_jobs() then
-calls panfrost_job_run(), which returns NULL for a job with no jc, and
-since commit 03877d621db0 ("drm/scheduler: mark jobs without fence as
-canceled") drm_sched_start() completes a pending job without a hardware
-fence with -ECANCELED. The job did complete, but userspace is told it
-did not.
-
-Return the job's done fence instead: drm_sched_start() finds it
-signalled and completes the job with the fence's status, which is 0 for
-a job that finished and the error panfrost_job_handle_err() set for one
-that was hard-stopped or faulted.
-
-This depends on the previous patch: before it, a job cancelled from
-_NEXT could be taken for done in the same window, and would now be
-reported as completed without having run.
-
-Found by code review (Sashiko) of the next patches, which make the
-soft-stop wait longer and the window wider. Not reproduced.
+A job that completes while panfrost_reset() has the schedulers stopped
+gets its done fence signalled and its jc cleared, so panfrost_job_run()
+returns NULL on resubmit and drm_sched_start() cancels it with
+-ECANCELED. Return its done fence instead, so that it completes with its
+own status. Depends on the previous patch. Not reproduced.
 
 Fixes: 03877d621db0 ("drm/scheduler: mark jobs without fence as canceled")
 Cc: stable@vger.kernel.org
@@ -37,7 +20,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 6 insertions(+), 3 deletions(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index 2d7ac0d..d37ea57 100644
+index 6dfbc33..4293eae 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -407,11 +407,14 @@ static struct dma_fence *panfrost_job_run(struct drm_sched_job *sched_job)

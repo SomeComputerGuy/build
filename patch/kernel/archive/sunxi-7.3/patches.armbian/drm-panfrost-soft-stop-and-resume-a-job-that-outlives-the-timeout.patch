@@ -1,7 +1,7 @@
-From 62c8b6c90172fc438b81ca9c412ec23b5776c55e Mon Sep 17 00:00:00 2001
+From ce204586024aaf834ccecbfac6ec3e8251b34c7f Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 05:00:27 +0000
-Subject: [PATCH 14/15] drm/panfrost: Soft-stop and resume a job that outlives
+Subject: [PATCH 16/17] drm/panfrost: Soft-stop and resume a job that outlives
  the timeout
 
 When the 500 ms job timeout fires, panfrost resets the GPU and the job
@@ -66,7 +66,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 196 insertions(+), 30 deletions(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index 5cf8c54..bb7dee4 100644
+index 27a098c..d1cbdca 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -25,6 +25,25 @@
@@ -107,7 +107,7 @@ index 5cf8c54..bb7dee4 100644
  	 */
  	if (WARN_ON(!job))
  		return NULL;
-@@ -671,13 +691,27 @@ static bool panfrost_slots_idle(struct panfrost_device *pfdev)
+@@ -672,13 +692,27 @@ static bool panfrost_slots_idle(struct panfrost_device *pfdev)
  	return true;
  }
  
@@ -137,7 +137,7 @@ index 5cf8c54..bb7dee4 100644
  	int ret;
  
  	if (!atomic_read(&pfdev->reset.pending))
-@@ -701,7 +735,8 @@ panfrost_reset(struct panfrost_device *pfdev,
+@@ -702,7 +736,8 @@ panfrost_reset(struct panfrost_device *pfdev,
  
  	cookie = dma_fence_begin_signalling();
  
