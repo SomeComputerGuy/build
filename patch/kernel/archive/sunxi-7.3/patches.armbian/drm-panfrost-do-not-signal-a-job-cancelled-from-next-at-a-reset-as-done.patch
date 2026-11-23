@@ -1,31 +1,24 @@
-From da53d0fbd98d8869b06aacbb8744864ff71c9baa Mon Sep 17 00:00:00 2001
+From 6a3c99c8d9151a17217c1403602e1c4bfb4defde Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 08:39:25 +0000
-Subject: [PATCH 08/15] drm/panfrost: Don't signal a job cancelled from _NEXT
+Subject: [PATCH 09/17] drm/panfrost: Don't signal a job cancelled from _NEXT
  at a reset as done
 
-panfrost_reset() cancels the job waiting in each slot's _NEXT registers
-with JS_COMMAND_NOP and soft-stops the running one. If the running job
-finishes instead of stopping, its DONE interrupt is handled by
-panfrost_jm_handle_irqs() before the reset. panfrost_jm_handle_irq()
-dequeues it, which moves the cancelled job to the head of the slot, then
-finds both subslots inactive and takes that job for done as well: when
-a job completes, the job manager starts the _NEXT one without waiting
-for the interrupt, so a job left on an inactive slot is normally one
-that has finished too. The cancelled job gets its jc cleared and its
-done fence signalled without having run: drm_sched_resubmit_jobs() does
-not run it again, and it completes with -ECANCELED although nothing was
-wrong with it.
+panfrost_reset() cancels the job in each slot's _NEXT registers with
+JS_COMMAND_NOP and soft-stops the running one. If the running job
+completes instead of stopping, panfrost_jm_handle_irq() dequeues it,
+finds both subslots inactive and takes the cancelled job, now at the
+head of the slot, for done as well. The cancelled job gets its jc
+cleared and its done fence signalled: drm_sched_resubmit_jobs() does not
+run it again, and it completes with -ECANCELED without having run.
 
-The Arm driver checks JS_HEAD_NEXT after writing the NOP: if it still
-holds the job, the job has not started and is evicted; if it reads zero,
-the job manager had already moved the job to the running subslot. Do the
-same: take an evicted job off the slot while the remaining interrupts
-are handled, and put it back afterwards, so that it is restarted with
-the other jobs.
+The Arm driver reads JS_HEAD_NEXT after the NOP: if it still holds the
+job, the job has not started and is evicted. Do the same: take an
+evicted job off the slot while the remaining interrupts are handled and
+put it back afterwards, so that it is restarted with the others.
 
-Found by code review (Sashiko) of the next patches, which make the
-soft-stop wait longer and the window wider. Not reproduced.
+Found by code review (Sashiko) of "Soft-stop and resume a job that
+outlives the timeout", which widens the window. Not reproduced.
 
 Fixes: 030761e097b4 ("drm/panfrost: Queue jobs on the hardware")
 Cc: stable@vger.kernel.org
@@ -37,7 +30,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 24 insertions(+)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index 86fb507..2d7ac0d 100644
+index b2735cd..6dfbc33 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -657,6 +657,7 @@ static void

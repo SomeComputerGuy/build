@@ -1,36 +1,32 @@
-From cc51f37e7c19273faf2c1309952faa6f22eddf04 Mon Sep 17 00:00:00 2001
+From 6d6ccba5fd67e3e7d7daf3fe7f2dc808100e38db Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 05:00:19 +0000
-Subject: [PATCH 12/15] drm/panfrost: Wait for the soft-stopped slots with the
+Subject: [PATCH 13/17] drm/panfrost: Wait for the soft-stopped slots with the
  live slot status
 
 panfrost_reset() soft-stops the slots and waits for them to go idle by
-polling JOB_INT_JS_STATE. That register is not live: it is a snapshot of
-the slot states taken when JOB_INT_CLEAR was last written (the Arm
-driver documents it as "status==active and _next == busy snapshot from
-last JOB_IRQ_CLEAR"). For a job that was started into an idle slot, the
-usual case for an OpenCL queue that submits one kernel at a time, it
-still shows the slot idle, and the wait ends at once while the job is
-still running.
+polling JOB_INT_JS_STATE. That register is a snapshot of the slot states
+taken when JOB_INT_CLEAR was last written (Arm driver: "status==active
+and _next == busy snapshot from last JOB_IRQ_CLEAR"). For a job started
+into an idle slot, the usual case for an OpenCL queue that submits one
+kernel at a time, it shows the slot idle and the wait ends at once.
 
-The GPU reset that follows hides this, since it kills the job anyway.
-Without a reset it does not: with the soft-stopped job resumed instead
-(next patch) and this wait, the job was removed from pfdev->jobs[] and
-resubmitted while its first run was still stopping. When that first run
+The GPU reset that follows hides this by killing the job. With the job
+resumed instead (next patch), it was removed from pfdev->jobs[] and
+resubmitted while its first run was still stopping. When the first run
 reported DONE, the handler signalled the resubmission's fence, the job
-manager started the resubmission from _NEXT, and its completion found
-no job on the slot (Mali-G31, OpenCL CTS Integer Ops):
+manager started the resubmission from _NEXT, and its completion found no
+job on the slot (Mali-G31, OpenCL CTS Integer Ops):
 
   Unable to handle kernel NULL pointer dereference at virtual address 00000000000000f8
   pc : panfrost_dequeue_job+0x2c/0xd8 [panfrost]
   lr : panfrost_jm_handle_irqs+0x268/0x570 [panfrost]
 
-Wait on the live JS_STATUS registers instead: a slot is busy while it
-reads ACTIVE, and every slot has to be idle before the queues are
-touched, so that the pending DONE or STOPPED interrupt is handled first.
-And make panfrost_dequeue_job() return NULL for a slot without a job:
-every caller copes with a NULL, so a stray event is a warning rather
-than an Oops.
+Wait until no JS_STATUS register reads ACTIVE instead, so that the
+pending DONE or STOPPED interrupt is handled before the queues are
+touched. Also make panfrost_dequeue_job() return NULL for a slot without
+a job: every caller copes with it, so a stray event is a WARN, not an
+Oops.
 
 Fixes: 030761e097b4 ("drm/panfrost: Queue jobs on the hardware")
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
@@ -39,7 +35,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 26 insertions(+), 22 deletions(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index 1683bab..83996b3 100644
+index b0a5a18..a318fd9 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -171,7 +171,11 @@ panfrost_dequeue_job(struct panfrost_device *pfdev, int slot)

@@ -1,39 +1,33 @@
-From e989ec7f2e8ce1ff1bd10401a607a3bef77ed8a6 Mon Sep 17 00:00:00 2001
+From 9295a6fb250357acb7309d1bc037e3e5ce2b035b Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 08:29:22 +0000
-Subject: [PATCH 01/15] drm/panfrost: Power the GPU up for a reset queued from
+Subject: [PATCH 02/17] drm/panfrost: Power the GPU up for a reset queued from
  the MMU code
 
 panfrost_reset_work() calls panfrost_reset() without a runtime PM
-reference. wait_ready() queues it when AS_ACTIVE is stuck, from MMU
-operations whose callers drop their PM reference right after, and it
-shares the ordered reset workqueue with the scheduler timeout handlers,
-so it can run late. If the GPU was runtime suspended in between,
-panfrost_reset() writes the registers of a powered-off GPU: a
-synchronous external abort on arm64.
+reference. wait_ready() queues it from MMU operations whose callers drop
+their reference right after, so the GPU can be runtime suspended when it
+runs. Take a reference in the work. If the GPU cannot be resumed, no job
+is on it and its next runtime resume resets it, so clear reset.pending
+there.
 
-Take a runtime PM reference in the work. pm_runtime_force_suspend()
-ignores the usage count, so also disable the work across system sleep
-and queue it again on resume if a reset is still pending. If the GPU
-cannot be resumed, no job is running on it and its next runtime resume
-resets it, so clear reset.pending there.
-
-Found by code review (Sashiko). Not reproduced.
+The access to a suspended GPU was not reproduced. With a resume failure
+injected into the work (test-only hook), a job submitted meanwhile
+started at once.
 
 Fixes: f9ab9c66f080 ("drm/panfrost: Reset the GPU when the AS_ACTIVE bit is stuck")
 Cc: stable@vger.kernel.org
 Reported-by: Sashiko <sashiko-bot@kernel.org>
 Closes: https://lore.kernel.org/all/sashiko-outbox-206548@kernel.org/
-Closes: https://lore.kernel.org/all/sashiko-outbox-210830@kernel.org/
 Closes: https://lore.kernel.org/all/sashiko-outbox-212557@kernel.org/
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
- drivers/gpu/drm/panfrost/panfrost_device.c | 29 ++++++++++++++++++++--
- drivers/gpu/drm/panfrost/panfrost_job.c    |  9 +++++++
- 2 files changed, 36 insertions(+), 2 deletions(-)
+ drivers/gpu/drm/panfrost/panfrost_device.c | 2 ++
+ drivers/gpu/drm/panfrost/panfrost_job.c    | 9 +++++++++
+ 2 files changed, 11 insertions(+)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_device.c b/drivers/gpu/drm/panfrost/panfrost_device.c
-index d0a23c5..fcd1d97 100644
+index d0a23c5..78dc3a3 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_device.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_device.c
 @@ -451,6 +451,8 @@ static int panfrost_device_runtime_resume(struct device *dev)
@@ -45,56 +39,8 @@ index d0a23c5..fcd1d97 100644
  	panfrost_device_reset(pfdev, true);
  	panfrost_devfreq_resume(pfdev);
  
-@@ -491,7 +493,7 @@ static int panfrost_device_runtime_suspend(struct device *dev)
- 	return 0;
- }
- 
--static int panfrost_device_resume(struct device *dev)
-+static int panfrost_device_power_up(struct device *dev)
- {
- 	struct panfrost_device *pfdev = dev_get_drvdata(dev);
- 	int ret;
-@@ -537,14 +539,37 @@ err_clk:
- 	return ret;
- }
- 
-+static void panfrost_device_enable_reset(struct panfrost_device *pfdev)
-+{
-+	enable_work(&pfdev->reset.work);
-+	if (atomic_read(&pfdev->reset.pending))
-+		queue_work(pfdev->reset.wq, &pfdev->reset.work);
-+}
-+
-+static int panfrost_device_resume(struct device *dev)
-+{
-+	int ret = panfrost_device_power_up(dev);
-+
-+	panfrost_device_enable_reset(dev_get_drvdata(dev));
-+	return ret;
-+}
-+
- static int panfrost_device_suspend(struct device *dev)
- {
- 	struct panfrost_device *pfdev = dev_get_drvdata(dev);
- 	int ret;
- 
-+	/* pm_runtime_force_suspend() powers the GPU off even if the reset
-+	 * work holds a runtime PM reference. Keep the work off the GPU until
-+	 * resume, which queues it again if a reset is still pending.
-+	 */
-+	disable_work_sync(&pfdev->reset.work);
-+
- 	ret = pm_runtime_force_suspend(dev);
--	if (ret)
-+	if (ret) {
-+		panfrost_device_enable_reset(pfdev);
- 		return ret;
-+	}
- 
- 	if (pfdev->comp->pm_features & BIT(GPU_PM_CLK_DIS)) {
- 		if (pfdev->bus_clock)
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index d59b486..86fb507 100644
+index a3c90c5..b2735cd 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -808,7 +808,16 @@ static void panfrost_reset_work(struct work_struct *work)

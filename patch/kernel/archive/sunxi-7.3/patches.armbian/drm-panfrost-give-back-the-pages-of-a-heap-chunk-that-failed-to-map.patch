@@ -1,35 +1,32 @@
-From a133d9a7efef1770b3271487dcbcf13ad5f5cfcc Mon Sep 17 00:00:00 2001
+From 96150b2e417542ac891c821b49c19dcc20138992 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 03:43:56 +0000
-Subject: [PATCH 06/15] drm/panfrost: Give back the pages of a heap chunk that
+Subject: [PATCH 07/17] drm/panfrost: Give back the pages of a heap chunk that
  failed to map
 
 panfrost_mmu_map_fault_addr() grows a heap BO by one 2 MB chunk per
 fault. If reading the chunk's folios, building its sg table, DMA mapping
-it or mapping it on the GPU fails, the folios that were already read stay
-in bo->base.pages, while the chunk's sg table stays empty. The next fault
-in that chunk reads the same folios again and finds their pages already
-owned:
+it or mapping it on the GPU fails, the folios already read stay in
+bo->base.pages while the chunk has no sg table. The next fault in the
+chunk reads them again, finds their pages owned and hits
 
   if (drm_WARN_ON(&pfdev->base, already_owned))
           folio_put(folio);
 
-Before commit b49c35ba0ce1 ("drm/panfrost: Fix a page leak in
-panfrost_mmu_map_fault_addr() when THP is on") the fault path skipped
-pages that were already filled in; since then the array is filled a
-folio at a time and an already filled page is treated as a bug.
+which commit b49c35ba0ce1 ("drm/panfrost: Fix a page leak in
+panfrost_mmu_map_fault_addr() when THP is on") added; before it, pages
+already filled in were skipped.
 
-On those error paths, put the folios read for the chunk and clear their
-entries, so that a later fault in it starts from an empty range. The
-range to clear is the one the fill loop wrote, which is not always the
-chunk: the loop aligns down to the start of each folio and fills the
-whole folio, so a folio larger than 2 MB (possible with 16K or
-64K pages) also fills entries of the neighbouring chunks, and a folio
-whose pages the loop found already owned (by such a neighbour) is not
-ours to put.
+On those error paths, put the folios read and clear their entries. The
+range to clear is what the fill loop wrote, whole folios: a folio larger
+than 2 MB (possible with 16K or 64K pages) also fills entries of the
+neighbouring chunks, and a folio the loop found already owned (by such a
+neighbour) is not ours to put.
 
-Tested with 4K pages, where the folios are at most 2 MB and never cross
-a chunk; the larger-folio case is from reading the code.
+Tested by failing a heap fault after its folios were read (test-only
+hook): before, the next fault in the chunk WARNed once for each of its
+512 pages; after, no WARN. With 4K pages here a folio never crosses a
+chunk; the larger-folio case is from reading the code.
 
 Fixes: b49c35ba0ce1 ("drm/panfrost: Fix a page leak in panfrost_mmu_map_fault_addr() when THP is on")
 Cc: stable@vger.kernel.org

@@ -1,7 +1,7 @@
-From 62c8b6c90172fc438b81ca9c412ec23b5776c55e Mon Sep 17 00:00:00 2001
+From 3f9c1b807347367dd7e639854dddf17906238097 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 05:00:27 +0000
-Subject: [PATCH 14/15] drm/panfrost: Soft-stop and resume a job that outlives
+Subject: [PATCH 16/17] drm/panfrost: Soft-stop and resume a job that outlives
  the timeout
 
 When the 500 ms job timeout fires, panfrost resets the GPU and the job
@@ -66,7 +66,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  1 file changed, 196 insertions(+), 30 deletions(-)
 
 diff --git a/drivers/gpu/drm/panfrost/panfrost_job.c b/drivers/gpu/drm/panfrost/panfrost_job.c
-index 5cf8c54..bb7dee4 100644
+index d11e9c7..e139d4e 100644
 --- a/drivers/gpu/drm/panfrost/panfrost_job.c
 +++ b/drivers/gpu/drm/panfrost/panfrost_job.c
 @@ -25,6 +25,25 @@
@@ -147,7 +147,7 @@ index 5cf8c54..bb7dee4 100644
  		drm_sched_increase_karma(bad);
  
  	/* Mask job interrupts and synchronize to make sure we won't be
-@@ -733,26 +768,90 @@ panfrost_reset(struct panfrost_device *pfdev,
+@@ -732,26 +767,90 @@ panfrost_reset(struct panfrost_device *pfdev,
  	}
  	spin_unlock(&pfdev->js->job_lock);
  
@@ -247,7 +247,7 @@ index 5cf8c54..bb7dee4 100644
  	 */
  	spin_lock(&pfdev->js->job_lock);
  	for (i = 0; i < NUM_JOB_SLOTS; i++) {
-@@ -763,19 +862,51 @@ panfrost_reset(struct panfrost_device *pfdev,
+@@ -762,19 +861,51 @@ panfrost_reset(struct panfrost_device *pfdev,
  			pfdev->jobs[i][pfdev->jobs[i][0] ? 1 : 0] = evicted[i];
  
  		for (j = 0; j < ARRAY_SIZE(pfdev->jobs[0]) && pfdev->jobs[i][j]; j++) {
@@ -304,7 +304,7 @@ index 5cf8c54..bb7dee4 100644
  
  	/* Now resubmit jobs that were previously queued but didn't have a
  	 * chance to finish.
-@@ -805,6 +936,8 @@ panfrost_job_handle_timeout(struct drm_sched_job *sched_job)
+@@ -804,6 +935,8 @@ panfrost_job_handle_timeout(struct drm_sched_job *sched_job)
  	struct panfrost_job *job = to_panfrost_job(sched_job);
  	struct panfrost_device *pfdev = job->pfdev;
  	int js = panfrost_job_get_slot(job);
@@ -313,7 +313,7 @@ index 5cf8c54..bb7dee4 100644
  
  	/*
  	 * If the GPU managed to complete this jobs fence, the timeout has
-@@ -829,18 +962,51 @@ panfrost_job_handle_timeout(struct drm_sched_job *sched_job)
+@@ -828,18 +961,51 @@ panfrost_job_handle_timeout(struct drm_sched_job *sched_job)
  		return DRM_GPU_SCHED_STAT_NO_HANG;
  	}
  
@@ -375,7 +375,7 @@ index 5cf8c54..bb7dee4 100644
  
  	return DRM_GPU_SCHED_STAT_RESET;
  }
-@@ -874,7 +1040,7 @@ static void panfrost_reset_work(struct work_struct *work)
+@@ -873,7 +1039,7 @@ static void panfrost_reset_work(struct work_struct *work)
  	if (pm_runtime_resume_and_get(pfdev->base.dev))
  		return;
  
