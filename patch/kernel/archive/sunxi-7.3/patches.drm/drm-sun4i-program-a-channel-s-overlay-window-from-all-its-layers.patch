@@ -23,11 +23,11 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/sun4i/sun50i_cdc.c     |  12 ++
  drivers/gpu/drm/sun4i/sun50i_cdc.h     |   5 +
- drivers/gpu/drm/sun4i/sun8i_mixer.c    | 277 ++++++++++++++++++++++++-
+ drivers/gpu/drm/sun4i/sun8i_mixer.c    | 279 ++++++++++++++++++++++++-
  drivers/gpu/drm/sun4i/sun8i_mixer.h    |  38 ++++
  drivers/gpu/drm/sun4i/sun8i_ui_layer.c |  67 ++++--
  drivers/gpu/drm/sun4i/sun8i_vi_layer.c |  71 +++++--
- 6 files changed, 424 insertions(+), 46 deletions(-)
+ 6 files changed, 425 insertions(+), 47 deletions(-)
 
 diff --git a/drivers/gpu/drm/sun4i/sun50i_cdc.c b/drivers/gpu/drm/sun4i/sun50i_cdc.c
 index b52499173..e72c2891b 100644
@@ -323,23 +323,25 @@ index 5ad4a9773..72a8b8b54 100644
  		enable = plane_state->visible;
  		zpos = plane_state->normalized_zpos;
  
-@@ -738,10 +939,12 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+@@ -738,11 +939,13 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
  		 * multiplies colour with (pixel and/or plane) alpha itself.
- 		 * Planes without a blend mode property (DE2 VI layers, no pixel
- 		 * alpha) keep the non-pre-multiplied path, which their global
--		 * alpha relies on.
-+		 * alpha relies on. Several layers of one channel leave it
-+		 * pre-multiplied (sun8i_ovl_premul_ctl()).
+ 		 * Planes without a blend mode property (DE2 VI layers) or
+ 		 * without pixel alpha keep the non-pre-multiplied path, which
+-		 * their global alpha relies on.
++		 * their global alpha relies on. Several layers of one channel
++		 * leave it pre-multiplied (sun8i_ovl_premul_ctl()).
  		 */
 -		ch->premul = plane->blend_mode_property &&
+-			     plane_state->fb->format->has_alpha &&
 -			     plane_state->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI;
 +		ch->premul = ch->visible > 1 ||
 +			     (plane->blend_mode_property &&
++			      plane_state->fb->format->has_alpha &&
 +			      plane_state->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI);
  	}
  
  	/*
-@@ -753,6 +956,9 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+@@ -754,6 +957,9 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
  		struct sun8i_mixer_chan *ch = &chans[i];
  		int key, pipe = 0, x, y, w, h;
  
@@ -349,7 +351,7 @@ index 5ad4a9773..72a8b8b54 100644
  		if (!ch->attached)
  			continue;
  
-@@ -1003,7 +1209,66 @@ static void sun50i_mixer_disable_color_correction(struct sunxi_engine *engine)
+@@ -1004,7 +1210,66 @@ static void sun50i_mixer_disable_color_correction(struct sunxi_engine *engine)
  	sun50i_mixer_set_output_yuv(engine, false);
  }
  
