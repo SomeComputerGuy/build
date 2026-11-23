@@ -16,6 +16,9 @@ the vendor library does. This covers every decoder except AVS2, whose
 engine mode cannot write the tiled format, and JPEG, which has no
 references. The tiled, AFBC and P010 formats are unchanged.
 
+The H.264 4:0:0 chroma fill ends with the visible picture, so later
+slices keep the hidden luma of earlier ones.
+
 Assisted-by: LLM
 Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
@@ -23,7 +26,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  drivers/staging/media/sunxi/cedrus/cedrus.h       | 110 ++++++++++++++++++----
  drivers/staging/media/sunxi/cedrus/cedrus_avs.c   |  13 ++-
  drivers/staging/media/sunxi/cedrus/cedrus_dec.c   |   9 +-
- drivers/staging/media/sunxi/cedrus/cedrus_h264.c  |  19 ++--
+ drivers/staging/media/sunxi/cedrus/cedrus_h264.c  |  24 +++--
  drivers/staging/media/sunxi/cedrus/cedrus_h265.c  |  13 ++-
  drivers/staging/media/sunxi/cedrus/cedrus_hw.c    |  60 ++++++++++--
  drivers/staging/media/sunxi/cedrus/cedrus_hw.h    |   6 ++
@@ -34,7 +37,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  drivers/staging/media/sunxi/cedrus/cedrus_video.c |   7 +-
  drivers/staging/media/sunxi/cedrus/cedrus_vp8.c   |  15 ++-
  drivers/staging/media/sunxi/cedrus/cedrus_vp9.c   |  24 ++++-
- 15 files changed, 275 insertions(+), 66 deletions(-)
+ 15 files changed, 279 insertions(+), 67 deletions(-)
 
 diff --git a/drivers/staging/media/sunxi/cedrus/cedrus.c b/drivers/staging/media/sunxi/cedrus/cedrus.c
 index 155f6e1..9e4291b 100644
@@ -328,7 +331,7 @@ index c7dd884..63a99f8 100644
  	error = ctx->current_codec->setup(ctx, &run);
  	if (error)
 diff --git a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
-index 2dd7fed..8a495b0 100644
+index 2dd7fed..414772c 100644
 --- a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
 +++ b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
 @@ -84,8 +84,8 @@ static void cedrus_fill_ref_pic(struct cedrus_ctx *ctx,
@@ -358,7 +361,25 @@ index 2dd7fed..8a495b0 100644
  }
  
  static enum cedrus_irq_status
-@@ -554,7 +555,10 @@ static int cedrus_h264_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+@@ -535,13 +536,16 @@ static void cedrus_h264_fill_mono_chroma(struct cedrus_ctx *ctx,
+ {
+ 	struct vb2_buffer *buf = &run->dst->vb2_buf;
+ 	size_t luma = (size_t)ctx->dst_fmt.bytesperline * ctx->dst_fmt.height;
++	/* Not the hidden reference surface: earlier slices wrote it. */
++	size_t end = ctx->dst_fmt.sizeimage -
++		     cedrus_dst_tiled_behind_size(ctx, &ctx->dst_fmt);
+ 	size_t size = vb2_plane_size(buf, 0);
+ 	u8 *vaddr = vb2_plane_vaddr(buf, 0);
+ 
+ 	if (!vaddr || size <= luma)
+ 		return;
+ 
+-	memset(vaddr + luma, 0x80, min_t(size_t, ctx->dst_fmt.sizeimage, size) - luma);
++	memset(vaddr + luma, 0x80, min(end, size) - luma);
+ }
+ 
+ static int cedrus_h264_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
+@@ -554,7 +558,10 @@ static int cedrus_h264_setup(struct cedrus_ctx *ctx, struct cedrus_run *run)
  
  	cedrus_engine_enable(ctx);
  
@@ -370,7 +391,7 @@ index 2dd7fed..8a495b0 100644
  	cedrus_write(dev, VE_H264_EXTRA_BUFFER1,
  		     ctx->codec.h264.pic_info_buf_dma);
  	cedrus_write(dev, VE_H264_EXTRA_BUFFER2,
-@@ -752,4 +756,5 @@ struct cedrus_dec_ops cedrus_dec_ops_h264 = {
+@@ -752,4 +759,5 @@ struct cedrus_dec_ops cedrus_dec_ops_h264 = {
  	.stop		= cedrus_h264_stop,
  	.buf_cleanup	= cedrus_h264_buf_cleanup,
  	.trigger	= cedrus_h264_trigger,
