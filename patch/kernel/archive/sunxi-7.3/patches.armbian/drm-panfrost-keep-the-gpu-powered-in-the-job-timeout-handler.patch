@@ -1,4 +1,4 @@
-From 9658f3cfea27a1ecd9a1cb3ce1490c53bd76340b Mon Sep 17 00:00:00 2001
+From 040e9e9df822c3f018d5a179ef523c5763a5b56d Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 20 Nov 2026 08:50:07 +0000
 Subject: [PATCH 14/17] drm/panfrost: Keep the GPU powered in the job timeout

@@ -1,12 +1,11 @@
-From 148f5d22ac423c9a69a497dbf4031377f98bd3a8 Mon Sep 17 00:00:00 2001
+From c5505e2c47a7046846852c25ac50690291533091 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 04:59:29 +0000
 Subject: [PATCH 05/17] drm/panfrost: Don't WARN when a GEM mapping cannot get
  its pages
 
-drm_gem_shmem_get_pages_sgt() fails at a memory cgroup limit, and the
-WARN_ON() adds a backtrace to that ordinary error (five in dEQP-GLES31
-draw_indirect compute_interop large). Drop it.
+Running out of memory at a memory cgroup limit is an ordinary error
+here, which userspace gets. Drop the WARN_ON() that adds a backtrace.
 
 Fixes: f3ba91228e8e ("drm/panfrost: Add initial panfrost driver")
 Cc: stable@vger.kernel.org

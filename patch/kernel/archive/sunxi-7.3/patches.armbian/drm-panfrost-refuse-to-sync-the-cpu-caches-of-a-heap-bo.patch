@@ -1,4 +1,4 @@
-From 3b684fac85a43f509bbec6d66c671941788b3d71 Mon Sep 17 00:00:00 2001
+From 74c10d8b60a55578ec6fa8c7b73002e9908b678f Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 08:30:41 +0000
 Subject: [PATCH 03/17] drm/panfrost: Refuse to sync the CPU caches of a heap

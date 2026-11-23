@@ -1,4 +1,4 @@
-From 4982d3b7b5413dfc320fdd71d4f8b0c4fa86aca3 Mon Sep 17 00:00:00 2001
+From b0d47d2fe1d9de3a297f67b1f48c63f3dba27ac7 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 03:40:07 +0000
 Subject: [PATCH 08/17] drm/panfrost: Don't WARN for a heap folio a

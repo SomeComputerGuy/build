@@ -1,4 +1,4 @@
-From bfb9126914f3f27bf911eda0b485dd4a39b8c4bb Mon Sep 17 00:00:00 2001
+From e4d910b3fa30c25d821c1b96fbb342744272f349 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Sat, 21 Nov 2026 04:11:26 +0000
 Subject: [PATCH 15/17] drm/panfrost: Keep the job interrupts masked during a

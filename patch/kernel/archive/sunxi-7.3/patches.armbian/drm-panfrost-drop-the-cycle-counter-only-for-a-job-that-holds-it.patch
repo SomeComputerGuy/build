@@ -1,4 +1,4 @@
-From 0d0e3ffee164c79dc15617b4db3b059507580ee5 Mon Sep 17 00:00:00 2001
+From a12bb8abfcef841f1b17e33a5eeef2d4e4515479 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Fri, 13 Nov 2026 03:17:23 +0000
 Subject: [PATCH 11/17] drm/panfrost: Drop the cycle counter only for a job

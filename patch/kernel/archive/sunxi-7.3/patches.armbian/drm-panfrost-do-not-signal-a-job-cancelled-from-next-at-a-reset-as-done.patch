@@ -1,4 +1,4 @@
-From 61090323a43eacb36c7c840f117de3eb5f481b3f Mon Sep 17 00:00:00 2001
+From fe9fe754bb286aab9e086f072e81a044961dfd24 Mon Sep 17 00:00:00 2001
 From: Arun Iyengar <aiyengar1990@gmail.com>
 Date: Tue, 10 Nov 2026 08:39:25 +0000
 Subject: [PATCH 09/17] drm/panfrost: Don't signal a job cancelled from _NEXT
