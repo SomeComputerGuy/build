@@ -23,11 +23,11 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
 ---
  drivers/gpu/drm/sun4i/sun50i_cdc.c     |  12 ++
  drivers/gpu/drm/sun4i/sun50i_cdc.h     |   5 +
- drivers/gpu/drm/sun4i/sun8i_mixer.c    | 279 ++++++++++++++++++++++++-
- drivers/gpu/drm/sun4i/sun8i_mixer.h    |  38 ++++
- drivers/gpu/drm/sun4i/sun8i_ui_layer.c |  67 ++++--
- drivers/gpu/drm/sun4i/sun8i_vi_layer.c |  71 +++++--
- 6 files changed, 425 insertions(+), 47 deletions(-)
+ drivers/gpu/drm/sun4i/sun8i_mixer.c    | 280 ++++++++++++++++++++++++-
+ drivers/gpu/drm/sun4i/sun8i_mixer.h    |  41 +++-
+ drivers/gpu/drm/sun4i/sun8i_ui_layer.c |  70 +++++--
+ drivers/gpu/drm/sun4i/sun8i_vi_layer.c |  74 ++++---
+ 6 files changed, 426 insertions(+), 56 deletions(-)
 
 diff --git a/drivers/gpu/drm/sun4i/sun50i_cdc.c b/drivers/gpu/drm/sun4i/sun50i_cdc.c
 index b52499173..e72c2891b 100644
@@ -75,7 +75,7 @@ index c856c9a55..e30193e46 100644
  
  #endif /* _SUN50I_CDC_H_ */
 diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.c b/drivers/gpu/drm/sun4i/sun8i_mixer.c
-index 5ad4a9773..72a8b8b54 100644
+index b80de01e3..356a6cacc 100644
 --- a/drivers/gpu/drm/sun4i/sun8i_mixer.c
 +++ b/drivers/gpu/drm/sun4i/sun8i_mixer.c
 @@ -23,13 +23,16 @@
@@ -95,7 +95,7 @@ index 5ad4a9773..72a8b8b54 100644
  #include "sun50i_fmt.h"
  #include "sun50i_planes.h"
  #include "sun50i_shadow.h"
-@@ -617,8 +620,203 @@ static void sun50i_mixer_vblank_quirk(struct sunxi_engine *engine,
+@@ -617,8 +620,204 @@ static void sun50i_mixer_vblank_quirk(struct sunxi_engine *engine,
  		sun50i_wb_vblank(wb, mixer, cur_line);
  }
  
@@ -179,19 +179,20 @@ index 5ad4a9773..72a8b8b54 100644
 +}
 +
 +/*
-+ * Layer pre-multiply control. A single layer passes its data as is and the
-+ * blender pipe is told the blend mode. Several layers are blended inside
-+ * the overlay: each is brought to pre-multiplied form and so is the pipe.
++ * Layer pre-multiply control. Pre-multiplied pixel alpha is marked, so the
++ * layer scales its colour by the plane alpha; other single layers pass as is.
++ * Several layers of a channel are each brought to pre-multiplied form.
 + */
 +u32 sun8i_ovl_premul_ctl(const struct sun8i_ovl *ovl,
 +			 const struct drm_plane_state *state)
 +{
-+	if (ovl->num < 2)
-+		return SUN8I_MIXER_LAYER_PREMUL_NONE;
++	bool premul = state->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI;
 +
-+	return state->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI ?
-+	       SUN8I_MIXER_LAYER_PREMUL_INPUT :
-+	       SUN8I_MIXER_LAYER_PREMUL_CONVERT;
++	if (premul && (ovl->num > 1 || state->fb->format->has_alpha))
++		return SUN8I_MIXER_LAYER_PREMUL_INPUT;
++
++	return ovl->num > 1 ? SUN8I_MIXER_LAYER_PREMUL_CONVERT :
++			      SUN8I_MIXER_LAYER_PREMUL_NONE;
 +}
 +
 +/*
@@ -299,7 +300,7 @@ index 5ad4a9773..72a8b8b54 100644
  	struct drm_rect dst;		/* union of the visible planes */
  	unsigned int visible;		/* visible planes */
  	bool attached;			/* any plane on the CRTC */
-@@ -696,17 +894,20 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+@@ -696,17 +895,20 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
  		bool enable;
  		int zpos;
  
@@ -323,7 +324,7 @@ index 5ad4a9773..72a8b8b54 100644
  		enable = plane_state->visible;
  		zpos = plane_state->normalized_zpos;
  
-@@ -738,11 +939,13 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+@@ -738,11 +940,13 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
  		 * multiplies colour with (pixel and/or plane) alpha itself.
  		 * Planes without a blend mode property (DE2 VI layers) or
  		 * without pixel alpha keep the non-pre-multiplied path, which
@@ -341,7 +342,7 @@ index 5ad4a9773..72a8b8b54 100644
  	}
  
  	/*
-@@ -754,6 +957,9 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
+@@ -754,6 +958,9 @@ static void sun8i_mixer_commit(struct sunxi_engine *engine,
  		struct sun8i_mixer_chan *ch = &chans[i];
  		int key, pipe = 0, x, y, w, h;
  
@@ -351,7 +352,7 @@ index 5ad4a9773..72a8b8b54 100644
  		if (!ch->attached)
  			continue;
  
-@@ -1004,7 +1210,66 @@ static void sun50i_mixer_disable_color_correction(struct sunxi_engine *engine)
+@@ -1004,7 +1211,66 @@ static void sun50i_mixer_disable_color_correction(struct sunxi_engine *engine)
  	sun50i_mixer_set_output_yuv(engine, false);
  }
  
@@ -419,7 +420,7 @@ index 5ad4a9773..72a8b8b54 100644
  	.layers_init		= sun50i_layers_init,
  	.mode_set		= sun8i_mixer_mode_set,
 diff --git a/drivers/gpu/drm/sun4i/sun8i_mixer.h b/drivers/gpu/drm/sun4i/sun8i_mixer.h
-index 15873e198..b379d45ba 100644
+index 4923f19de..b379d45ba 100644
 --- a/drivers/gpu/drm/sun4i/sun8i_mixer.h
 +++ b/drivers/gpu/drm/sun4i/sun8i_mixer.h
 @@ -16,6 +16,8 @@
@@ -431,7 +432,17 @@ index 15873e198..b379d45ba 100644
  struct sun50i_cdc;
  struct sun50i_shadow;
  struct sun50i_wb;
-@@ -118,6 +120,12 @@ struct sun50i_wb;
+@@ -96,9 +98,6 @@ struct sun50i_wb;
+ /* pipe input colour is already pre-multiplied with its alpha */
+ #define SUN8I_MIXER_BLEND_PREMULTIPLY_EN(pipe)	BIT(pipe)
+ 
+-/* UI and VI layer attribute: layer colour is pre-multiplied */
+-#define SUN8I_MIXER_LAYER_ATTR_PREMUL_INPUT	(2 << 16)
+-
+ /* colors are always in AARRGGBB format */
+ #define SUN8I_MIXER_BLEND_COLOR_BLACK		0xff000000
+ /* Black in limited range YCbCr, used when the blender works in YUV */
+@@ -121,6 +120,12 @@ struct sun50i_wb;
  #define SUN50I_MIXER_BLEND_CSC_CTL_EN(ch)	BIT(ch)
  #define SUN50I_MIXER_BLEND_CSC_CONST_VAL(d, c)	(((d) << 16) | ((c) & 0xffff))
  
@@ -444,7 +455,7 @@ index 15873e198..b379d45ba 100644
  #define SUN8I_MIXER_FBFMT_ARGB8888	0
  #define SUN8I_MIXER_FBFMT_ABGR8888	1
  #define SUN8I_MIXER_FBFMT_RGBA8888	2
-@@ -327,12 +335,17 @@ enum {
+@@ -330,12 +335,17 @@ enum {
  	SUN8I_LAYER_TYPE_VI,
  };
  
@@ -462,7 +473,7 @@ index 15873e198..b379d45ba 100644
  	struct regmap			*regs;
  	u32				afbc_base;
  	struct sun50i_cdc		*cdc;
-@@ -345,6 +358,31 @@ plane_to_sun8i_layer(struct drm_plane *plane)
+@@ -348,6 +358,31 @@ plane_to_sun8i_layer(struct drm_plane *plane)
  	return container_of(plane, struct sun8i_layer, plane);
  }
  
@@ -495,7 +506,7 @@ index 15873e198..b379d45ba 100644
  #define SUN8I_LAYER_BLEND_MODES		(BIT(DRM_MODE_BLEND_PREMULTI) | \
  					 BIT(DRM_MODE_BLEND_COVERAGE) | \
 diff --git a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
-index 1bc7fba54..e135c1614 100644
+index 56b5a5722..e135c1614 100644
 --- a/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
 +++ b/drivers/gpu/drm/sun4i/sun8i_ui_layer.c
 @@ -31,12 +31,18 @@ static void sun8i_ui_layer_disable(struct sun8i_layer *layer)
@@ -518,9 +529,13 @@ index 1bc7fba54..e135c1614 100644
  {
  	struct drm_plane_state *state = plane->state;
  	const struct drm_format_info *fmt;
-@@ -54,23 +60,26 @@ static void sun8i_ui_layer_update_attributes(struct sun8i_layer *layer,
+@@ -53,27 +59,27 @@ static void sun8i_ui_layer_update_attributes(struct sun8i_layer *layer,
+ 		val |= SUN8I_MIXER_CHAN_UI_LAYER_ATTR_ALPHA_MODE_PIXEL;
  	else
  		val |= SUN8I_MIXER_CHAN_UI_LAYER_ATTR_ALPHA_MODE_COMBINED;
+-	if (fmt->has_alpha &&
+-	    state->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI)
+-		val |= SUN8I_MIXER_LAYER_ATTR_PREMUL_INPUT;
  	val |= hw_fmt << SUN8I_MIXER_CHAN_UI_LAYER_ATTR_FBFMT_OFFSET;
 +	val |= SUN8I_MIXER_LAYER_ATTR_PREMUL(sun8i_ovl_premul_ctl(ovl, state));
  	val |= SUN8I_MIXER_CHAN_UI_LAYER_ATTR_EN;
@@ -549,7 +564,7 @@ index 1bc7fba54..e135c1614 100644
  
  	ch_base = sun8i_channel_base(layer);
  
-@@ -81,6 +90,8 @@ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
+@@ -84,6 +90,8 @@ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
  
  	hphase = state->src.x1 & 0xffff;
  	vphase = state->src.y1 & 0xffff;
@@ -558,7 +573,7 @@ index 1bc7fba54..e135c1614 100644
  
  	insize = SUN8I_MIXER_SIZE(src_w, src_h);
  	outsize = SUN8I_MIXER_SIZE(dst_w, dst_h);
-@@ -90,20 +101,35 @@ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
+@@ -93,20 +101,35 @@ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
  			 state->src.x1 >> 16, state->src.y1 >> 16);
  	DRM_DEBUG_DRIVER("Layer source size W: %d H: %d\n", src_w, src_h);
  	regmap_write(layer->regs,
@@ -600,7 +615,7 @@ index 1bc7fba54..e135c1614 100644
  		if (layer->cfg->de_type == SUN8I_MIXER_DE33) {
  			sun8i_vi_scaler_setup(layer, src_w, src_h, dst_w, dst_h,
  					      hscale, vscale, hphase, vphase,
-@@ -124,7 +150,7 @@ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
+@@ -127,7 +150,7 @@ static void sun8i_ui_layer_update_coord(struct sun8i_layer *layer,
  }
  
  static void sun8i_ui_layer_update_buffer(struct sun8i_layer *layer,
@@ -609,7 +624,7 @@ index 1bc7fba54..e135c1614 100644
  {
  	struct drm_plane_state *state = plane->state;
  	struct drm_framebuffer *fb = state->fb;
-@@ -139,13 +165,13 @@ static void sun8i_ui_layer_update_buffer(struct sun8i_layer *layer,
+@@ -142,13 +165,13 @@ static void sun8i_ui_layer_update_buffer(struct sun8i_layer *layer,
  	/* Set the line width */
  	DRM_DEBUG_DRIVER("Layer line width: %d bytes\n", fb->pitches[0]);
  	regmap_write(layer->regs,
@@ -625,7 +640,7 @@ index 1bc7fba54..e135c1614 100644
  		     lower_32_bits(dma_addr));
  }
  
-@@ -196,18 +222,21 @@ static void sun8i_ui_layer_atomic_update(struct drm_plane *plane,
+@@ -199,18 +222,21 @@ static void sun8i_ui_layer_atomic_update(struct drm_plane *plane,
  	struct drm_plane_state *new_state = drm_atomic_get_new_plane_state(state,
  									   plane);
  	struct sun8i_layer *layer = plane_to_sun8i_layer(plane);
@@ -653,7 +668,7 @@ index 1bc7fba54..e135c1614 100644
  
  static const struct drm_plane_helper_funcs sun8i_ui_layer_helper_funcs = {
 diff --git a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
-index c78fc44c1..b36ba5a2e 100644
+index 6e78879ac..b36ba5a2e 100644
 --- a/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
 +++ b/drivers/gpu/drm/sun4i/sun8i_vi_layer.c
 @@ -27,14 +27,19 @@ static void sun8i_vi_layer_disable(struct sun8i_layer *layer)
@@ -679,10 +694,13 @@ index c78fc44c1..b36ba5a2e 100644
  {
  	struct drm_plane_state *state = plane->state;
  	const struct drm_format_info *fmt;
-@@ -56,10 +61,11 @@ static void sun8i_vi_layer_update_attributes(struct sun8i_layer *layer,
+@@ -56,13 +61,11 @@ static void sun8i_vi_layer_update_attributes(struct sun8i_layer *layer,
  			val |= SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_PIXEL;
  		else
  			val |= SUN50I_MIXER_CHAN_VI_LAYER_ATTR_ALPHA_MODE_COMBINED;
+-		if (fmt->has_alpha &&
+-		    state->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI)
+-			val |= SUN8I_MIXER_LAYER_ATTR_PREMUL_INPUT;
 +		val |= SUN8I_MIXER_LAYER_ATTR_PREMUL(sun8i_ovl_premul_ctl(ovl, state));
  	}
  
@@ -692,7 +710,7 @@ index c78fc44c1..b36ba5a2e 100644
  
  	if (layer->cfg->de2_fcc_alpha) {
  		regmap_write(layer->regs,
-@@ -69,7 +75,8 @@ static void sun8i_vi_layer_update_attributes(struct sun8i_layer *layer,
+@@ -72,7 +75,8 @@ static void sun8i_vi_layer_update_attributes(struct sun8i_layer *layer,
  }
  
  static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
@@ -702,7 +720,7 @@ index c78fc44c1..b36ba5a2e 100644
  {
  	struct drm_plane_state *state = plane->state;
  	struct sun4i_crtc *scrtc = drm_crtc_to_sun4i_crtc(state->crtc);
-@@ -84,8 +91,8 @@ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
+@@ -87,8 +91,8 @@ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
  	bool subsampled;
  	u32 ch_base;
  
@@ -713,7 +731,7 @@ index c78fc44c1..b36ba5a2e 100644
  
  	ch_base = sun8i_channel_base(layer);
  
-@@ -127,8 +134,29 @@ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
+@@ -130,8 +134,29 @@ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
  			 (state->src.y1 >> 16) & ~(format->vsub - 1));
  	DRM_DEBUG_DRIVER("Layer source size W: %d H: %d\n", src_w, src_h);
  	regmap_write(layer->regs,
@@ -744,7 +762,7 @@ index c78fc44c1..b36ba5a2e 100644
  	regmap_write(layer->regs,
  		     SUN8I_MIXER_CHAN_VI_OVL_SIZE(ch_base),
  		     insize);
-@@ -214,7 +242,7 @@ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
+@@ -217,7 +242,7 @@ static void sun8i_vi_layer_update_coord(struct sun8i_layer *layer,
  }
  
  static void sun8i_vi_layer_update_buffer(struct sun8i_layer *layer,
@@ -753,7 +771,7 @@ index c78fc44c1..b36ba5a2e 100644
  {
  	struct drm_plane_state *state = plane->state;
  	struct drm_framebuffer *fb = state->fb;
-@@ -249,16 +277,14 @@ static void sun8i_vi_layer_update_buffer(struct sun8i_layer *layer,
+@@ -252,16 +277,14 @@ static void sun8i_vi_layer_update_buffer(struct sun8i_layer *layer,
  		DRM_DEBUG_DRIVER("Layer %d. line width: %d bytes\n",
  				 i + 1, fb->pitches[i]);
  		regmap_write(layer->regs,
@@ -772,7 +790,7 @@ index c78fc44c1..b36ba5a2e 100644
  			     lower_32_bits(dma_addr));
  	}
  }
-@@ -324,8 +350,11 @@ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
+@@ -327,8 +350,11 @@ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
  									   plane);
  	struct sun8i_layer *layer = plane_to_sun8i_layer(plane);
  	u32 ch_base = sun8i_channel_base(layer);
@@ -785,7 +803,7 @@ index c78fc44c1..b36ba5a2e 100644
  		sun8i_vi_layer_disable(layer);
  		return;
  	}
-@@ -333,17 +362,17 @@ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
+@@ -336,17 +362,17 @@ static void sun8i_vi_layer_atomic_update(struct drm_plane *plane,
  	if (drm_is_afbc(new_state->fb->modifier)) {
  		/* The decompressor replaces the linear fetch unit. */
  		regmap_write(layer->regs,
