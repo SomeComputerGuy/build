@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 27 Nov 2026 18:00:00 +0000
+Subject: [PATCH] media: cedrus: h264: bound the wait for the bit skip
+
+cedrus_skip_bits() polls the VLD busy bit without a limit. When the
+bitstream engine never goes idle, device_run() spins forever in the
+thread that queued the request, with the media device's
+req_queue_mutex held, and every later close() of a cedrus file blocks
+on that mutex.
+
+Wait with cedrus_wait_for(), as the H.265 code does, and fail the job
+on a timeout.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_h264.c
+@@ -333,7 +333,7 @@
+  * rare cases frame is not decoded correctly. However, setting offset to 0 and
+  * skipping appropriate amount of bits with flush bits trigger always works.
+  */
+-static void cedrus_skip_bits(struct cedrus_dev *dev, int num)
++static int cedrus_skip_bits(struct cedrus_dev *dev, int num)
+ {
+ 	int count = 0;
+ 
+@@ -343,15 +343,21 @@
+ 		cedrus_write(dev, VE_H264_TRIGGER_TYPE,
+ 			     VE_H264_TRIGGER_TYPE_FLUSH_BITS |
+ 			     VE_H264_TRIGGER_TYPE_N_BITS(tmp));
+-		while (cedrus_read(dev, VE_H264_STATUS) & VE_H264_STATUS_VLD_BUSY)
+-			udelay(1);
++		if (cedrus_wait_for(dev, VE_H264_STATUS,
++				    VE_H264_STATUS_VLD_BUSY)) {
++			dev_err_ratelimited(dev->dev,
++					    "timed out waiting to skip bits\n");
++			return -ETIMEDOUT;
++		}
+ 
+ 		count += tmp;
+ 	}
++
++	return 0;
+ }
+ 
+-static void cedrus_set_params(struct cedrus_ctx *ctx,
+-			      struct cedrus_run *run)
++static int cedrus_set_params(struct cedrus_ctx *ctx,
++			     struct cedrus_run *run)
+ {
+ 	const struct v4l2_ctrl_h264_decode_params *decode = run->h264.decode_params;
+ 	const struct v4l2_ctrl_h264_slice_params *slice = run->h264.slice_params;
+@@ -364,6 +370,7 @@
+ 	unsigned int pic_width_in_mbs;
+ 	bool mbaff_pic;
+ 	u32 reg;
++	int ret;
+ 
+ 	cedrus_write(dev, VE_H264_VLD_LEN, slice_bytes * 8);
+ 	cedrus_write(dev, VE_H264_VLD_OFFSET, 0);
+@@ -398,7 +405,9 @@
+ 	cedrus_write(dev, VE_H264_TRIGGER_TYPE,
+ 		     VE_H264_TRIGGER_TYPE_INIT_SWDEC);
+ 
+-	cedrus_skip_bits(dev, slice->header_bit_size);
++	ret = cedrus_skip_bits(dev, slice->header_bit_size);
++	if (ret)
++		return ret;
+ 
+ 	if (V4L2_H264_CTRL_PRED_WEIGHTS_REQUIRED(pps, slice))
+ 		cedrus_write_pred_weight_table(ctx, run);
+@@ -491,6 +500,8 @@
+ 	if (cedrus_dst_is_tiled_behind(ctx))
+ 		reg |= VE_H264_CTRL_WRITE_SDROT_PIC;
+ 	cedrus_write(dev, VE_H264_CTRL, reg);
++
++	return 0;
+ }
+ 
+ static enum cedrus_irq_status
+@@ -572,9 +583,7 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	cedrus_set_params(ctx, run);
+-
+-	return 0;
++	return cedrus_set_params(ctx, run);
+ }
+ 
+ static int cedrus_h264_start(struct cedrus_ctx *ctx)
