@@ -7,7 +7,7 @@ Subject: [PATCH] media: cedrus: h265: stop the slice setup when the bit
 cedrus_h265_skip_bits() logs a timeout and goes on with the next 32
 bits, and cedrus_h265_show_bits() ignores it. With a bitstream engine
 that does not go idle, every slice then busy-waits 1 ms per 32 bits of
-its header in atomic context and is decoded from a wrong position.
+its header and may be decoded from a wrong position.
 
 Return -ETIMEDOUT from both and fail the job.
 
