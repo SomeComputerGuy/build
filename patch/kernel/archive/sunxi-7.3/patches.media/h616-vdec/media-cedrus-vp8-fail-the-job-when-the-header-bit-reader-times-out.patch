@@ -5,7 +5,7 @@ Subject: [PATCH] media: cedrus: vp8: fail the job when the header bit reader tim
 
 The VP8 header parser ignores the bit reader timeouts: with a stuck
 bitstream engine every read waits 1 ms, and the frame is then decoded
-from a wrong header.
+with the bit reader in a wrong state.
 
 Stop reading after the first timeout and fail the job.
 
@@ -149,7 +149,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  }
  
  static void cedrus_irq_clear(struct cedrus_dev *dev)
-@@ -522,73 +536,77 @@
+@@ -522,73 +536,80 @@
  		     VE_H264_STATUS_INT_MASK);
  }
  
@@ -207,6 +207,9 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  	if (!V4L2_VP8_FRAME_IS_KEY_FRAME(slice))
 -		read_bits(dev, 1, VP8_PROB_HALF);
 +		read_bits(&b, 1, VP8_PROB_HALF);
++
++	if (b.error)
++		return b.error;
  
  	cedrus_write(dev, VE_H264_TRIGGER_TYPE, VE_H264_TRIGGER_TYPE_VP8_UPDATE_COEF);
 -	cedrus_wait_for(dev, VE_H264_STATUS, VE_H264_STATUS_VP8_UPPROB_BUSY);
@@ -262,7 +265,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  }
  
  static void cedrus_vp8_update_probs(const struct v4l2_ctrl_vp8_frame *slice,
-@@ -661,6 +679,7 @@
+@@ -661,6 +682,7 @@
  	dma_addr_t src_buf_addr;
  	int header_size;
  	u32 reg;
@@ -270,7 +273,7 @@ Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
  
  	cedrus_engine_enable(ctx);
  
-@@ -763,7 +782,9 @@
+@@ -763,7 +785,9 @@
  		reg |= VE_VP8_PPS_PIC_TYPE_P_FRAME;
  	cedrus_write(dev, VE_VP8_PPS, reg);
  
