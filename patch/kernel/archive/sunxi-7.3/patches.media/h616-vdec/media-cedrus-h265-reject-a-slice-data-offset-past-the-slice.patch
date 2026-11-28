@@ -1,0 +1,26 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 28 Nov 2026 09:00:00 +0000
+Subject: [PATCH] media: cedrus: h265: reject a slice data offset past the slice
+
+data_byte_offset comes from userspace and is not checked against the
+slice. A large value makes cedrus_h265_skip_bits() flush bits for
+minutes in device_run(), with the media device's req_queue_mutex held.
+
+Fail the job when the offset is past the end of the slice.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_h265.c
+@@ -539,6 +539,9 @@
+ 	if (slice_params->data_byte_offset == 0)
+ 		return -EOPNOTSUPP;
+ 
++	if (slice_params->data_byte_offset > slice_bytes)
++		return -EINVAL;
++
+ 	ret = cedrus_h265_skip_bits(dev, (slice_params->data_byte_offset - 1) * 8);
+ 	if (ret)
+ 		return ret;

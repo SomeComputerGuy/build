@@ -1,0 +1,30 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Sat, 28 Nov 2026 09:00:00 +0000
+Subject: [PATCH] media: cedrus: vc1: fail the job when the header skip times out
+
+The picture header skip ignores the bit reader timeout: with a stuck
+bitstream engine every 24-bit step waits 1 ms, and the picture is then
+decoded from a wrong position.
+
+Fail the job on the first timeout.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+--- a/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
++++ b/drivers/staging/media/sunxi/cedrus/cedrus_vc1.c
+@@ -678,7 +678,12 @@
+ 			     VE_DEC_VC1_TRIGGER_TYPE_GET_BITS |
+ 			     VE_DEC_VC1_TRIGGER_TYPE_N_BITS(bits));
+ 
+-		cedrus_wait_for(dev, VE_DEC_VC1_STATUS, VE_DEC_VC1_STATUS_BITS_BUSY);
++		if (cedrus_wait_for(dev, VE_DEC_VC1_STATUS,
++				    VE_DEC_VC1_STATUS_BITS_BUSY)) {
++			dev_err_ratelimited(dev->dev,
++					    "timed out waiting to skip bits\n");
++			return -ETIMEDOUT;
++		}
+ 	}
+ 
+ 	cedrus_write(dev, VE_DEC_VC1_ROT_CTRL, 0);
