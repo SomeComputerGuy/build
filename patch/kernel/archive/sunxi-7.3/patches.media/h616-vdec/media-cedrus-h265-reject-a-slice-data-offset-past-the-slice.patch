@@ -5,8 +5,8 @@ Subject: [PATCH] media: cedrus: h265: reject a slice data offset past the slice
 
 data_byte_offset comes from userspace and is not checked against the
 slice. A value past the slice makes cedrus_h265_skip_bits() flush up
-to 2^31 bits in device_run(), with the media device's req_queue_mutex
-held.
+to 2^31 bits in device_run(), which can run with the media device's
+req_queue_mutex held.
 
 Fail the job when the offset is past the end of the slice.
 

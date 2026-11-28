@@ -5,8 +5,8 @@ Subject: [PATCH] media: cedrus: h264: reject a slice header larger than the slic
 
 header_bit_size comes from userspace and is not checked against the
 slice. A value past the slice makes cedrus_skip_bits() flush up to
-2^31 bits in device_run(), with the media device's req_queue_mutex
-held.
+2^31 bits in device_run(), which can run with the media device's
+req_queue_mutex held.
 
 Fail the job when the header is larger than the slice.
 
