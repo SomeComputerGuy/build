@@ -1,0 +1,158 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Arun Iyengar <aiyengar1990@gmail.com>
+Date: Fri, 27 Nov 2026 23:39:30 +0000
+Subject: [PATCH] drm/sun4i: Fix plane alpha on DE33 AFBC planes with pixel
+ alpha
+
+The AFBC decompressor replaces the channel's overlay, so the layer
+pre-multiply control does not apply. Unlike the DE355 one, the DE33
+decompressor has no such control of its own (BSP de_fbd_atw.c). A
+pre-multiplied plane thus kept its colour at plane alpha below opaque:
+an opaque pixel at plane alpha 0 still showed. Scale the colour by the
+plane alpha in the channel CSC instead.
+
+The decompressor also took the pixel alpha in the "None" blend mode.
+Use the plane alpha only, as for linear buffers.
+
+Tested on H616 only. The DE3 (H6) CSC is not changed.
+
+Assisted-by: LLM
+Signed-off-by: Arun Iyengar <aiyengar1990@gmail.com>
+---
+ drivers/gpu/drm/sun4i/sun50i_afbc.c |  3 +-
+ drivers/gpu/drm/sun4i/sun8i_csc.c   | 48 +++++++++++++++++++++++++++--
+ 2 files changed, 47 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/gpu/drm/sun4i/sun50i_afbc.c b/drivers/gpu/drm/sun4i/sun50i_afbc.c
+index 4fb84e5..71dc9fd 100644
+--- a/drivers/gpu/drm/sun4i/sun50i_afbc.c
++++ b/drivers/gpu/drm/sun4i/sun50i_afbc.c
+@@ -265,7 +265,8 @@ void sun50i_afbc_atomic_update(struct sun8i_layer *layer,
+ 
+ 	val = SUN50I_FBD_CTL_GLB_ALPHA(state->alpha >> 8) |
+ 	      SUN50I_FBD_CTL_CLK_GATE | SUN50I_FBD_CTL_FBD_EN;
+-	if (!fb->format->has_alpha)
++	if (!fb->format->has_alpha ||
++	    state->pixel_blend_mode == DRM_MODE_BLEND_PIXEL_NONE)
+ 		val |= SUN50I_FBD_CTL_ALPHA_MODE_LAYER;
+ 	else if (state->alpha == DRM_BLEND_ALPHA_OPAQUE)
+ 		val |= SUN50I_FBD_CTL_ALPHA_MODE_PIXEL;
+diff --git a/drivers/gpu/drm/sun4i/sun8i_csc.c b/drivers/gpu/drm/sun4i/sun8i_csc.c
+index ed2ce14..6f3def5 100644
+--- a/drivers/gpu/drm/sun4i/sun8i_csc.c
++++ b/drivers/gpu/drm/sun4i/sun8i_csc.c
+@@ -3,11 +3,14 @@
+  * Copyright (C) Jernej Skrabec <jernej.skrabec@siol.net>
+  */
+ 
++#include <drm/drm_blend.h>
+ #include <drm/drm_crtc.h>
+ #include <drm/drm_fourcc.h>
+ #include <drm/drm_framebuffer.h>
++#include <drm/drm_gem_framebuffer_helper.h>
+ #include <drm/drm_plane.h>
+ #include <drm/drm_print.h>
++#include <linux/math64.h>
+ 
+ #include "sun4i_crtc.h"
+ #include "sun8i_csc.h"
+@@ -372,6 +375,21 @@ static void sun8i_de33_convert_table(const u32 *src, u32 *dst)
+ 	dst[14] &= 0xffff;
+ }
+ 
++/* multiply the matrix of a converted table by @scale / 255 */
++static void sun8i_de33_scale_table(u32 *csc, u8 scale)
++{
++	int r, c;
++
++	if (scale == 0xff)
++		return;
++
++	for (r = 0; r < 3; r++) {
++		for (c = 0; c < 3; c++)
++			csc[3 + r * 4 + c] =
++				div_s64((s64)(s32)csc[3 + r * 4 + c] * scale, 0xff);
++	}
++}
++
+ /*
+  * The register image the DE33 write-back unit's CSC takes (same layout as
+  * the layer CSC): full-range RGB to limited-range YCbCr of @encoding, the
+@@ -418,13 +436,17 @@ static void sun8i_de33_ccsc_setup(struct regmap *map, int layer,
+ 				  enum sun8i_csc_mode mode,
+ 				  enum drm_color_encoding encoding,
+ 				  enum drm_color_range range,
+-				  enum drm_color_encoding out_encoding)
++				  enum drm_color_encoding out_encoding,
++				  u8 scale)
+ {
+ 	u32 addr, val, base, csc[15];
+ 	const u32 *table;
+ 	int i;
+ 
+ 	switch (mode) {
++	case SUN8I_CSC_MODE_OFF:
++		table = identity_de3;
++		break;
+ 	case SUN8I_CSC_MODE_RGB2YUV:
+ 		table = rgb2yuv_de3[out_encoding];
+ 		break;
+@@ -441,18 +463,22 @@ static void sun8i_de33_ccsc_setup(struct regmap *map, int layer,
+ 	switch (mode) {
+ 	case SUN8I_CSC_MODE_OFF:
+ 		val = 0;
+-		break;
++		if (scale == 0xff)
++			break;
++		fallthrough;
+ 	case SUN8I_CSC_MODE_YUV2RGB:
+ 	case SUN8I_CSC_MODE_RGB2YUV:
+ 	case SUN8I_CSC_MODE_YUV2YUV:
+ 		val = SUN8I_CSC_CTRL_EN;
+ 		sun8i_de33_convert_table(table, csc);
++		sun8i_de33_scale_table(csc, scale);
+ 		regmap_bulk_write(map, SUN50I_CSC_COEFF(base, 0), csc, 15);
+ 		break;
+ 	case SUN8I_CSC_MODE_YVU2RGB:
+ 	case SUN8I_CSC_MODE_YVU2YUV:
+ 		val = SUN8I_CSC_CTRL_EN;
+ 		sun8i_de33_convert_table(table, csc);
++		sun8i_de33_scale_table(csc, scale);
+ 		for (i = 0; i < 15; i++) {
+ 			addr = SUN50I_CSC_COEFF(base, i);
+ 			if (i > 3) {
+@@ -543,6 +569,21 @@ static u32 sun8i_csc_get_mode(struct sun8i_layer *layer,
+ 	return yvu ? SUN8I_CSC_MODE_YVU2YUV : SUN8I_CSC_MODE_YUV2YUV;
+ }
+ 
++/*
++ * The DE33 AFBC decompressor has no pre-multiply stage: the channel CSC
++ * applies the plane alpha to pre-multiplied colour instead.
++ */
++static u8 sun8i_csc_color_scale(struct drm_plane_state *state)
++{
++	if (state->crtc && state->visible &&
++	    drm_is_afbc(state->fb->modifier) &&
++	    state->fb->format->has_alpha &&
++	    state->pixel_blend_mode == DRM_MODE_BLEND_PREMULTI)
++		return state->alpha >> 8;
++
++	return 0xff;
++}
++
+ void sun8i_csc_config(struct sun8i_layer *layer,
+ 		      struct drm_plane_state *state)
+ {
+@@ -558,7 +599,8 @@ void sun8i_csc_config(struct sun8i_layer *layer,
+ 	} else if (layer->cfg->de_type == SUN8I_MIXER_DE33) {
+ 		sun8i_de33_ccsc_setup(layer->regs, layer->channel,
+ 				      mode, state->color_encoding,
+-				      state->color_range, out_encoding);
++				      state->color_range, out_encoding,
++				      sun8i_csc_color_scale(state));
+ 		return;
+ 	}
+ 
+-- 
+2.55.0
+
